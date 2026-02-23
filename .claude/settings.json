@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__context7__*",
+      "mcp__tree-sitter__*",
+      "mcp__memory__*",
+      "mcp__sequential-thinking__*",
+      "mcp__plugin_linear_linear__*",
+      "Skill(frontend-design:frontend-design)",
+      "Skill(feature-dev:feature-dev)",
+      "Skill(superpowers:*)",
+      "Skill(plugin-dev:*)",
+      "Bash(npm run lint:*)",
+      "Bash(npm run test:*)",
+      "Bash(npm info *)",
+      "Bash(gh run view *)",
+      "Bash(gh run list *)"
+    ],
+    "deny": ["Read(**/.env)", "Read(**/.*.env)"],
+    "ask": []
+  },
+  "enabledMcpjsonServers": [
+    "memory",
+    "context7",
+    "tree-sitter",
+    "sequential-thinking",
+    "linear",
+    "plugin:linear:linear"
+  ],
+  "enabledPlugins": {
+    "feature-dev@claude-plugins-official": true,
+    "frontend-design@claude-plugins-official": true,
+    "security-guidance@claude-plugins-official": true,
+    "typescript-lsp@claude-plugins-official": true,
+    "linear@claude-plugins-official": true
+  },
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  }
+}
