@@ -1,5 +1,6 @@
 import { SignalingDO } from './signaling';
 import { verifyJWT, type JWTPayload } from './auth';
+import { generateTurnCredentials } from './turn';
 
 export { SignalingDO };
 
@@ -35,15 +36,14 @@ export default {
           headers: { 'Content-Type': 'application/json' },
         });
       }
-      // Inject auth context into headers for downstream handlers
-      const headers = new Headers(request.headers);
-      headers.set('X-Device-Id', authResult.payload!.deviceId);
-      headers.set('X-User-Id', authResult.payload!.userId);
-      headers.set('X-Device-Type', authResult.payload!.deviceType);
-      request = new Request(request.url, {
-        method: request.method,
-        headers,
-        body: request.body,
+      // Clone request to preserve body stream, then inject auth context headers
+      request = new Request(request.clone(), {
+        headers: new Headers([
+          ...request.headers,
+          ['X-Device-Id', authResult.payload!.deviceId],
+          ['X-User-Id', authResult.payload!.userId],
+          ['X-Device-Type', authResult.payload!.deviceType],
+        ]),
       });
     }
 
@@ -52,7 +52,10 @@ export default {
       return routeToDO(request, url, env);
     }
 
-    // TODO [T1.7]: GET /turn/credentials (authenticated)
+    // TURN credentials (authenticated — JWT already verified by middleware above)
+    if (url.pathname === '/turn/credentials' && request.method === 'GET') {
+      return handleTurnCredentials(env);
+    }
 
     return new Response('Not Found', { status: 404 });
   },
@@ -111,4 +114,23 @@ async function routeToDO(request: Request, url: URL, env: Env): Promise<Response
   });
 
   return stub.fetch(doRequest);
+}
+
+/**
+ * Generate and return TURN credentials from Cloudflare Realtime API.
+ */
+async function handleTurnCredentials(env: Env): Promise<Response> {
+  try {
+    const credentials = await generateTurnCredentials(env);
+    return new Response(JSON.stringify(credentials), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to generate TURN credentials';
+    return new Response(JSON.stringify({ error: message }), {
+      status: 502,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
 }
