@@ -3,11 +3,12 @@
  *
  * Uses built-in SQLite for persistent device/user storage.
  * Uses in-memory maps for ephemeral state (pairing codes, WebSocket sessions).
+ * Uses the WebSocket Hibernation API for cost-efficient persistent connections.
  */
 
 import type { Env } from './worker';
-import type { DeviceType } from '@pocketmux/shared';
-import { verifyEd25519Signature, createJWT } from './auth';
+import type { DeviceType, SignalingClientMessage } from '@pocketmux/shared';
+import { verifyEd25519Signature, createJWT, verifyJWT } from './auth';
 
 // --- Types ---
 
@@ -32,6 +33,14 @@ export interface PairingSession {
   expiresAt: number;
 }
 
+/** Per-WebSocket metadata, survives DO hibernation via serializeAttachment. */
+export interface WsAttachment {
+  deviceId: string;
+  userId: string;
+  deviceType: DeviceType;
+  authenticated: boolean;
+}
+
 // --- Durable Object ---
 
 export class SignalingDO implements DurableObject {
@@ -42,7 +51,7 @@ export class SignalingDO implements DurableObject {
   // Ephemeral pairing state (in-memory, not SQLite)
   private pairingSessions = new Map<string, PairingSession>();
 
-  // WebSocket connections indexed by deviceId
+  // In-memory WebSocket cache indexed by deviceId (rebuilt after hibernation wake)
   private connections = new Map<string, WebSocket>();
 
   constructor(state: DurableObjectState, env: Env) {
@@ -177,7 +186,10 @@ export class SignalingDO implements DurableObject {
     // Clean up expired sessions
     this.cleanExpiredPairings();
 
-    const code = generatePairingCode();
+    let code: string;
+    do {
+      code = generatePairingCode();
+    } while (this.pairingSessions.has(code));
     this.pairingSessions.set(code, {
       agentDeviceId,
       agentX25519PublicKey,
@@ -210,14 +222,64 @@ export class SignalingDO implements DurableObject {
     }
   }
 
-  // --- WebSocket connection tracking ---
+  // --- WebSocket connection management ---
 
+  /**
+   * Find a WebSocket by deviceId. Checks in-memory cache first,
+   * then scans hibernated WebSockets and rebuilds cache.
+   */
+  private findWebSocket(deviceId: string): WebSocket | undefined {
+    const cached = this.connections.get(deviceId);
+    if (cached) return cached;
+
+    // After hibernation wake, the in-memory cache is empty — rebuild it.
+    this.rebuildConnectionCache();
+    return this.connections.get(deviceId);
+  }
+
+  /**
+   * Rebuild the in-memory connections cache from hibernated WebSockets.
+   * Called when the cache might be stale (e.g., after hibernation wake).
+   */
+  private rebuildConnectionCache(): void {
+    if (!this.state.getWebSockets) return;
+    for (const ws of this.state.getWebSockets()) {
+      const att = ws.deserializeAttachment() as WsAttachment | null;
+      if (att?.authenticated && att.deviceId) {
+        this.connections.set(att.deviceId, ws);
+      }
+    }
+  }
+
+  /**
+   * Send a message to all connected mobile devices belonging to a user.
+   */
+  private notifyMobileDevices(userId: string, message: unknown, excludeDeviceId?: string): void {
+    // Ensure cache is populated (handles post-hibernation wake)
+    if (this.connections.size === 0) {
+      this.rebuildConnectionCache();
+    }
+
+    for (const [, ws] of this.connections) {
+      const att = ws.deserializeAttachment() as WsAttachment | null;
+      if (
+        att?.authenticated &&
+        att.userId === userId &&
+        att.deviceType === 'mobile' &&
+        att.deviceId !== excludeDeviceId
+      ) {
+        wsSend(ws, message);
+      }
+    }
+  }
+
+  // Backward-compatible helpers used by handlePairComplete
   setConnection(deviceId: string, ws: WebSocket): void {
     this.connections.set(deviceId, ws);
   }
 
   getConnection(deviceId: string): WebSocket | undefined {
-    return this.connections.get(deviceId);
+    return this.findWebSocket(deviceId);
   }
 
   removeConnection(deviceId: string): void {
@@ -240,11 +302,192 @@ export class SignalingDO implements DurableObject {
       return this.handleTokenExchange(request);
     }
     if (url.pathname === '/ws') {
-      // TODO [T1.8]: Handle WebSocket upgrades for signaling
-      return new Response('WebSocket endpoint - not yet implemented', { status: 501 });
+      return this.handleWebSocketUpgrade(request);
     }
 
     return new Response('Not Found', { status: 404 });
+  }
+
+  // --- WebSocket upgrade [T1.8] ---
+
+  /**
+   * Handle WebSocket upgrade requests.
+   * Uses the Hibernation API so idle connections don't burn compute.
+   */
+  private handleWebSocketUpgrade(request: Request): Response {
+    if (request.headers.get('Upgrade') !== 'websocket') {
+      return new Response('Expected WebSocket upgrade', { status: 426 });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+
+    // Accept with Hibernation API — DO will sleep when no messages flow
+    this.state.acceptWebSocket(server);
+    server.serializeAttachment({ authenticated: false } as WsAttachment);
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // --- WebSocket Hibernation API handlers [T1.8] ---
+
+  /**
+   * Called by the runtime when a hibernated WebSocket receives a message.
+   */
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (typeof message !== 'string') return;
+
+    let data: SignalingClientMessage;
+    try {
+      data = JSON.parse(message) as SignalingClientMessage;
+    } catch {
+      wsSend(ws, { type: 'error', error: 'Invalid JSON' });
+      return;
+    }
+
+    if (!data.type) {
+      wsSend(ws, { type: 'error', error: 'Missing message type' });
+      return;
+    }
+
+    // Auth must be handled before any other message type
+    if (data.type === 'auth') {
+      await this.handleWsAuth(ws, data.token);
+      return;
+    }
+
+    // All other messages require authentication
+    const attachment = ws.deserializeAttachment() as WsAttachment | null;
+    if (!attachment?.authenticated) {
+      wsSend(ws, { type: 'error', error: 'Not authenticated' });
+      return;
+    }
+
+    switch (data.type) {
+      case 'presence':
+        // Agent heartbeat — acknowledged. DO stays awake due to message receipt.
+        break;
+
+      case 'connect_request':
+        this.handleConnectRequest(ws, attachment, data.targetDeviceId);
+        break;
+
+      case 'sdp_offer':
+      case 'sdp_answer':
+        this.relaySignalingMessage(attachment, data);
+        break;
+
+      case 'ice_candidate':
+        this.relaySignalingMessage(attachment, data);
+        break;
+
+      default:
+        wsSend(ws, { type: 'error', error: `Unknown message type: ${(data as { type: string }).type}` });
+    }
+  }
+
+  /**
+   * Called by the runtime when a WebSocket closes.
+   */
+  async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
+    const attachment = ws.deserializeAttachment() as WsAttachment | null;
+    if (!attachment?.authenticated) return;
+
+    // Remove from in-memory cache
+    this.connections.delete(attachment.deviceId);
+
+    // If agent disconnected, notify mobile clients
+    if (attachment.deviceType === 'agent') {
+      this.notifyMobileDevices(attachment.userId, {
+        type: 'agent_offline',
+        deviceId: attachment.deviceId,
+      });
+    }
+  }
+
+  /**
+   * Called by the runtime when a WebSocket encounters an error.
+   */
+  async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
+    const attachment = ws.deserializeAttachment() as WsAttachment | null;
+    if (attachment?.authenticated) {
+      this.connections.delete(attachment.deviceId);
+    }
+    try {
+      ws.close(1011, 'WebSocket error');
+    } catch {
+      // May already be closed
+    }
+  }
+
+  // --- WebSocket message handlers ---
+
+  /**
+   * Handle auth message: verify JWT and associate WebSocket with device.
+   */
+  private async handleWsAuth(ws: WebSocket, token: string): Promise<void> {
+    try {
+      const payload = await verifyJWT(token, this.env.JWT_SECRET);
+      const attachment: WsAttachment = {
+        deviceId: payload.deviceId,
+        userId: payload.userId,
+        deviceType: payload.deviceType,
+        authenticated: true,
+      };
+      ws.serializeAttachment(attachment);
+
+      // Update in-memory cache
+      this.connections.set(payload.deviceId, ws);
+
+      // If agent, notify connected mobile clients of agent_online
+      if (payload.deviceType === 'agent') {
+        this.notifyMobileDevices(payload.userId, {
+          type: 'agent_online',
+          deviceId: payload.deviceId,
+        });
+      }
+
+      wsSend(ws, { type: 'auth', status: 'ok' });
+    } catch {
+      wsSend(ws, { type: 'error', error: 'Authentication failed' });
+      ws.close(4001, 'Authentication failed');
+    }
+  }
+
+  /**
+   * Handle connect_request: mobile wants to connect to an agent.
+   * Relays the request to the target agent with the mobile's deviceId.
+   */
+  private handleConnectRequest(ws: WebSocket, sender: WsAttachment, targetDeviceId: string): void {
+    const targetWs = this.findWebSocket(targetDeviceId);
+    if (!targetWs) {
+      wsSend(ws, { type: 'error', error: `Device ${targetDeviceId} is not connected` });
+      return;
+    }
+
+    // Relay to target with sender's deviceId as the origin
+    wsSend(targetWs, {
+      type: 'connect_request',
+      targetDeviceId: sender.deviceId,
+    });
+  }
+
+  /**
+   * Relay SDP/ICE signaling messages between devices.
+   * Swaps targetDeviceId to the sender's deviceId so the recipient knows the origin.
+   */
+  private relaySignalingMessage(
+    sender: WsAttachment,
+    data: { type: string; targetDeviceId: string; [key: string]: unknown }
+  ): void {
+    const targetWs = this.findWebSocket(data.targetDeviceId);
+    if (!targetWs) return;
+
+    // Relay with sender's deviceId as the origin
+    wsSend(targetWs, {
+      ...data,
+      targetDeviceId: sender.deviceId,
+    });
   }
 
   // --- Pairing endpoints [T1.5] ---
@@ -459,4 +702,9 @@ function jsonResponse(data: unknown, status = 200): Response {
     status,
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+/** Send a JSON message over a WebSocket. */
+function wsSend(ws: WebSocket, data: unknown): void {
+  ws.send(JSON.stringify(data));
 }

@@ -9,9 +9,18 @@ import type { Env } from '../../worker';
 export async function createTestDO(): Promise<SignalingDO> {
   const mockSql = await createMockSqlStorage();
 
+  // Track accepted WebSockets for the Hibernation API mock
+  const acceptedWebSockets: WebSocket[] = [];
+
   const mockState = {
     storage: {
       sql: mockSql,
+    },
+    acceptWebSocket(ws: WebSocket): void {
+      acceptedWebSockets.push(ws);
+    },
+    getWebSockets(): WebSocket[] {
+      return acceptedWebSockets;
     },
   };
 
