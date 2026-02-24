@@ -411,6 +411,55 @@ describe('WebSocket signaling [T1.8]', () => {
     });
   });
 
+  describe('cross-user isolation', () => {
+    it('rejects connect_request to device owned by different user', async () => {
+      // User A's agent
+      const { ws: agentWs } = await connectAndAuth('agent-1', 'agent');
+      // User B's mobile (different user)
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+
+      mobileWs.sent.length = 0;
+
+      // Mobile tries to connect to agent owned by a different user
+      await doInstance.webSocketMessage(
+        mobileWs as unknown as WebSocket,
+        JSON.stringify({ type: 'connect_request', targetDeviceId: 'agent-1' })
+      );
+
+      // Should get an error, not relay to the agent
+      const errors = mobileWs.messagesOfType('error');
+      expect(errors).toHaveLength(1);
+      expect(errors[0]!['error']).toContain('not connected');
+
+      // Agent should NOT have received anything
+      const agentRequests = agentWs.messagesOfType('connect_request');
+      expect(agentRequests).toHaveLength(0);
+    });
+
+    it('silently drops SDP relay to device owned by different user', async () => {
+      // User A's agent
+      const { ws: agentWs } = await connectAndAuth('agent-1', 'agent');
+      // User B's mobile (different user)
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+
+      mobileWs.sent.length = 0;
+
+      // Agent tries to send SDP offer to mobile owned by a different user
+      await doInstance.webSocketMessage(
+        agentWs as unknown as WebSocket,
+        JSON.stringify({
+          type: 'sdp_offer',
+          sdp: 'malicious-offer',
+          targetDeviceId: 'mobile-1',
+        })
+      );
+
+      // Mobile should NOT receive the offer
+      const offers = mobileWs.messagesOfType('sdp_offer');
+      expect(offers).toHaveLength(0);
+    });
+  });
+
   describe('WebSocket error handling', () => {
     it('handles webSocketError gracefully', async () => {
       const { ws: agentWs } = await connectAndAuth('agent-1', 'agent');
@@ -422,6 +471,25 @@ describe('WebSocket signaling [T1.8]', () => {
 
       expect(agentWs.closed).toBe(true);
       expect(agentWs.closeCode).toBe(1011);
+    });
+
+    it('emits agent_offline on webSocketError', async () => {
+      const agentDevice = doInstance.registerDevice('agent-1', 'pubkey-agent', 'agent');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile', agentDevice.userId);
+      const { ws: agentWs } = await connectAndAuth('agent-1', 'agent', agentDevice.userId);
+
+      mobileWs.sent.length = 0;
+
+      // Agent WebSocket errors out
+      await doInstance.webSocketError(
+        agentWs as unknown as WebSocket,
+        new Error('connection reset')
+      );
+
+      // Mobile should receive agent_offline
+      const offlineMessages = mobileWs.messagesOfType('agent_offline');
+      expect(offlineMessages).toHaveLength(1);
+      expect(offlineMessages[0]!['deviceId']).toBe('agent-1');
     });
 
     it('handles unknown message type', async () => {

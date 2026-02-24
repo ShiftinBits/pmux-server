@@ -17,6 +17,7 @@ export const PUBLIC_PATHS = new Set([
   '/auth/pair/initiate',
   '/auth/pair/complete',
   '/auth/token',
+  '/ws', // WebSocket auth is handled at the DO level via auth message, not HTTP headers
 ]);
 
 export default {

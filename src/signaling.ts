@@ -255,10 +255,8 @@ export class SignalingDO implements DurableObject {
    * Send a message to all connected mobile devices belonging to a user.
    */
   private notifyMobileDevices(userId: string, message: unknown, excludeDeviceId?: string): void {
-    // Ensure cache is populated (handles post-hibernation wake)
-    if (this.connections.size === 0) {
-      this.rebuildConnectionCache();
-    }
+    // Always rebuild cache to ensure no WebSockets are missed after hibernation wake
+    this.rebuildConnectionCache();
 
     for (const [, ws] of this.connections) {
       const att = ws.deserializeAttachment() as WsAttachment | null;
@@ -374,9 +372,6 @@ export class SignalingDO implements DurableObject {
 
       case 'sdp_offer':
       case 'sdp_answer':
-        this.relaySignalingMessage(attachment, data);
-        break;
-
       case 'ice_candidate':
         this.relaySignalingMessage(attachment, data);
         break;
@@ -412,6 +407,13 @@ export class SignalingDO implements DurableObject {
     const attachment = ws.deserializeAttachment() as WsAttachment | null;
     if (attachment?.authenticated) {
       this.connections.delete(attachment.deviceId);
+      // Notify mobile clients if agent errored out
+      if (attachment.deviceType === 'agent') {
+        this.notifyMobileDevices(attachment.userId, {
+          type: 'agent_offline',
+          deviceId: attachment.deviceId,
+        });
+      }
     }
     try {
       ws.close(1011, 'WebSocket error');
@@ -465,6 +467,13 @@ export class SignalingDO implements DurableObject {
       return;
     }
 
+    // Verify target belongs to the same user (prevents cross-user signaling)
+    const targetAtt = targetWs.deserializeAttachment() as WsAttachment | null;
+    if (!targetAtt || targetAtt.userId !== sender.userId) {
+      wsSend(ws, { type: 'error', error: `Device ${targetDeviceId} is not connected` });
+      return;
+    }
+
     // Relay to target with sender's deviceId as the origin
     wsSend(targetWs, {
       type: 'connect_request',
@@ -482,6 +491,10 @@ export class SignalingDO implements DurableObject {
   ): void {
     const targetWs = this.findWebSocket(data.targetDeviceId);
     if (!targetWs) return;
+
+    // Verify target belongs to the same user (prevents cross-user signaling)
+    const targetAtt = targetWs.deserializeAttachment() as WsAttachment | null;
+    if (!targetAtt || targetAtt.userId !== sender.userId) return;
 
     // Relay with sender's deviceId as the origin
     wsSend(targetWs, {

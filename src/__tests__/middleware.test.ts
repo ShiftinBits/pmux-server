@@ -81,6 +81,7 @@ describe('auth middleware', () => {
       '/auth/pair/initiate',
       '/auth/pair/complete',
       '/auth/token',
+      '/ws', // WebSocket auth is handled at DO level
     ];
 
     for (const route of publicRoutes) {
@@ -89,7 +90,7 @@ describe('auth middleware', () => {
       });
     }
 
-    const protectedRoutes = ['/turn/credentials', '/ws', '/devices/abc'];
+    const protectedRoutes = ['/turn/credentials', '/devices/abc'];
 
     for (const route of protectedRoutes) {
       it(`${route} requires auth`, () => {
