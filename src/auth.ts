@@ -11,7 +11,9 @@ import type { DeviceType } from '@pocketmux/shared';
 // --- JWT Payload ---
 
 export interface JWTPayload {
-  deviceId: string;
+  sub: string;       // Subject — device ID (standard JWT claim)
+  aud: string;       // Audience — must be 'pocketmux'
+  deviceId: string;  // Device ID (mirrors sub for backward compatibility)
   userId: string;
   deviceType: DeviceType;
   iat: number;
@@ -110,6 +112,8 @@ async function hmacVerify(secret: string, data: string, signature: Uint8Array): 
 
 const JWT_HEADER = base64urlEncode(textEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
 const JWT_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
+const JWT_AUDIENCE = 'pocketmux';
+const JWT_MAX_CLOCK_SKEW_S = 60; // Maximum allowed clock skew in seconds
 
 /**
  * Create a signed JWT for a device.
@@ -128,6 +132,8 @@ export async function createJWT(
 ): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const payload: JWTPayload = {
+    sub: deviceId,
+    aud: JWT_AUDIENCE,
     deviceId,
     userId,
     deviceType,
@@ -178,14 +184,24 @@ export async function verifyJWT(token: string, secret: string): Promise<JWTPaylo
   // Decode payload
   const decoded = JSON.parse(textDecode(base64urlDecode(payload))) as JWTPayload;
 
+  // Verify audience claim
+  if (decoded.aud !== JWT_AUDIENCE) {
+    throw new Error('Invalid JWT: invalid audience');
+  }
+
+  // Verify subject claim exists and matches deviceId
+  if (!decoded.sub || decoded.sub !== decoded.deviceId) {
+    throw new Error('Invalid JWT: missing or mismatched subject');
+  }
+
   // Check expiry
   const now = Math.floor(Date.now() / 1000);
   if (decoded.exp <= now) {
     throw new Error('Invalid JWT: token expired');
   }
 
-  // Check iat is not in the future (allow 60s clock skew)
-  if (decoded.iat > now + 60) {
+  // Check iat is not in the future (allow configured clock skew)
+  if (decoded.iat > now + JWT_MAX_CLOCK_SKEW_S) {
     throw new Error('Invalid JWT: issued in the future');
   }
 
