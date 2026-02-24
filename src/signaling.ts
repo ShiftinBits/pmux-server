@@ -7,6 +7,7 @@
 
 import type { Env } from './worker';
 import type { DeviceType } from '@pocketmux/shared';
+import { verifyEd25519Signature, createJWT } from './auth';
 
 // --- Types ---
 
@@ -351,10 +352,61 @@ export class SignalingDO implements DurableObject {
     });
   }
 
-  // --- Token exchange endpoint (stub for T1.6) ---
+  // --- Token exchange endpoint [T1.6] ---
 
-  private async handleTokenExchange(_request: Request): Promise<Response> {
-    return new Response('Not implemented', { status: 501 });
+  /**
+   * POST /token
+   * Device exchanges a signed challenge for a JWT.
+   * Body: { deviceId, timestamp, signature }
+   * signature = Ed25519.sign(privateKey, deviceId + timestamp)
+   * Returns: { token }
+   */
+  private async handleTokenExchange(request: Request): Promise<Response> {
+    let body: { deviceId?: string; timestamp?: string; signature?: string };
+    try {
+      body = await request.json() as typeof body;
+    } catch {
+      return jsonResponse({ error: 'Invalid JSON' }, 400);
+    }
+
+    if (!body.deviceId || !body.timestamp || !body.signature) {
+      return jsonResponse(
+        { error: 'Missing required fields: deviceId, timestamp, signature' },
+        400
+      );
+    }
+
+    // Look up the device to get its public key
+    const device = this.getDevice(body.deviceId);
+    if (!device) {
+      return jsonResponse({ error: 'Unknown device' }, 401);
+    }
+
+    // Verify the signature: sign(privateKey, deviceId + timestamp)
+    const message = new TextEncoder().encode(body.deviceId + body.timestamp);
+    const publicKeyBytes = base64ToBytes(device.publicKey);
+    const signatureBytes = base64ToBytes(body.signature);
+
+    let valid: boolean;
+    try {
+      valid = await verifyEd25519Signature(publicKeyBytes, message, signatureBytes);
+    } catch {
+      return jsonResponse({ error: 'Invalid signature format' }, 401);
+    }
+
+    if (!valid) {
+      return jsonResponse({ error: 'Signature verification failed' }, 401);
+    }
+
+    // Issue JWT
+    const token = await createJWT(
+      device.id,
+      device.userId,
+      device.deviceType,
+      this.env.JWT_SECRET
+    );
+
+    return jsonResponse({ token });
   }
 }
 
@@ -380,6 +432,15 @@ function generatePairingCode(): string {
     code += chars[byte % chars.length];
   }
   return code;
+}
+
+function base64ToBytes(str: string): Uint8Array {
+  const binary = atob(str);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
 }
 
 function jsonResponse(data: unknown, status = 200): Response {

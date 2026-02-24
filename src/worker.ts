@@ -1,4 +1,5 @@
 import { SignalingDO } from './signaling';
+import { verifyJWT, type JWTPayload } from './auth';
 
 export { SignalingDO };
 
@@ -10,7 +11,7 @@ export interface Env {
 }
 
 // Routes that don't require JWT authentication
-const PUBLIC_ROUTES = new Set([
+const PUBLIC_PATHS = new Set([
   '/health',
   '/auth/pair/initiate',
   '/auth/pair/complete',
@@ -25,6 +26,27 @@ export default {
       return new Response('OK', { status: 200 });
     }
 
+    // Auth middleware: verify JWT for non-public routes
+    if (!PUBLIC_PATHS.has(url.pathname)) {
+      const authResult = await authenticateRequest(request, env);
+      if (authResult.error) {
+        return new Response(JSON.stringify({ error: authResult.error }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      // Inject auth context into headers for downstream handlers
+      const headers = new Headers(request.headers);
+      headers.set('X-Device-Id', authResult.payload!.deviceId);
+      headers.set('X-User-Id', authResult.payload!.userId);
+      headers.set('X-Device-Type', authResult.payload!.deviceType);
+      request = new Request(request.url, {
+        method: request.method,
+        headers,
+        body: request.body,
+      });
+    }
+
     // Routes that dispatch to the Durable Object
     if (url.pathname.startsWith('/auth/') || url.pathname === '/ws') {
       return routeToDO(request, url, env);
@@ -35,6 +57,33 @@ export default {
     return new Response('Not Found', { status: 404 });
   },
 };
+
+/**
+ * Verify JWT from Authorization header.
+ */
+async function authenticateRequest(
+  request: Request,
+  env: Env
+): Promise<{ payload?: JWTPayload; error?: string }> {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader) {
+    return { error: 'Missing Authorization header' };
+  }
+
+  if (!authHeader.startsWith('Bearer ')) {
+    return { error: 'Invalid Authorization format, expected Bearer token' };
+  }
+
+  const token = authHeader.slice('Bearer '.length);
+
+  try {
+    const payload = await verifyJWT(token, env.JWT_SECRET);
+    return { payload };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Token verification failed';
+    return { error: message };
+  }
+}
 
 /**
  * Route requests to the SignalingDO.
