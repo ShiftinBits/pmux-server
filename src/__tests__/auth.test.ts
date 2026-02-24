@@ -60,6 +60,24 @@ describe('verifyEd25519Signature', () => {
     const valid = await verifyEd25519Signature(publicKeyRaw, message2, signature);
     expect(valid).toBe(false);
   });
+
+  it('rejects a public key of wrong length', async () => {
+    const shortKey = new Uint8Array(16);
+    const message = new TextEncoder().encode('test');
+    const sig = new Uint8Array(64);
+    await expect(verifyEd25519Signature(shortKey, message, sig)).rejects.toThrow(
+      'expected 32 bytes'
+    );
+  });
+
+  it('rejects a signature of wrong length', async () => {
+    const { publicKeyRaw } = await generateEd25519Keypair();
+    const message = new TextEncoder().encode('test');
+    const shortSig = new Uint8Array(32);
+    await expect(verifyEd25519Signature(publicKeyRaw, message, shortSig)).rejects.toThrow(
+      'expected 64 bytes'
+    );
+  });
 });
 
 // --- JWT creation and verification ---
@@ -141,6 +159,29 @@ describe('verifyJWT', () => {
   it('rejects malformed JWT (wrong number of parts)', async () => {
     await expect(verifyJWT('only.two', TEST_SECRET)).rejects.toThrow('expected 3 parts');
     await expect(verifyJWT('no-dots', TEST_SECRET)).rejects.toThrow('expected 3 parts');
+  });
+
+  it('rejects JWT with alg:none header', async () => {
+    const token = await createJWT('device-1', 'user-1', 'agent', TEST_SECRET);
+    const parts = token.split('.');
+    // Replace header with alg:none
+    const noneHeader = btoa(JSON.stringify({ alg: 'none', typ: 'JWT' }))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const tampered = `${noneHeader}.${parts[1]}.${parts[2]}`;
+    await expect(verifyJWT(tampered, TEST_SECRET)).rejects.toThrow('unsupported algorithm');
+  });
+
+  it('rejects JWT with iat in the future', async () => {
+    // Mock Date.now to create a token far in the future
+    const futureTime = Date.now() + 2 * 60 * 60 * 1000; // 2 hours from now
+    vi.spyOn(Date, 'now').mockReturnValue(futureTime);
+
+    const token = await createJWT('device-1', 'user-1', 'agent', TEST_SECRET);
+
+    // Restore real time — the token's iat is now 2 hours in the future
+    vi.restoreAllMocks();
+
+    await expect(verifyJWT(token, TEST_SECRET)).rejects.toThrow('issued in the future');
   });
 
   it('sets expiry to ~1 hour from creation', async () => {

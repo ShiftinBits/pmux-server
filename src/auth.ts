@@ -6,12 +6,14 @@
  * identity verification during token exchange.
  */
 
+import type { DeviceType } from '@pocketmux/shared';
+
 // --- JWT Payload ---
 
 export interface JWTPayload {
   deviceId: string;
   userId: string;
-  deviceType: string;
+  deviceType: DeviceType;
   iat: number;
   exp: number;
 }
@@ -61,6 +63,13 @@ export async function verifyEd25519Signature(
   message: Uint8Array,
   signature: Uint8Array
 ): Promise<boolean> {
+  if (publicKey.length !== 32) {
+    throw new Error('Invalid Ed25519 public key: expected 32 bytes');
+  }
+  if (signature.length !== 64) {
+    throw new Error('Invalid Ed25519 signature: expected 64 bytes');
+  }
+
   const key = await crypto.subtle.importKey(
     'raw',
     publicKey,
@@ -114,7 +123,7 @@ const JWT_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
 export async function createJWT(
   deviceId: string,
   userId: string,
-  deviceType: string,
+  deviceType: DeviceType,
   secret: string
 ): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
@@ -152,6 +161,11 @@ export async function verifyJWT(token: string, secret: string): Promise<JWTPaylo
     throw new Error('Invalid JWT: empty part');
   }
 
+  // Verify header matches expected algorithm (defense against alg:none attacks)
+  if (header !== JWT_HEADER) {
+    throw new Error('Invalid JWT: unsupported algorithm');
+  }
+
   // Verify signature
   const signingInput = `${header}.${payload}`;
   const signature = base64urlDecode(sig);
@@ -168,6 +182,11 @@ export async function verifyJWT(token: string, secret: string): Promise<JWTPaylo
   const now = Math.floor(Date.now() / 1000);
   if (decoded.exp <= now) {
     throw new Error('Invalid JWT: token expired');
+  }
+
+  // Check iat is not in the future (allow 60s clock skew)
+  if (decoded.iat > now + 60) {
+    throw new Error('Invalid JWT: issued in the future');
   }
 
   return decoded;
