@@ -246,15 +246,112 @@ export class SignalingDO implements DurableObject {
     return new Response('Not Found', { status: 404 });
   }
 
-  // --- Endpoint handlers (stubs for T1.5, T1.6) ---
+  // --- Pairing endpoints [T1.5] ---
 
-  private async handlePairInitiate(_request: Request): Promise<Response> {
-    return new Response('Not implemented', { status: 501 });
+  /**
+   * POST /pair/initiate
+   * Agent calls this to start pairing. Creates a pairing session.
+   * Body: { deviceId, publicKey, x25519PublicKey }
+   * Returns: { pairingCode }
+   */
+  private async handlePairInitiate(request: Request): Promise<Response> {
+    let body: { deviceId?: string; publicKey?: string; x25519PublicKey?: string };
+    try {
+      body = await request.json() as typeof body;
+    } catch {
+      return jsonResponse({ error: 'Invalid JSON' }, 400);
+    }
+
+    if (!body.deviceId || !body.publicKey || !body.x25519PublicKey) {
+      return jsonResponse(
+        { error: 'Missing required fields: deviceId, publicKey, x25519PublicKey' },
+        400
+      );
+    }
+
+    // Register the agent device if not already registered
+    const existing = this.getDevice(body.deviceId);
+    if (!existing) {
+      this.registerDevice(body.deviceId, body.publicKey, 'agent');
+    }
+
+    const pairingCode = this.createPairingSession(
+      body.deviceId,
+      body.x25519PublicKey,
+      body.publicKey
+    );
+
+    return jsonResponse({ pairingCode });
   }
 
-  private async handlePairComplete(_request: Request): Promise<Response> {
-    return new Response('Not implemented', { status: 501 });
+  /**
+   * POST /pair/complete
+   * Mobile calls this with the pairing code to complete pairing.
+   * Body: { pairingCode, deviceId, publicKey, x25519PublicKey }
+   * Returns: { agentX25519PublicKey, agentDeviceId, userId }
+   */
+  private async handlePairComplete(request: Request): Promise<Response> {
+    let body: {
+      pairingCode?: string;
+      deviceId?: string;
+      publicKey?: string;
+      x25519PublicKey?: string;
+    };
+    try {
+      body = await request.json() as typeof body;
+    } catch {
+      return jsonResponse({ error: 'Invalid JSON' }, 400);
+    }
+
+    if (!body.pairingCode || !body.deviceId || !body.publicKey || !body.x25519PublicKey) {
+      return jsonResponse(
+        { error: 'Missing required fields: pairingCode, deviceId, publicKey, x25519PublicKey' },
+        400
+      );
+    }
+
+    // Consume the pairing session (single-use, validates expiry)
+    const session = this.consumePairingSession(body.pairingCode);
+    if (!session) {
+      return jsonResponse({ error: 'Invalid or expired pairing code' }, 404);
+    }
+
+    // Get the agent device to find its userId
+    const agentDevice = this.getDevice(session.agentDeviceId);
+    if (!agentDevice) {
+      return jsonResponse({ error: 'Agent device not found' }, 500);
+    }
+
+    // Register the mobile device under the same user as the agent
+    this.registerDevice(
+      body.deviceId,
+      body.publicKey,
+      'mobile',
+      agentDevice.userId
+    );
+
+    // Relay mobile's X25519 key to agent via WebSocket if connected
+    const agentWs = this.getConnection(session.agentDeviceId);
+    if (agentWs) {
+      try {
+        agentWs.send(JSON.stringify({
+          type: 'pair_complete',
+          mobileDeviceId: body.deviceId,
+          mobileX25519PublicKey: body.x25519PublicKey,
+        }));
+      } catch {
+        // Agent WS may have disconnected — pairing data is still stored
+      }
+    }
+
+    return jsonResponse({
+      agentX25519PublicKey: session.agentX25519PublicKey,
+      agentDeviceId: session.agentDeviceId,
+      userId: agentDevice.userId,
+    });
   }
+
+  // --- Token exchange endpoint (stub for T1.6) ---
 
   private async handleTokenExchange(_request: Request): Promise<Response> {
     return new Response('Not implemented', { status: 501 });
@@ -283,4 +380,11 @@ function generatePairingCode(): string {
     code += chars[byte % chars.length];
   }
   return code;
+}
+
+function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
