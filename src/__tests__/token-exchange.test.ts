@@ -130,4 +130,48 @@ describe('POST /token', () => {
     expect(status).toBe(400);
     expect(data['error']).toContain('Missing required fields');
   });
+
+  it('rejects a stale timestamp (replay attack)', async () => {
+    const { keyPair, publicKeyRaw } = await generateEd25519Keypair();
+    const publicKeyBase64 = bytesToBase64(publicKeyRaw);
+
+    await registerAgentDevice('agent-1', publicKeyBase64);
+
+    // Use a timestamp from 10 minutes ago
+    const staleTimestamp = String(Math.floor(Date.now() / 1000) - 600);
+    const message = new TextEncoder().encode('agent-1' + staleTimestamp);
+    const signature = await signEd25519(keyPair.privateKey, message);
+    const signatureBase64 = bytesToBase64(signature);
+
+    const { status, data } = await postJSON('/token', {
+      deviceId: 'agent-1',
+      timestamp: staleTimestamp,
+      signature: signatureBase64,
+    });
+
+    expect(status).toBe(401);
+    expect(data['error']).toContain('Timestamp out of range');
+  });
+
+  it('rejects a future timestamp', async () => {
+    const { keyPair, publicKeyRaw } = await generateEd25519Keypair();
+    const publicKeyBase64 = bytesToBase64(publicKeyRaw);
+
+    await registerAgentDevice('agent-1', publicKeyBase64);
+
+    // Use a timestamp 10 minutes in the future
+    const futureTimestamp = String(Math.floor(Date.now() / 1000) + 600);
+    const message = new TextEncoder().encode('agent-1' + futureTimestamp);
+    const signature = await signEd25519(keyPair.privateKey, message);
+    const signatureBase64 = bytesToBase64(signature);
+
+    const { status, data } = await postJSON('/token', {
+      deviceId: 'agent-1',
+      timestamp: futureTimestamp,
+      signature: signatureBase64,
+    });
+
+    expect(status).toBe(401);
+    expect(data['error']).toContain('Timestamp out of range');
+  });
 });

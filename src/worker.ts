@@ -11,7 +11,7 @@ export interface Env {
 }
 
 // Routes that don't require JWT authentication
-const PUBLIC_PATHS = new Set([
+export const PUBLIC_PATHS = new Set([
   '/health',
   '/auth/pair/initiate',
   '/auth/pair/complete',
@@ -61,7 +61,7 @@ export default {
 /**
  * Verify JWT from Authorization header.
  */
-async function authenticateRequest(
+export async function authenticateRequest(
   request: Request,
   env: Env
 ): Promise<{ payload?: JWTPayload; error?: string }> {

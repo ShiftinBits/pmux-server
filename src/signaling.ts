@@ -70,7 +70,7 @@ export class SignalingDO implements DurableObject {
       CREATE TABLE IF NOT EXISTS devices (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL REFERENCES users(id),
-        public_key TEXT NOT NULL,
+        public_key TEXT NOT NULL UNIQUE,
         device_type TEXT NOT NULL CHECK(device_type IN ('agent', 'mobile')),
         name TEXT,
         created_at INTEGER NOT NULL
@@ -111,7 +111,7 @@ export class SignalingDO implements DurableObject {
     }
 
     this.sql.exec(
-      'INSERT INTO devices (id, user_id, public_key, device_type, name, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      'INSERT OR REPLACE INTO devices (id, user_id, public_key, device_type, name, created_at) VALUES (?, ?, ?, ?, ?, ?)',
       deviceId,
       userId,
       publicKey,
@@ -376,6 +376,13 @@ export class SignalingDO implements DurableObject {
       );
     }
 
+    // Validate timestamp is recent (within 5 minutes) to prevent replay attacks
+    const ts = parseInt(body.timestamp, 10);
+    const now = Math.floor(Date.now() / 1000);
+    if (isNaN(ts) || Math.abs(now - ts) > 300) {
+      return jsonResponse({ error: 'Timestamp out of range' }, 401);
+    }
+
     // Look up the device to get its public key
     const device = this.getDevice(body.deviceId);
     if (!device) {
@@ -424,12 +431,16 @@ function rowToDevice(row: Record<string, SqlStorageValue>): StoredDevice {
 }
 
 function generatePairingCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I to avoid confusion
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 31 chars, no 0/O/1/I
+  const maxUnbiased = 248; // 31 * 8 = 248, largest multiple of 31 <= 256
   let code = '';
-  const bytes = new Uint8Array(6);
-  crypto.getRandomValues(bytes);
-  for (const byte of bytes) {
-    code += chars[byte % chars.length];
+  for (let i = 0; i < 6; ) {
+    const byte = new Uint8Array(1);
+    crypto.getRandomValues(byte);
+    if (byte[0]! < maxUnbiased) {
+      code += chars[byte[0]! % chars.length];
+      i++;
+    }
   }
   return code;
 }
