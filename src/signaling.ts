@@ -4,11 +4,21 @@
  * Uses built-in SQLite for persistent device/user storage.
  * Uses in-memory maps for ephemeral state (pairing codes, WebSocket sessions).
  * Uses the WebSocket Hibernation API for cost-efficient persistent connections.
+ * Uses DO key-value storage for rate limit counters.
  */
 
 import type { Env } from './worker';
 import type { DeviceType, SignalingClientMessage } from '@pocketmux/shared';
 import { verifyEd25519Signature, createJWT, verifyJWT } from './auth';
+import { generateTurnCredentials } from './turn';
+import {
+  checkRateLimit,
+  rateLimitResponse,
+  ENDPOINT_LIMITS,
+  MAX_DEVICES_PER_USER,
+  MAX_WS_CONNECTIONS_PER_DEVICE,
+  type RateLimitStorage,
+} from './middleware/ratelimit';
 
 // --- Types ---
 
@@ -54,6 +64,9 @@ export class SignalingDO implements DurableObject {
   // In-memory WebSocket cache indexed by deviceId (rebuilt after hibernation wake)
   private connections = new Map<string, WebSocket>();
 
+  // In-memory WebSocket connection count per device ID (for abuse prevention)
+  private wsConnectionCounts = new Map<string, number>();
+
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
@@ -61,6 +74,11 @@ export class SignalingDO implements DurableObject {
 
   private get sql(): SqlStorage {
     return this.state.storage.sql;
+  }
+
+  /** Access DO storage as a RateLimitStorage for the rate limiter. */
+  private get rateLimitStorage(): RateLimitStorage {
+    return this.state.storage as unknown as RateLimitStorage;
   }
 
   // --- Schema initialization ---
@@ -143,6 +161,19 @@ export class SignalingDO implements DurableObject {
     );
 
     return [...rows].map(rowToDevice);
+  }
+
+  /**
+   * Count devices belonging to a user.
+   */
+  countDevicesByUser(userId: string): number {
+    this.ensureSchema();
+    const rows = this.sql.exec(
+      'SELECT COUNT(*) as count FROM devices WHERE user_id = ?',
+      userId
+    );
+    const result = [...rows][0];
+    return (result?.['count'] as number) ?? 0;
   }
 
   /**
@@ -271,7 +302,7 @@ export class SignalingDO implements DurableObject {
     }
   }
 
-  // Backward-compatible helpers used by handlePairComplete
+  // Backward-compatible helpers used by handlePairComplete and tests
   setConnection(deviceId: string, ws: WebSocket): void {
     this.connections.set(deviceId, ws);
   }
@@ -284,22 +315,43 @@ export class SignalingDO implements DurableObject {
     this.connections.delete(deviceId);
   }
 
+  /** Get current WebSocket connection count for a device (for testing). */
+  getWsConnectionCount(deviceId: string): number {
+    return this.wsConnectionCounts.get(deviceId) ?? 0;
+  }
+
   // --- HTTP routing ---
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const clientIp = request.headers.get('X-Client-IP') ?? '127.0.0.1';
+    const deviceId = request.headers.get('X-Device-Id') ?? '';
 
-    // Route to specific handlers based on path
+    // Route to specific handlers based on path, with rate limiting
     if (url.pathname === '/pair/initiate' && request.method === 'POST') {
+      const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/pair/initiate');
+      if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
       return this.handlePairInitiate(request);
     }
     if (url.pathname === '/pair/complete' && request.method === 'POST') {
+      const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/pair/complete');
+      if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
       return this.handlePairComplete(request);
     }
     if (url.pathname === '/token' && request.method === 'POST') {
+      // Token uses IP as key since device ID comes from the request body (pre-auth)
+      const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/token');
+      if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
       return this.handleTokenExchange(request);
     }
+    if (url.pathname === '/turn/credentials' && request.method === 'GET') {
+      const rl = await checkRateLimit(this.rateLimitStorage, deviceId || clientIp, '/turn/credentials');
+      if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+      return this.handleTurnCredentials();
+    }
     if (url.pathname === '/ws') {
+      const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/ws');
+      if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
       return this.handleWebSocketUpgrade(request);
     }
 
@@ -391,6 +443,9 @@ export class SignalingDO implements DurableObject {
     // Remove from in-memory cache
     this.connections.delete(attachment.deviceId);
 
+    // Decrement WebSocket connection count
+    this.decrementWsCount(attachment.deviceId);
+
     // If agent disconnected, notify mobile clients
     if (attachment.deviceType === 'agent') {
       this.notifyMobileDevices(attachment.userId, {
@@ -407,6 +462,7 @@ export class SignalingDO implements DurableObject {
     const attachment = ws.deserializeAttachment() as WsAttachment | null;
     if (attachment?.authenticated) {
       this.connections.delete(attachment.deviceId);
+      this.decrementWsCount(attachment.deviceId);
       // Notify mobile clients if agent errored out
       if (attachment.deviceType === 'agent') {
         this.notifyMobileDevices(attachment.userId, {
@@ -422,14 +478,43 @@ export class SignalingDO implements DurableObject {
     }
   }
 
+  // --- WebSocket connection count helpers ---
+
+  private incrementWsCount(deviceId: string): void {
+    const current = this.wsConnectionCounts.get(deviceId) ?? 0;
+    this.wsConnectionCounts.set(deviceId, current + 1);
+  }
+
+  private decrementWsCount(deviceId: string): void {
+    const current = this.wsConnectionCounts.get(deviceId) ?? 0;
+    if (current <= 1) {
+      this.wsConnectionCounts.delete(deviceId);
+    } else {
+      this.wsConnectionCounts.set(deviceId, current - 1);
+    }
+  }
+
   // --- WebSocket message handlers ---
 
   /**
    * Handle auth message: verify JWT and associate WebSocket with device.
+   * Enforces per-device WebSocket connection limit.
    */
   private async handleWsAuth(ws: WebSocket, token: string): Promise<void> {
     try {
       const payload = await verifyJWT(token, this.env.JWT_SECRET);
+
+      // Check WebSocket connection limit per device
+      const currentCount = this.wsConnectionCounts.get(payload.deviceId) ?? 0;
+      if (currentCount >= MAX_WS_CONNECTIONS_PER_DEVICE) {
+        console.warn(
+          `[ws-limit] Rejected: deviceId=${payload.deviceId} connections=${currentCount} limit=${MAX_WS_CONNECTIONS_PER_DEVICE}`
+        );
+        wsSend(ws, { type: 'error', error: 'Too many WebSocket connections' });
+        ws.close(1008, 'Too many connections');
+        return;
+      }
+
       const attachment: WsAttachment = {
         deviceId: payload.deviceId,
         userId: payload.userId,
@@ -438,8 +523,9 @@ export class SignalingDO implements DurableObject {
       };
       ws.serializeAttachment(attachment);
 
-      // Update in-memory cache
+      // Update in-memory cache and connection count
       this.connections.set(payload.deviceId, ws);
+      this.incrementWsCount(payload.deviceId);
 
       // If agent, notify connected mobile clients of agent_online
       if (payload.deviceType === 'agent') {
@@ -579,6 +665,15 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Agent device not found' }, 500);
     }
 
+    // Enforce device count limit per user
+    const deviceCount = this.countDevicesByUser(agentDevice.userId);
+    if (deviceCount >= MAX_DEVICES_PER_USER) {
+      return jsonResponse(
+        { error: `Maximum device limit reached (${MAX_DEVICES_PER_USER})` },
+        400
+      );
+    }
+
     // Register the mobile device under the same user as the agent
     this.registerDevice(
       body.deviceId,
@@ -670,6 +765,23 @@ export class SignalingDO implements DurableObject {
     );
 
     return jsonResponse({ token });
+  }
+
+  // --- TURN credentials [T3.5] ---
+
+  /**
+   * GET /turn/credentials
+   * Returns TURN credentials from Cloudflare Realtime API.
+   * Rate limited per device ID. Routed through DO for rate limit storage access.
+   */
+  private async handleTurnCredentials(): Promise<Response> {
+    try {
+      const credentials = await generateTurnCredentials(this.env);
+      return jsonResponse(credentials);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to generate TURN credentials';
+      return jsonResponse({ error: message }, 502);
+    }
   }
 }
 
