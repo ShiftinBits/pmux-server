@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:integration": "vitest run src/__tests__/integration/"
   },
   "dependencies": {
     "@pocketmux/shared": "workspace:*"
