@@ -7,8 +7,7 @@ import {
   MAX_WS_CONNECTIONS_PER_DEVICE,
   type RateLimitStorage,
 } from '../middleware/ratelimit';
-import { createTestDO } from './helpers/mock-do';
-import { createMockKVStorage } from './helpers/mock-do';
+import { createTestDOCompat as createTestDO, createMockKVStorage } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
 import type { SignalingDO } from '../signaling';

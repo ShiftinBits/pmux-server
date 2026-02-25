@@ -49,7 +49,15 @@ export interface WsAttachment {
   userId: string;
   deviceType: DeviceType;
   authenticated: boolean;
+  /** Epoch ms of last received message (for idle timeout). */
+  lastMessageTime?: number;
 }
+
+/** Interval (ms) between alarm-based cleanup sweeps. */
+const ALARM_INTERVAL_MS = 60_000; // 60 seconds
+
+/** Maximum idle time (ms) before a WebSocket is closed. */
+const WS_IDLE_TIMEOUT_MS = 5 * 60_000; // 5 minutes
 
 // --- Durable Object ---
 
@@ -364,7 +372,7 @@ export class SignalingDO implements DurableObject {
    * Handle WebSocket upgrade requests.
    * Uses the Hibernation API so idle connections don't burn compute.
    */
-  private handleWebSocketUpgrade(request: Request): Response {
+  private async handleWebSocketUpgrade(request: Request): Promise<Response> {
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('Expected WebSocket upgrade', { status: 426 });
     }
@@ -374,7 +382,13 @@ export class SignalingDO implements DurableObject {
 
     // Accept with Hibernation API — DO will sleep when no messages flow
     this.state.acceptWebSocket(server);
-    server.serializeAttachment({ authenticated: false } as WsAttachment);
+    server.serializeAttachment({
+      authenticated: false,
+      lastMessageTime: Date.now(),
+    } as WsAttachment);
+
+    // Schedule cleanup alarm on first WebSocket connection
+    await this.scheduleAlarmIfNeeded();
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -386,6 +400,9 @@ export class SignalingDO implements DurableObject {
    */
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== 'string') return;
+
+    // Update lastMessageTime on every received message (for idle timeout tracking)
+    this.touchWebSocket(ws);
 
     let data: SignalingClientMessage;
     try {
@@ -478,6 +495,73 @@ export class SignalingDO implements DurableObject {
     }
   }
 
+  // --- Idle timeout tracking ---
+
+  /**
+   * Update the lastMessageTime in the WebSocket's attachment.
+   * Called on every received message to track idle state.
+   */
+  private touchWebSocket(ws: WebSocket): void {
+    const att = ws.deserializeAttachment() as WsAttachment | null;
+    if (att) {
+      att.lastMessageTime = Date.now();
+      ws.serializeAttachment(att);
+    }
+  }
+
+  // --- DO alarm handler (idle WS cleanup + expired pairing purge) ---
+
+  /**
+   * Called by the runtime on the scheduled alarm.
+   * Closes idle WebSockets and purges expired pairing codes.
+   */
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    let activeCount = 0;
+
+    if (this.state.getWebSockets) {
+      for (const ws of this.state.getWebSockets()) {
+        const att = ws.deserializeAttachment() as WsAttachment | null;
+        if (!att) continue;
+
+        const lastMsg = att.lastMessageTime ?? 0;
+        if (lastMsg > 0 && now - lastMsg > WS_IDLE_TIMEOUT_MS) {
+          // Close idle WebSocket
+          try {
+            ws.close(1000, 'idle timeout');
+          } catch {
+            // May already be closed
+          }
+          if (att.authenticated && att.deviceId) {
+            this.connections.delete(att.deviceId);
+            this.decrementWsCount(att.deviceId);
+          }
+        } else {
+          activeCount++;
+        }
+      }
+    }
+
+    // Purge expired pairing codes
+    this.cleanExpiredPairings();
+
+    // Re-schedule alarm if there are still active connections
+    if (activeCount > 0) {
+      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+    }
+  }
+
+  /**
+   * Schedule the cleanup alarm if not already scheduled.
+   * Called on first WebSocket connection.
+   */
+  private async scheduleAlarmIfNeeded(): Promise<void> {
+    const currentAlarm = await this.state.storage.getAlarm();
+    if (!currentAlarm) {
+      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+    }
+  }
+
   // --- WebSocket connection count helpers ---
 
   private incrementWsCount(deviceId: string): void {
@@ -520,6 +604,7 @@ export class SignalingDO implements DurableObject {
         userId: payload.userId,
         deviceType: payload.deviceType,
         authenticated: true,
+        lastMessageTime: Date.now(),
       };
       ws.serializeAttachment(attachment);
 

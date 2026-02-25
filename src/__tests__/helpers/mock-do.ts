@@ -27,18 +27,42 @@ export function createMockKVStorage(): {
   };
 }
 
-export async function createTestDO(): Promise<SignalingDO> {
+export interface MockDOState {
+  acceptedWebSockets: WebSocket[];
+  scheduledAlarm: number | null;
+}
+
+export async function createTestDO(): Promise<{ doInstance: SignalingDO; mockState: MockDOState }> {
   const mockSql = await createMockSqlStorage();
   const mockKV = createMockKVStorage();
 
   // Track accepted WebSockets for the Hibernation API mock
   const acceptedWebSockets: WebSocket[] = [];
 
+  // Track alarm scheduling
+  let scheduledAlarm: number | null = null;
+
+  const trackableState: MockDOState = {
+    acceptedWebSockets,
+    scheduledAlarm,
+  };
+
   const mockState = {
     storage: {
       sql: mockSql,
       get: mockKV.get,
       put: mockKV.put,
+      async setAlarm(scheduledTime: number): Promise<void> {
+        scheduledAlarm = scheduledTime;
+        trackableState.scheduledAlarm = scheduledTime;
+      },
+      async getAlarm(): Promise<number | null> {
+        return scheduledAlarm;
+      },
+      async deleteAlarm(): Promise<void> {
+        scheduledAlarm = null;
+        trackableState.scheduledAlarm = null;
+      },
     },
     acceptWebSocket(ws: WebSocket): void {
       acceptedWebSockets.push(ws);
@@ -55,8 +79,19 @@ export async function createTestDO(): Promise<SignalingDO> {
     JWT_SECRET: 'test-jwt-secret-at-least-32-chars-long',
   };
 
-  return new SignalingDO(
+  const doInstance = new SignalingDO(
     mockState as unknown as DurableObjectState,
     mockEnv
   );
+
+  return { doInstance, mockState: trackableState };
+}
+
+/**
+ * Legacy helper — returns just the DO instance for backward compatibility
+ * with existing tests that destructure as `doInstance = await createTestDO()`.
+ */
+export async function createTestDOCompat(): Promise<SignalingDO> {
+  const { doInstance } = await createTestDO();
+  return doInstance;
 }
