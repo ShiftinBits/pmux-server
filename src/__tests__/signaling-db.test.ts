@@ -9,11 +9,11 @@ beforeEach(async () => {
 });
 
 describe('device registration', () => {
-  it('registers an agent device and creates a new user', () => {
+  it('registers a host device and creates a new user', () => {
     const result = doInstance.registerDevice(
       'agent-device-1',
       'ed25519-public-key-agent',
-      'agent'
+      'host'
     );
 
     expect(result.deviceId).toBe('agent-device-1');
@@ -22,11 +22,11 @@ describe('device registration', () => {
   });
 
   it('registers a mobile device linked to an existing user', () => {
-    // First: register agent (creates user)
+    // First: register host (creates user)
     const agentResult = doInstance.registerDevice(
       'agent-device-1',
       'ed25519-public-key-agent',
-      'agent'
+      'host'
     );
 
     // Second: register mobile under the same user
@@ -44,13 +44,13 @@ describe('device registration', () => {
 
 describe('getDevice', () => {
   it('returns a registered device', () => {
-    doInstance.registerDevice('device-1', 'pub-key-1', 'agent');
+    doInstance.registerDevice('device-1', 'pub-key-1', 'host');
 
     const device = doInstance.getDevice('device-1');
     expect(device).not.toBeNull();
     expect(device!.id).toBe('device-1');
     expect(device!.publicKey).toBe('pub-key-1');
-    expect(device!.deviceType).toBe('agent');
+    expect(device!.deviceType).toBe('host');
     expect(device!.createdAt).toBeTypeOf('number');
   });
 
@@ -65,7 +65,7 @@ describe('getDevicesByUser', () => {
     const agentResult = doInstance.registerDevice(
       'agent-1',
       'pub-key-agent',
-      'agent'
+      'host'
     );
     doInstance.registerDevice(
       'mobile-1',
@@ -78,7 +78,7 @@ describe('getDevicesByUser', () => {
     expect(devices).toHaveLength(2);
 
     const types = devices.map(d => d.deviceType).sort();
-    expect(types).toEqual(['agent', 'mobile']);
+    expect(types).toEqual(['host', 'mobile']);
 
     const ids = devices.map(d => d.id).sort();
     expect(ids).toEqual(['agent-1', 'mobile-1']);
@@ -92,7 +92,7 @@ describe('getDevicesByUser', () => {
 
 describe('removeDevice', () => {
   it('removes a device and returns true', () => {
-    doInstance.registerDevice('device-1', 'pub-key', 'agent');
+    doInstance.registerDevice('device-1', 'pub-key', 'host');
 
     const removed = doInstance.removeDevice('device-1');
     expect(removed).toBe(true);
@@ -107,7 +107,7 @@ describe('removeDevice', () => {
   });
 
   it('does not remove the user when removing a device', () => {
-    const result = doInstance.registerDevice('device-1', 'pub-key-1', 'agent');
+    const result = doInstance.registerDevice('device-1', 'pub-key-1', 'host');
     doInstance.registerDevice('device-2', 'pub-key-2', 'mobile', result.userId);
 
     doInstance.removeDevice('device-1');
@@ -140,9 +140,9 @@ describe('pairing session management', () => {
 
     const session = doInstance.consumePairingSession(code);
     expect(session).not.toBeNull();
-    expect(session!.agentDeviceId).toBe('agent-1');
-    expect(session!.agentX25519PublicKey).toBe('x25519-pub-key');
-    expect(session!.agentEdPublicKey).toBe('ed25519-pub-key');
+    expect(session!.hostDeviceId).toBe('agent-1');
+    expect(session!.hostX25519PublicKey).toBe('x25519-pub-key');
+    expect(session!.hostEdPublicKey).toBe('ed25519-pub-key');
 
     // Second consume should return null (single-use)
     const again = doInstance.consumePairingSession(code);

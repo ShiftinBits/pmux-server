@@ -8,7 +8,7 @@
  */
 
 import type { Env } from './worker';
-import type { DeviceType, SignalingClientMessage } from '@pocketmux/shared';
+import type { DeviceType, SignalingClientMessage, HostOnlineMessage } from '@pocketmux/shared';
 import { verifyEd25519Signature, createJWT, verifyJWT } from './auth';
 import { generateTurnCredentials } from './turn';
 import {
@@ -37,9 +37,9 @@ export interface StoredUser {
 }
 
 export interface PairingSession {
-  agentDeviceId: string;
-  agentX25519PublicKey: string;
-  agentEdPublicKey: string;
+  hostDeviceId: string;
+  hostX25519PublicKey: string;
+  hostEdPublicKey: string;
   expiresAt: number;
 }
 
@@ -106,7 +106,7 @@ export class SignalingDO implements DurableObject {
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL REFERENCES users(id),
         public_key TEXT NOT NULL UNIQUE,
-        device_type TEXT NOT NULL CHECK(device_type IN ('agent', 'mobile')),
+        device_type TEXT NOT NULL CHECK(device_type IN ('host', 'mobile')),
         name TEXT,
         created_at INTEGER NOT NULL
       )
@@ -212,15 +212,23 @@ export class SignalingDO implements DurableObject {
     return true;
   }
 
+  /**
+   * Update a device's display name.
+   */
+  updateDeviceName(deviceId: string, name: string): void {
+    this.ensureSchema();
+    this.sql.exec('UPDATE devices SET name = ? WHERE id = ?', name, deviceId);
+  }
+
   // --- Pairing session management ---
 
   /**
    * Create a pairing session. Returns a 6-character alphanumeric code.
    */
   createPairingSession(
-    agentDeviceId: string,
-    agentX25519PublicKey: string,
-    agentEdPublicKey: string
+    hostDeviceId: string,
+    hostX25519PublicKey: string,
+    hostEdPublicKey: string
   ): string {
     // Clean up expired sessions
     this.cleanExpiredPairings();
@@ -230,9 +238,9 @@ export class SignalingDO implements DurableObject {
       code = generatePairingCode();
     } while (this.pairingSessions.has(code));
     this.pairingSessions.set(code, {
-      agentDeviceId,
-      agentX25519PublicKey,
-      agentEdPublicKey,
+      hostDeviceId,
+      hostX25519PublicKey,
+      hostEdPublicKey,
       expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
     });
 
@@ -432,7 +440,7 @@ export class SignalingDO implements DurableObject {
 
     switch (data.type) {
       case 'presence':
-        // Agent heartbeat — acknowledged. DO stays awake due to message receipt.
+        // Host heartbeat — acknowledged. DO stays awake due to message receipt.
         break;
 
       case 'connect_request':
@@ -457,16 +465,22 @@ export class SignalingDO implements DurableObject {
     const attachment = ws.deserializeAttachment() as WsAttachment | null;
     if (!attachment?.authenticated) return;
 
-    // Remove from in-memory cache
-    this.connections.delete(attachment.deviceId);
+    // Only remove from cache if this WS is the one currently stored.
+    // A device may have multiple concurrent WebSockets (e.g., mobile uses one
+    // for presence on the host list and another for WebRTC signaling). If a
+    // stale WS closes after a newer one registered, blindly deleting would
+    // remove the newer WS's routing entry.
+    if (this.connections.get(attachment.deviceId) === ws) {
+      this.connections.delete(attachment.deviceId);
+    }
 
     // Decrement WebSocket connection count
     this.decrementWsCount(attachment.deviceId);
 
-    // If agent disconnected, notify mobile clients
-    if (attachment.deviceType === 'agent') {
+    // If host disconnected, notify mobile clients
+    if (attachment.deviceType === 'host') {
       this.notifyMobileDevices(attachment.userId, {
-        type: 'agent_offline',
+        type: 'host_offline',
         deviceId: attachment.deviceId,
       });
     }
@@ -478,12 +492,14 @@ export class SignalingDO implements DurableObject {
   async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     const attachment = ws.deserializeAttachment() as WsAttachment | null;
     if (attachment?.authenticated) {
-      this.connections.delete(attachment.deviceId);
+      if (this.connections.get(attachment.deviceId) === ws) {
+        this.connections.delete(attachment.deviceId);
+      }
       this.decrementWsCount(attachment.deviceId);
-      // Notify mobile clients if agent errored out
-      if (attachment.deviceType === 'agent') {
+      // Notify mobile clients if host errored out
+      if (attachment.deviceType === 'host') {
         this.notifyMobileDevices(attachment.userId, {
-          type: 'agent_offline',
+          type: 'host_offline',
           deviceId: attachment.deviceId,
         });
       }
@@ -533,7 +549,9 @@ export class SignalingDO implements DurableObject {
             // May already be closed
           }
           if (att.authenticated && att.deviceId) {
-            this.connections.delete(att.deviceId);
+            if (this.connections.get(att.deviceId) === ws) {
+              this.connections.delete(att.deviceId);
+            }
             this.decrementWsCount(att.deviceId);
           }
         } else {
@@ -612,28 +630,38 @@ export class SignalingDO implements DurableObject {
       this.connections.set(payload.deviceId, ws);
       this.incrementWsCount(payload.deviceId);
 
-      // If agent, notify connected mobile clients of agent_online
-      if (payload.deviceType === 'agent') {
-        this.notifyMobileDevices(payload.userId, {
-          type: 'agent_online',
+      // If host, notify connected mobile clients of host_online (with name from DB)
+      if (payload.deviceType === 'host') {
+        const hostDevice = this.getDevice(payload.deviceId);
+        const hostOnlineMsg: HostOnlineMessage = {
+          type: 'host_online',
           deviceId: payload.deviceId,
-        });
+        };
+        if (hostDevice?.name) {
+          hostOnlineMsg.name = hostDevice.name;
+        }
+        this.notifyMobileDevices(payload.userId, hostOnlineMsg);
       }
 
-      // If mobile, send current presence snapshot for all connected agents.
+      // If mobile, send current presence snapshot for all connected hosts.
       // Read directly from getWebSockets() instead of rebuildConnectionCache()
       // to avoid overwriting the connections map entry for this mobile's deviceId
       // (there may be multiple WebSockets for the same mobile device — one for
-      // presence on the agent list, another for WebRTC signaling).
+      // presence on the host list, another for WebRTC signaling).
       if (payload.deviceType === 'mobile' && this.state.getWebSockets) {
         for (const connWs of this.state.getWebSockets()) {
           const att = connWs.deserializeAttachment() as WsAttachment | null;
           if (
             att?.authenticated &&
             att.userId === payload.userId &&
-            att.deviceType === 'agent'
+            att.deviceType === 'host'
           ) {
-            wsSend(ws, { type: 'agent_online', deviceId: att.deviceId });
+            const device = this.getDevice(att.deviceId);
+            const msg: HostOnlineMessage = { type: 'host_online', deviceId: att.deviceId };
+            if (device?.name) {
+              msg.name = device.name;
+            }
+            wsSend(ws, msg);
           }
         }
       }
@@ -646,8 +674,8 @@ export class SignalingDO implements DurableObject {
   }
 
   /**
-   * Handle connect_request: mobile wants to connect to an agent.
-   * Relays the request to the target agent with the mobile's deviceId.
+   * Handle connect_request: mobile wants to connect to a host.
+   * Relays the request to the target host with the mobile's deviceId.
    */
   private handleConnectRequest(ws: WebSocket, sender: WsAttachment, targetDeviceId: string): void {
     const targetWs = this.findWebSocket(targetDeviceId);
@@ -696,12 +724,12 @@ export class SignalingDO implements DurableObject {
 
   /**
    * POST /pair/initiate
-   * Agent calls this to start pairing. Creates a pairing session.
-   * Body: { deviceId, publicKey, x25519PublicKey }
+   * Host calls this to start pairing. Creates a pairing session.
+   * Body: { deviceId, publicKey, x25519PublicKey, name? }
    * Returns: { pairingCode }
    */
   private async handlePairInitiate(request: Request): Promise<Response> {
-    let body: { deviceId?: string; publicKey?: string; x25519PublicKey?: string };
+    let body: { deviceId?: string; publicKey?: string; x25519PublicKey?: string; name?: string };
     try {
       body = await request.json() as typeof body;
     } catch {
@@ -715,10 +743,18 @@ export class SignalingDO implements DurableObject {
       );
     }
 
-    // Register the agent device if not already registered
+    // Validate name if provided
+    if (body.name !== undefined && (typeof body.name !== 'string' || body.name.length > 64)) {
+      return jsonResponse({ error: 'Name must be a string of 64 characters or fewer' }, 400);
+    }
+
+    // Register the host device if not already registered, or update name
     const existing = this.getDevice(body.deviceId);
     if (!existing) {
-      this.registerDevice(body.deviceId, body.publicKey, 'agent');
+      this.registerDevice(body.deviceId, body.publicKey, 'host', undefined, body.name);
+    } else if (body.name !== undefined && existing.publicKey === body.publicKey) {
+      // Only update name if the caller proves identity via matching publicKey
+      this.updateDeviceName(body.deviceId, body.name);
     }
 
     const pairingCode = this.createPairingSession(
@@ -734,7 +770,7 @@ export class SignalingDO implements DurableObject {
    * POST /pair/complete
    * Mobile calls this with the pairing code to complete pairing.
    * Body: { pairingCode, deviceId, publicKey, x25519PublicKey }
-   * Returns: { agentX25519PublicKey, agentDeviceId, userId }
+   * Returns: { hostX25519PublicKey, hostDeviceId, userId, hostName? }
    */
   private async handlePairComplete(request: Request): Promise<Response> {
     let body: {
@@ -762,14 +798,14 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Invalid or expired pairing code' }, 404);
     }
 
-    // Get the agent device to find its userId
-    const agentDevice = this.getDevice(session.agentDeviceId);
-    if (!agentDevice) {
-      return jsonResponse({ error: 'Agent device not found' }, 500);
+    // Get the host device to find its userId
+    const hostDevice = this.getDevice(session.hostDeviceId);
+    if (!hostDevice) {
+      return jsonResponse({ error: 'Host device not found' }, 500);
     }
 
     // Enforce device count limit per user
-    const deviceCount = this.countDevicesByUser(agentDevice.userId);
+    const deviceCount = this.countDevicesByUser(hostDevice.userId);
     if (deviceCount >= MAX_DEVICES_PER_USER) {
       return jsonResponse(
         { error: `Maximum device limit reached (${MAX_DEVICES_PER_USER})` },
@@ -777,32 +813,33 @@ export class SignalingDO implements DurableObject {
       );
     }
 
-    // Register the mobile device under the same user as the agent
+    // Register the mobile device under the same user as the host
     this.registerDevice(
       body.deviceId,
       body.publicKey,
       'mobile',
-      agentDevice.userId
+      hostDevice.userId
     );
 
-    // Relay mobile's X25519 key to agent via WebSocket if connected
-    const agentWs = this.getConnection(session.agentDeviceId);
-    if (agentWs) {
+    // Relay mobile's X25519 key to host via WebSocket if connected
+    const hostWs = this.getConnection(session.hostDeviceId);
+    if (hostWs) {
       try {
-        agentWs.send(JSON.stringify({
+        hostWs.send(JSON.stringify({
           type: 'pair_complete',
           mobileDeviceId: body.deviceId,
           mobileX25519PublicKey: body.x25519PublicKey,
         }));
       } catch {
-        // Agent WS may have disconnected — pairing data is still stored
+        // Host WS may have disconnected — pairing data is still stored
       }
     }
 
     return jsonResponse({
-      agentX25519PublicKey: session.agentX25519PublicKey,
-      agentDeviceId: session.agentDeviceId,
-      userId: agentDevice.userId,
+      hostX25519PublicKey: session.hostX25519PublicKey,
+      hostDeviceId: session.hostDeviceId,
+      userId: hostDevice.userId,
+      hostName: hostDevice.name ?? '',
     });
   }
 

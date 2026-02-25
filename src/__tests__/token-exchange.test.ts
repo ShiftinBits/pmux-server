@@ -88,7 +88,7 @@ describe('POST /token', () => {
     // Verify the issued JWT
     const payload = await verifyJWT(data['token'] as string, JWT_SECRET);
     expect(payload.deviceId).toBe('agent-1');
-    expect(payload.deviceType).toBe('agent');
+    expect(payload.deviceType).toBe('host');
     expect(payload.userId).toBeTypeOf('string');
   });
 

@@ -147,9 +147,9 @@ describe('checkRateLimit', () => {
       expect(ENDPOINT_LIMITS['/turn/credentials']!.windowMs).toBe(60_000);
     });
 
-    it('/ws allows 30 per minute', () => {
-      expect(ENDPOINT_LIMITS['/ws']!.maxRequests).toBe(30);
-      expect(ENDPOINT_LIMITS['/ws']!.windowMs).toBe(60_000);
+    it('/ws allows 8 per 10 seconds', () => {
+      expect(ENDPOINT_LIMITS['/ws']!.maxRequests).toBe(8);
+      expect(ENDPOINT_LIMITS['/ws']!.windowMs).toBe(10_000);
     });
   });
 });
@@ -427,7 +427,7 @@ describe('WebSocket connection limits', () => {
 
   async function setupDevice(
     deviceId: string,
-    deviceType: 'agent' | 'mobile',
+    deviceType: 'host' | 'mobile',
     userId?: string
   ): Promise<string> {
     doInstance.registerDevice(deviceId, `pubkey-${deviceId}`, deviceType, userId);
@@ -437,7 +437,7 @@ describe('WebSocket connection limits', () => {
 
   async function connectAndAuth(
     deviceId: string,
-    deviceType: 'agent' | 'mobile',
+    deviceType: 'host' | 'mobile',
     userId?: string
   ): Promise<{ ws: MockWebSocket; token: string }> {
     const token = await setupDevice(deviceId, deviceType, userId);
@@ -456,7 +456,7 @@ describe('WebSocket connection limits', () => {
   it('allows up to MAX_WS_CONNECTIONS_PER_DEVICE connections', async () => {
     expect(MAX_WS_CONNECTIONS_PER_DEVICE).toBe(5);
 
-    const token = await setupDevice('agent-1', 'agent');
+    const token = await setupDevice('agent-1', 'host');
 
     // Open 5 connections (the limit)
     for (let i = 0; i < MAX_WS_CONNECTIONS_PER_DEVICE; i++) {
@@ -473,7 +473,7 @@ describe('WebSocket connection limits', () => {
   });
 
   it('rejects 6th WebSocket from same device with code 1008', async () => {
-    const token = await setupDevice('agent-1', 'agent');
+    const token = await setupDevice('agent-1', 'host');
 
     // Open 5 connections
     for (let i = 0; i < MAX_WS_CONNECTIONS_PER_DEVICE; i++) {
@@ -497,7 +497,7 @@ describe('WebSocket connection limits', () => {
   });
 
   it('decrements count on WebSocket close', async () => {
-    const token = await setupDevice('agent-1', 'agent');
+    const token = await setupDevice('agent-1', 'host');
 
     // Open 5 connections
     const sockets: MockWebSocket[] = [];
@@ -506,7 +506,7 @@ describe('WebSocket connection limits', () => {
       ws.serializeAttachment({
         deviceId: 'agent-1',
         userId: 'user-1',
-        deviceType: 'agent',
+        deviceType: 'host',
         authenticated: true,
       });
       await doInstance.webSocketMessage(
@@ -540,7 +540,7 @@ describe('WebSocket connection limits', () => {
   });
 
   it('decrements count on WebSocket error', async () => {
-    const { ws } = await connectAndAuth('agent-1', 'agent');
+    const { ws } = await connectAndAuth('agent-1', 'host');
 
     expect(doInstance.getWsConnectionCount('agent-1')).toBe(1);
 
@@ -553,8 +553,8 @@ describe('WebSocket connection limits', () => {
   });
 
   it('different devices have independent connection limits', async () => {
-    const token1 = await setupDevice('agent-1', 'agent');
-    const token2 = await setupDevice('agent-2', 'agent');
+    const token1 = await setupDevice('agent-1', 'host');
+    const token2 = await setupDevice('agent-2', 'host');
 
     // Fill limit for device 1
     for (let i = 0; i < MAX_WS_CONNECTIONS_PER_DEVICE; i++) {

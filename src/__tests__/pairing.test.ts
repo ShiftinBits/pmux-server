@@ -44,7 +44,7 @@ describe('POST /pair/initiate', () => {
 
     const device = doInstance.getDevice('agent-1');
     expect(device).not.toBeNull();
-    expect(device!.deviceType).toBe('agent');
+    expect(device!.deviceType).toBe('host');
     expect(device!.publicKey).toBe('ed25519-pub-key-agent');
   });
 
@@ -56,6 +56,84 @@ describe('POST /pair/initiate', () => {
 
     expect(status).toBe(400);
     expect(data['error']).toContain('Missing required fields');
+  });
+
+  it('stores host name when provided', async () => {
+    await postJSON('/pair/initiate', {
+      deviceId: 'agent-1',
+      publicKey: 'ed25519-pub-key-agent',
+      x25519PublicKey: 'x25519-pub-key-agent',
+      name: 'my-workstation',
+    });
+
+    const device = doInstance.getDevice('agent-1');
+    expect(device).not.toBeNull();
+    expect(device!.name).toBe('my-workstation');
+  });
+
+  it('updates name on re-initiation', async () => {
+    // First initiation with name
+    await postJSON('/pair/initiate', {
+      deviceId: 'agent-1',
+      publicKey: 'ed25519-pub-key-agent',
+      x25519PublicKey: 'x25519-pub-key-agent',
+      name: 'old-name',
+    });
+
+    // Second initiation with a new name (device already exists)
+    await postJSON('/pair/initiate', {
+      deviceId: 'agent-1',
+      publicKey: 'ed25519-pub-key-agent',
+      x25519PublicKey: 'x25519-pub-key-agent',
+      name: 'new-name',
+    });
+
+    const device = doInstance.getDevice('agent-1');
+    expect(device!.name).toBe('new-name');
+  });
+
+  it('stores null name when not provided', async () => {
+    await postJSON('/pair/initiate', {
+      deviceId: 'agent-1',
+      publicKey: 'ed25519-pub-key-agent',
+      x25519PublicKey: 'x25519-pub-key-agent',
+    });
+
+    const device = doInstance.getDevice('agent-1');
+    expect(device!.name).toBeNull();
+  });
+
+  it('rejects name longer than 64 characters', async () => {
+    const { status, data } = await postJSON('/pair/initiate', {
+      deviceId: 'agent-1',
+      publicKey: 'ed25519-pub-key-agent',
+      x25519PublicKey: 'x25519-pub-key-agent',
+      name: 'x'.repeat(65),
+    });
+
+    expect(status).toBe(400);
+    expect(data['error']).toContain('64 characters');
+  });
+
+  it('does not update name when publicKey does not match', async () => {
+    // First initiation registers the device
+    await postJSON('/pair/initiate', {
+      deviceId: 'agent-1',
+      publicKey: 'ed25519-pub-key-agent',
+      x25519PublicKey: 'x25519-pub-key-agent',
+      name: 'original-name',
+    });
+
+    // Second initiation with wrong publicKey should not update name
+    await postJSON('/pair/initiate', {
+      deviceId: 'agent-1',
+      publicKey: 'wrong-public-key',
+      x25519PublicKey: 'x25519-pub-key-agent',
+      name: 'spoofed-name',
+    });
+
+    const device = doInstance.getDevice('agent-1');
+    expect(device!.name).toBe('original-name');
   });
 });
 
@@ -78,8 +156,8 @@ describe('POST /pair/complete', () => {
     });
 
     expect(status).toBe(200);
-    expect(data['agentX25519PublicKey']).toBe('x25519-pub-key-agent');
-    expect(data['agentDeviceId']).toBe('agent-1');
+    expect(data['hostX25519PublicKey']).toBe('x25519-pub-key-agent');
+    expect(data['hostDeviceId']).toBe('agent-1');
     expect(data['userId']).toBeTypeOf('string');
   });
 
@@ -104,7 +182,7 @@ describe('POST /pair/complete', () => {
 
     expect(devices).toHaveLength(2);
     const types = devices.map(d => d.deviceType).sort();
-    expect(types).toEqual(['agent', 'mobile']);
+    expect(types).toEqual(['host', 'mobile']);
   });
 
   it('rejects invalid pairing code', async () => {

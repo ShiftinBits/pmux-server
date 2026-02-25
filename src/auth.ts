@@ -120,7 +120,7 @@ const JWT_MAX_CLOCK_SKEW_S = 60; // Maximum allowed clock skew in seconds
  *
  * @param deviceId - The device identifier
  * @param userId - The user identifier
- * @param deviceType - "agent" or "mobile"
+ * @param deviceType - "host" or "mobile"
  * @param secret - Server-side HMAC secret
  * @returns Compact JWT string (header.payload.signature)
  */

@@ -35,7 +35,7 @@ beforeEach(async () => {
 
 async function setupDevice(
   deviceId: string,
-  deviceType: 'agent' | 'mobile',
+  deviceType: 'host' | 'mobile',
   userId?: string
 ): Promise<string> {
   doInstance.registerDevice(deviceId, `pubkey-${deviceId}`, deviceType, userId);
@@ -45,7 +45,7 @@ async function setupDevice(
 
 async function connectAndAuth(
   deviceId: string,
-  deviceType: 'agent' | 'mobile',
+  deviceType: 'host' | 'mobile',
   userId?: string
 ): Promise<{ ws: MockWebSocket; token: string }> {
   const token = await setupDevice(deviceId, deviceType, userId);
@@ -87,17 +87,17 @@ describe('Concurrent connections integration [T3.11]', () => {
   describe('multi-device messaging', () => {
     it('routes connect_request to correct agent under same user', async () => {
       // User A has agent-A and mobile-A
-      const agentADev = doInstance.registerDevice('agent-A', 'pubkey-agent-A', 'agent');
+      const agentADev = doInstance.registerDevice('agent-A', 'pubkey-agent-A', 'host');
       const userA = agentADev.userId;
 
-      const { ws: agentAWs } = await connectAndAuth('agent-A', 'agent', userA);
+      const { ws: agentAWs } = await connectAndAuth('agent-A', 'host', userA);
       const { ws: mobileAWs } = await connectAndAuth('mobile-A', 'mobile', userA);
 
       // User B has agent-B and mobile-B
-      const agentBDev = doInstance.registerDevice('agent-B', 'pubkey-agent-B', 'agent');
+      const agentBDev = doInstance.registerDevice('agent-B', 'pubkey-agent-B', 'host');
       const userB = agentBDev.userId;
 
-      const { ws: agentBWs } = await connectAndAuth('agent-B', 'agent', userB);
+      const { ws: agentBWs } = await connectAndAuth('agent-B', 'host', userB);
       await connectAndAuth('mobile-B', 'mobile', userB);
 
       // Clear all auth messages
@@ -122,15 +122,15 @@ describe('Concurrent connections integration [T3.11]', () => {
 
     it('relays SDP between correct device pairs', async () => {
       // User A: agent-A + mobile-A
-      const agentADev = doInstance.registerDevice('agent-sdp-A', 'pubkey-A', 'agent');
+      const agentADev = doInstance.registerDevice('agent-sdp-A', 'pubkey-A', 'host');
       const userA = agentADev.userId;
-      const { ws: agentAWs } = await connectAndAuth('agent-sdp-A', 'agent', userA);
+      const { ws: agentAWs } = await connectAndAuth('agent-sdp-A', 'host', userA);
       const { ws: mobileAWs } = await connectAndAuth('mobile-sdp-A', 'mobile', userA);
 
       // User B: agent-B + mobile-B
-      const agentBDev = doInstance.registerDevice('agent-sdp-B', 'pubkey-B', 'agent');
+      const agentBDev = doInstance.registerDevice('agent-sdp-B', 'pubkey-B', 'host');
       const userB = agentBDev.userId;
-      const { ws: agentBWs } = await connectAndAuth('agent-sdp-B', 'agent', userB);
+      const { ws: agentBWs } = await connectAndAuth('agent-sdp-B', 'host', userB);
       const { ws: mobileBWs } = await connectAndAuth('mobile-sdp-B', 'mobile', userB);
 
       // Clear messages
@@ -170,7 +170,7 @@ describe('Concurrent connections integration [T3.11]', () => {
 
     it('prevents cross-user signaling', async () => {
       // User A agent
-      const { ws: agentAWs } = await connectAndAuth('agent-cross-A', 'agent');
+      const { ws: agentAWs } = await connectAndAuth('agent-cross-A', 'host');
       // agentADevice exists but we only need agentAWs for assertions
 
       // User B mobile
@@ -267,7 +267,7 @@ describe('Concurrent connections integration [T3.11]', () => {
     it('enforces MAX_WS_CONNECTIONS_PER_DEVICE', async () => {
       expect(MAX_WS_CONNECTIONS_PER_DEVICE).toBe(5);
 
-      const token = await setupDevice('agent-ws-limit', 'agent');
+      const token = await setupDevice('agent-ws-limit', 'host');
 
       // Open connections up to the limit
       const sockets: MockWebSocket[] = [];
@@ -300,7 +300,7 @@ describe('Concurrent connections integration [T3.11]', () => {
     });
 
     it('allows new connections after closing one', async () => {
-      const token = await setupDevice('agent-ws-reopen', 'agent');
+      const token = await setupDevice('agent-ws-reopen', 'host');
 
       // Open 5 connections
       const sockets: MockWebSocket[] = [];
@@ -309,7 +309,7 @@ describe('Concurrent connections integration [T3.11]', () => {
         ws.serializeAttachment({
           deviceId: 'agent-ws-reopen',
           userId: 'test-user',
-          deviceType: 'agent',
+          deviceType: 'host',
           authenticated: true,
         });
         await doInstance.webSocketMessage(
@@ -341,8 +341,8 @@ describe('Concurrent connections integration [T3.11]', () => {
     });
 
     it('different devices have independent connection limits', async () => {
-      const token1 = await setupDevice('agent-ws-indep-1', 'agent');
-      const token2 = await setupDevice('agent-ws-indep-2', 'agent');
+      const token1 = await setupDevice('agent-ws-indep-1', 'host');
+      const token2 = await setupDevice('agent-ws-indep-2', 'host');
 
       // Fill limit for device 1
       for (let i = 0; i < MAX_WS_CONNECTIONS_PER_DEVICE; i++) {
@@ -370,14 +370,14 @@ describe('Concurrent connections integration [T3.11]', () => {
   describe('concurrent operations', () => {
     it('handles multiple simultaneous connect_requests correctly', async () => {
       // One user with one agent and two mobiles
-      const agentDev = doInstance.registerDevice('agent-concurrent', 'pubkey-agent', 'agent');
+      const agentDev = doInstance.registerDevice('agent-concurrent', 'pubkey-agent', 'host');
       const userId = agentDev.userId;
 
-      const { ws: agentWs } = await connectAndAuth('agent-concurrent', 'agent', userId);
+      const { ws: hostWs } = await connectAndAuth('agent-concurrent', 'host', userId);
       const { ws: mobile1Ws } = await connectAndAuth('mobile-concurrent-1', 'mobile', userId);
       const { ws: mobile2Ws } = await connectAndAuth('mobile-concurrent-2', 'mobile', userId);
 
-      agentWs.sent.length = 0;
+      hostWs.sent.length = 0;
 
       // Both mobiles send connect_request simultaneously
       await doInstance.webSocketMessage(
@@ -390,7 +390,7 @@ describe('Concurrent connections integration [T3.11]', () => {
       );
 
       // Agent should receive both connect_requests
-      const requests = agentWs.messagesOfType('connect_request');
+      const requests = hostWs.messagesOfType('connect_request');
       expect(requests).toHaveLength(2);
 
       const senders = requests.map((r) => r['targetDeviceId']).sort();
@@ -399,10 +399,10 @@ describe('Concurrent connections integration [T3.11]', () => {
 
     it('handles simultaneous SDP exchanges between multiple pairs', async () => {
       // User with agent + 2 mobiles
-      const agentDev = doInstance.registerDevice('agent-multi-sdp', 'pubkey-agent', 'agent');
+      const agentDev = doInstance.registerDevice('agent-multi-sdp', 'pubkey-agent', 'host');
       const userId = agentDev.userId;
 
-      const { ws: agentWs } = await connectAndAuth('agent-multi-sdp', 'agent', userId);
+      const { ws: hostWs } = await connectAndAuth('agent-multi-sdp', 'host', userId);
       const { ws: mobile1Ws } = await connectAndAuth('mobile-multi-sdp-1', 'mobile', userId);
       const { ws: mobile2Ws } = await connectAndAuth('mobile-multi-sdp-2', 'mobile', userId);
 
@@ -411,7 +411,7 @@ describe('Concurrent connections integration [T3.11]', () => {
 
       // Agent sends different SDP offers to each mobile
       await doInstance.webSocketMessage(
-        agentWs as unknown as WebSocket,
+        hostWs as unknown as WebSocket,
         JSON.stringify({
           type: 'sdp_offer',
           sdp: 'offer-for-mobile-1',
@@ -419,7 +419,7 @@ describe('Concurrent connections integration [T3.11]', () => {
         })
       );
       await doInstance.webSocketMessage(
-        agentWs as unknown as WebSocket,
+        hostWs as unknown as WebSocket,
         JSON.stringify({
           type: 'sdp_offer',
           sdp: 'offer-for-mobile-2',
@@ -437,11 +437,11 @@ describe('Concurrent connections integration [T3.11]', () => {
       expect(mobile2Offers[0]!['sdp']).toBe('offer-for-mobile-2');
     });
 
-    it('agent disconnect sends agent_offline to all mobiles under same user', async () => {
-      const agentDev = doInstance.registerDevice('agent-offline-all', 'pubkey-agent', 'agent');
+    it('host disconnect sends host_offline to all mobiles under same user', async () => {
+      const agentDev = doInstance.registerDevice('agent-offline-all', 'pubkey-agent', 'host');
       const userId = agentDev.userId;
 
-      const { ws: agentWs } = await connectAndAuth('agent-offline-all', 'agent', userId);
+      const { ws: hostWs } = await connectAndAuth('agent-offline-all', 'host', userId);
       const { ws: mobile1Ws } = await connectAndAuth('mobile-offline-1', 'mobile', userId);
       const { ws: mobile2Ws } = await connectAndAuth('mobile-offline-2', 'mobile', userId);
 
@@ -450,18 +450,18 @@ describe('Concurrent connections integration [T3.11]', () => {
 
       // Agent disconnects
       await doInstance.webSocketClose(
-        agentWs as unknown as WebSocket,
+        hostWs as unknown as WebSocket,
         1000,
         'normal closure',
         true
       );
 
-      // Both mobiles should receive agent_offline
-      const mobile1Offline = mobile1Ws.messagesOfType('agent_offline');
+      // Both mobiles should receive host_offline
+      const mobile1Offline = mobile1Ws.messagesOfType('host_offline');
       expect(mobile1Offline).toHaveLength(1);
       expect(mobile1Offline[0]!['deviceId']).toBe('agent-offline-all');
 
-      const mobile2Offline = mobile2Ws.messagesOfType('agent_offline');
+      const mobile2Offline = mobile2Ws.messagesOfType('host_offline');
       expect(mobile2Offline).toHaveLength(1);
       expect(mobile2Offline[0]!['deviceId']).toBe('agent-offline-all');
     });

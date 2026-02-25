@@ -24,7 +24,7 @@ afterEach(() => {
  */
 async function setupDevice(
   deviceId: string,
-  deviceType: 'agent' | 'mobile',
+  deviceType: 'host' | 'mobile',
   userId?: string
 ): Promise<string> {
   doInstance.registerDevice(deviceId, `pubkey-${deviceId}`, deviceType, userId);
@@ -37,7 +37,7 @@ async function setupDevice(
  */
 async function connectAndAuth(
   deviceId: string,
-  deviceType: 'agent' | 'mobile',
+  deviceType: 'host' | 'mobile',
   userId?: string
 ): Promise<{ ws: MockWebSocket; token: string }> {
   const token = await setupDevice(deviceId, deviceType, userId);
@@ -66,7 +66,7 @@ async function connectAndAuth(
 describe('Signaling server efficiency [T3.10]', () => {
   describe('idle WebSocket cleanup', () => {
     it('closes WebSocket idle for more than 5 minutes', async () => {
-      const { ws } = await connectAndAuth('agent-1', 'agent');
+      const { ws } = await connectAndAuth('agent-1', 'host');
 
       // Simulate that the WS has been idle for 6 minutes
       const att = ws.deserializeAttachment() as Record<string, unknown>;
@@ -82,7 +82,7 @@ describe('Signaling server efficiency [T3.10]', () => {
     });
 
     it('keeps active WebSocket alive (message within 5 minutes)', async () => {
-      const { ws } = await connectAndAuth('agent-1', 'agent');
+      const { ws } = await connectAndAuth('agent-1', 'host');
 
       // Simulate recent activity (2 minutes ago)
       const att = ws.deserializeAttachment() as Record<string, unknown>;
@@ -96,7 +96,7 @@ describe('Signaling server efficiency [T3.10]', () => {
     });
 
     it('keeps WebSocket alive after receiving messages', async () => {
-      const { ws } = await connectAndAuth('agent-1', 'agent');
+      const { ws } = await connectAndAuth('agent-1', 'host');
 
       // Send a message (presence heartbeat) — this should update lastMessageTime
       await doInstance.webSocketMessage(
@@ -116,7 +116,7 @@ describe('Signaling server efficiency [T3.10]', () => {
     });
 
     it('re-schedules alarm when active connections remain', async () => {
-      const { ws } = await connectAndAuth('agent-1', 'agent');
+      const { ws } = await connectAndAuth('agent-1', 'host');
 
       // Simulate recent activity
       const att = ws.deserializeAttachment() as Record<string, unknown>;
@@ -172,7 +172,7 @@ describe('Signaling server efficiency [T3.10]', () => {
       // Code should still be consumable
       const session = doInstance.consumePairingSession(code);
       expect(session).not.toBeNull();
-      expect(session!.agentDeviceId).toBe('agent-1');
+      expect(session!.hostDeviceId).toBe('agent-1');
     });
   });
 
@@ -184,7 +184,7 @@ describe('Signaling server efficiency [T3.10]', () => {
       // with a rate-limited mock that allows the request but catches
       // the WebSocketPair error. Instead, verify via the alarm() path:
       // when alarm fires with active connections, it re-schedules.
-      const { ws } = await connectAndAuth('agent-1', 'agent');
+      const { ws } = await connectAndAuth('agent-1', 'host');
 
       // Simulate recent activity
       const att = ws.deserializeAttachment() as Record<string, unknown>;
@@ -215,7 +215,7 @@ describe('Signaling server efficiency [T3.10]', () => {
   describe('SQLite index verification', () => {
     it('idx_devices_user index exists on devices table', () => {
       // Trigger schema initialization by registering a device
-      doInstance.registerDevice('test-device', 'test-key', 'agent');
+      doInstance.registerDevice('test-device', 'test-key', 'host');
 
       // Query EXPLAIN QUERY PLAN to verify the index is used
       // This works with sql.js which supports EXPLAIN QUERY PLAN
@@ -320,7 +320,7 @@ describe('Correlation IDs and response timing [T3.10]', () => {
 
     // Non-public routes require auth. Provide a valid JWT so the request
     // passes auth middleware and falls through to the 404 handler.
-    const token = await createJWT('device-1', 'user-1', 'agent', JWT_SECRET);
+    const token = await createJWT('device-1', 'user-1', 'host', JWT_SECRET);
     const request = new Request('http://localhost/nonexistent', {
       headers: new Headers({ Authorization: `Bearer ${token}` }),
     });

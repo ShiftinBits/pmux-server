@@ -83,7 +83,7 @@ async function postJSON(
 
 async function connectAndAuth(
   deviceId: string,
-  deviceType: 'agent' | 'mobile',
+  deviceType: 'host' | 'mobile',
   userId?: string
 ): Promise<{ ws: MockWebSocket; token: string }> {
   doInstance.registerDevice(deviceId, `pubkey-${deviceId}`, deviceType, userId);
@@ -129,8 +129,8 @@ describe('Full auth flow integration [T3.11]', () => {
       x25519PublicKey: 'mobile-x25519-pub',
     });
     expect(completeResult.status).toBe(200);
-    expect(completeResult.data['agentDeviceId']).toBe('agent-integ');
-    expect(completeResult.data['agentX25519PublicKey']).toBe('agent-x25519-pub');
+    expect(completeResult.data['hostDeviceId']).toBe('agent-integ');
+    expect(completeResult.data['hostX25519PublicKey']).toBe('agent-x25519-pub');
 
     const userId = completeResult.data['userId'] as string;
     expect(userId).toBeTruthy();
@@ -139,7 +139,7 @@ describe('Full auth flow integration [T3.11]', () => {
     const devices = doInstance.getDevicesByUser(userId);
     expect(devices).toHaveLength(2);
     const deviceTypes = devices.map((d) => d.deviceType).sort();
-    expect(deviceTypes).toEqual(['agent', 'mobile']);
+    expect(deviceTypes).toEqual(['host', 'mobile']);
 
     // 4. Agent exchanges signature for JWT
     const agentTimestamp = String(Math.floor(Date.now() / 1000));
@@ -160,7 +160,7 @@ describe('Full auth flow integration [T3.11]', () => {
     expect(agentPayload.deviceId).toBe('agent-integ');
     expect(agentPayload.sub).toBe('agent-integ');
     expect(agentPayload.aud).toBe('pocketmux');
-    expect(agentPayload.deviceType).toBe('agent');
+    expect(agentPayload.deviceType).toBe('host');
     expect(agentPayload.userId).toBe(userId);
 
     // 5. Mobile exchanges signature for JWT
@@ -184,13 +184,13 @@ describe('Full auth flow integration [T3.11]', () => {
     expect(mobilePayload.userId).toBe(userId);
 
     // 6. Both connect via WebSocket and authenticate
-    const agentWs = new MockWebSocket();
-    doInstance.setConnection('agent-integ', agentWs as unknown as WebSocket);
+    const hostWs = new MockWebSocket();
+    doInstance.setConnection('agent-integ', hostWs as unknown as WebSocket);
     await doInstance.webSocketMessage(
-      agentWs as unknown as WebSocket,
+      hostWs as unknown as WebSocket,
       JSON.stringify({ type: 'auth', token: agentJWT })
     );
-    expect(agentWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+    expect(hostWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
 
     const mobileWs = new MockWebSocket();
     doInstance.setConnection('mobile-integ', mobileWs as unknown as WebSocket);
@@ -201,20 +201,20 @@ describe('Full auth flow integration [T3.11]', () => {
     expect(mobileWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
 
     // 7. Mobile sends connect_request, agent receives it
-    agentWs.sent.length = 0;
+    hostWs.sent.length = 0;
     await doInstance.webSocketMessage(
       mobileWs as unknown as WebSocket,
       JSON.stringify({ type: 'connect_request', targetDeviceId: 'agent-integ' })
     );
 
-    const agentRequests = agentWs.messagesOfType('connect_request');
-    expect(agentRequests).toHaveLength(1);
-    expect(agentRequests[0]!['targetDeviceId']).toBe('mobile-integ');
+    const hostRequests = hostWs.messagesOfType('connect_request');
+    expect(hostRequests).toHaveLength(1);
+    expect(hostRequests[0]!['targetDeviceId']).toBe('mobile-integ');
 
     // 8. SDP/ICE exchange
     mobileWs.sent.length = 0;
     await doInstance.webSocketMessage(
-      agentWs as unknown as WebSocket,
+      hostWs as unknown as WebSocket,
       JSON.stringify({
         type: 'sdp_offer',
         sdp: 'v=0\r\no=- 123 IN IP4 127.0.0.1\r\n',
@@ -227,7 +227,7 @@ describe('Full auth flow integration [T3.11]', () => {
     expect(offers[0]!['sdp']).toContain('v=0');
     expect(offers[0]!['targetDeviceId']).toBe('agent-integ');
 
-    agentWs.sent.length = 0;
+    hostWs.sent.length = 0;
     await doInstance.webSocketMessage(
       mobileWs as unknown as WebSocket,
       JSON.stringify({
@@ -237,16 +237,16 @@ describe('Full auth flow integration [T3.11]', () => {
       })
     );
 
-    const answers = agentWs.messagesOfType('sdp_answer');
+    const answers = hostWs.messagesOfType('sdp_answer');
     expect(answers).toHaveLength(1);
     expect(answers[0]!['targetDeviceId']).toBe('mobile-integ');
 
     // ICE candidates
     mobileWs.sent.length = 0;
-    agentWs.sent.length = 0;
+    hostWs.sent.length = 0;
 
     await doInstance.webSocketMessage(
-      agentWs as unknown as WebSocket,
+      hostWs as unknown as WebSocket,
       JSON.stringify({
         type: 'ice_candidate',
         candidate: 'candidate:1 1 udp 2130706431 192.168.1.1 12345 typ host',
@@ -264,7 +264,7 @@ describe('Full auth flow integration [T3.11]', () => {
     );
 
     expect(mobileWs.messagesOfType('ice_candidate')).toHaveLength(1);
-    expect(agentWs.messagesOfType('ice_candidate')).toHaveLength(1);
+    expect(hostWs.messagesOfType('ice_candidate')).toHaveLength(1);
   });
 
   it('rejects token exchange with wrong key', async () => {
@@ -296,7 +296,7 @@ describe('Full auth flow integration [T3.11]', () => {
 
   it('blocks WebSocket auth with expired token', async () => {
     // Register a device
-    doInstance.registerDevice('agent-expired', 'pubkey-agent', 'agent');
+    doInstance.registerDevice('agent-expired', 'pubkey-agent', 'host');
     const device = doInstance.getDevice('agent-expired')!;
 
     // Create a JWT that is already expired (by manipulating Date.now)
@@ -321,46 +321,46 @@ describe('Full auth flow integration [T3.11]', () => {
     expect(ws.closeCode).toBe(4001);
   });
 
-  it('emits agent_online/offline during connection lifecycle', async () => {
+  it('emits host_online/offline during connection lifecycle', async () => {
     // Register under same user
-    const agentDevice = doInstance.registerDevice('agent-notify', 'pubkey-agent', 'agent');
+    const hostDevice = doInstance.registerDevice('agent-notify', 'pubkey-agent', 'host');
     const { ws: mobileWs } = await connectAndAuth(
       'mobile-notify',
       'mobile',
-      agentDevice.userId
+      hostDevice.userId
     );
 
     // Clear mobile messages from auth
     mobileWs.sent.length = 0;
 
-    // Agent connects - mobile should get agent_online
+    // Agent connects - mobile should get host_online
     const agentToken = await createJWT(
       'agent-notify',
-      agentDevice.userId,
-      'agent',
+      hostDevice.userId,
+      'host',
       JWT_SECRET
     );
-    const agentWs = new MockWebSocket();
-    doInstance.setConnection('agent-notify', agentWs as unknown as WebSocket);
+    const hostWs = new MockWebSocket();
+    doInstance.setConnection('agent-notify', hostWs as unknown as WebSocket);
     await doInstance.webSocketMessage(
-      agentWs as unknown as WebSocket,
+      hostWs as unknown as WebSocket,
       JSON.stringify({ type: 'auth', token: agentToken })
     );
 
-    const onlineMessages = mobileWs.messagesOfType('agent_online');
+    const onlineMessages = mobileWs.messagesOfType('host_online');
     expect(onlineMessages).toHaveLength(1);
     expect(onlineMessages[0]!['deviceId']).toBe('agent-notify');
 
-    // Agent disconnects - mobile should get agent_offline
+    // Agent disconnects - mobile should get host_offline
     mobileWs.sent.length = 0;
     await doInstance.webSocketClose(
-      agentWs as unknown as WebSocket,
+      hostWs as unknown as WebSocket,
       1000,
       'normal closure',
       true
     );
 
-    const offlineMessages = mobileWs.messagesOfType('agent_offline');
+    const offlineMessages = mobileWs.messagesOfType('host_offline');
     expect(offlineMessages).toHaveLength(1);
     expect(offlineMessages[0]!['deviceId']).toBe('agent-notify');
   });
