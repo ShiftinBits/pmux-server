@@ -9,7 +9,7 @@ bindings = [
 
 [[migrations]]
 tag = "v1"
-new_classes = ["SignalingDO"]
+new_sqlite_classes = ["SignalingDO"]
 
 # Environment secrets:
 # - TURN_TOKEN_ID
