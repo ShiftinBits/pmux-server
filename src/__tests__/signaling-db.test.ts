@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { createTestDO } from './helpers/mock-do';
+import { createTestDOCompat as createTestDO } from './helpers/mock-do';
 import type { SignalingDO } from '../signaling';
 
 let doInstance: SignalingDO;

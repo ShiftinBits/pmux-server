@@ -100,6 +100,8 @@ describe('createJWT', () => {
     expect(payload.iat).toBeTypeOf('number');
     expect(payload.exp).toBeTypeOf('number');
     expect(payload.exp).toBeGreaterThan(payload.iat);
+    expect(payload.sub).toBe('device-1');
+    expect(payload.aud).toBe('pocketmux');
   });
 });
 
@@ -112,6 +114,8 @@ describe('verifyJWT', () => {
     expect(payload.userId).toBe('user-1');
     expect(payload.deviceType).toBe('mobile');
     expect(payload.exp).toBeGreaterThan(payload.iat);
+    expect(payload.sub).toBe('device-1');
+    expect(payload.aud).toBe('pocketmux');
   });
 
   it('rejects a tampered token', async () => {
@@ -195,5 +199,132 @@ describe('verifyJWT', () => {
     expect(expiryDuration).toBe(3600); // exactly 1 hour
     expect(payload.iat).toBeGreaterThanOrEqual(before);
     expect(payload.iat).toBeLessThanOrEqual(after);
+  });
+
+  // --- Audience (aud) claim tests ---
+
+  it('rejects JWT with wrong aud claim', async () => {
+    const token = await createJWT('device-1', 'user-1', 'agent', TEST_SECRET);
+    const parts = token.split('.');
+
+    // Decode payload, change aud, re-encode and re-sign
+    const payloadStr = atob(parts[1]!.replace(/-/g, '+').replace(/_/g, '/'));
+    const payload = JSON.parse(payloadStr);
+    payload.aud = 'wrong-audience';
+
+    // Re-encode the tampered payload (this will fail signature check too,
+    // so we need to craft a fully valid token with wrong aud)
+    // Create a helper to sign with our test secret
+    const header = parts[0]!;
+    const newPayload = btoa(JSON.stringify(payload))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const signingInput = `${header}.${newPayload}`;
+
+    // Sign with HMAC-SHA256 using Web Crypto
+    const key = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(TEST_SECRET),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+    const sig = new Uint8Array(
+      await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(signingInput))
+    );
+    const sigBase64url = btoa(String.fromCharCode(...sig))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    const tampered = `${signingInput}.${sigBase64url}`;
+    await expect(verifyJWT(tampered, TEST_SECRET)).rejects.toThrow('invalid audience');
+  });
+
+  it('rejects JWT without aud claim', async () => {
+    const token = await createJWT('device-1', 'user-1', 'agent', TEST_SECRET);
+    const parts = token.split('.');
+
+    // Decode payload, remove aud, re-encode and re-sign
+    const payloadStr = atob(parts[1]!.replace(/-/g, '+').replace(/_/g, '/'));
+    const payload = JSON.parse(payloadStr);
+    delete payload.aud;
+
+    const header = parts[0]!;
+    const newPayload = btoa(JSON.stringify(payload))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const signingInput = `${header}.${newPayload}`;
+
+    const key = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(TEST_SECRET),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+    const sig = new Uint8Array(
+      await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(signingInput))
+    );
+    const sigBase64url = btoa(String.fromCharCode(...sig))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    const tampered = `${signingInput}.${sigBase64url}`;
+    await expect(verifyJWT(tampered, TEST_SECRET)).rejects.toThrow('invalid audience');
+  });
+
+  it('rejects JWT with clock skew > 60s', async () => {
+    // Create a token 90 seconds in the future (beyond 60s tolerance)
+    const futureTime = Date.now() + 90 * 1000;
+    vi.spyOn(Date, 'now').mockReturnValue(futureTime);
+
+    const token = await createJWT('device-1', 'user-1', 'agent', TEST_SECRET);
+
+    // Restore real time — the token's iat is 90s in the future
+    vi.restoreAllMocks();
+
+    await expect(verifyJWT(token, TEST_SECRET)).rejects.toThrow('issued in the future');
+  });
+
+  it('accepts JWT with clock skew <= 60s', async () => {
+    // Create a token 50 seconds in the future (within 60s tolerance)
+    const futureTime = Date.now() + 50 * 1000;
+    vi.spyOn(Date, 'now').mockReturnValue(futureTime);
+
+    const token = await createJWT('device-1', 'user-1', 'agent', TEST_SECRET);
+
+    // Restore real time — the token's iat is 50s in the future (within tolerance)
+    vi.restoreAllMocks();
+
+    const payload = await verifyJWT(token, TEST_SECRET);
+    expect(payload.deviceId).toBe('device-1');
+  });
+
+  // --- Subject (sub) claim tests ---
+
+  it('rejects JWT without sub claim', async () => {
+    const token = await createJWT('device-1', 'user-1', 'agent', TEST_SECRET);
+    const parts = token.split('.');
+
+    const payloadStr = atob(parts[1]!.replace(/-/g, '+').replace(/_/g, '/'));
+    const payload = JSON.parse(payloadStr);
+    delete payload.sub;
+
+    const header = parts[0]!;
+    const newPayload = btoa(JSON.stringify(payload))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const signingInput = `${header}.${newPayload}`;
+
+    const key = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(TEST_SECRET),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+    const sig = new Uint8Array(
+      await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(signingInput))
+    );
+    const sigBase64url = btoa(String.fromCharCode(...sig))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    const tampered = `${signingInput}.${sigBase64url}`;
+    await expect(verifyJWT(tampered, TEST_SECRET)).rejects.toThrow('missing or mismatched subject');
   });
 });
