@@ -620,6 +620,24 @@ export class SignalingDO implements DurableObject {
         });
       }
 
+      // If mobile, send current presence snapshot for all connected agents.
+      // Read directly from getWebSockets() instead of rebuildConnectionCache()
+      // to avoid overwriting the connections map entry for this mobile's deviceId
+      // (there may be multiple WebSockets for the same mobile device — one for
+      // presence on the agent list, another for WebRTC signaling).
+      if (payload.deviceType === 'mobile' && this.state.getWebSockets) {
+        for (const connWs of this.state.getWebSockets()) {
+          const att = connWs.deserializeAttachment() as WsAttachment | null;
+          if (
+            att?.authenticated &&
+            att.userId === payload.userId &&
+            att.deviceType === 'agent'
+          ) {
+            wsSend(ws, { type: 'agent_online', deviceId: att.deviceId });
+          }
+        }
+      }
+
       wsSend(ws, { type: 'auth', status: 'ok' });
     } catch {
       wsSend(ws, { type: 'error', error: 'Authentication failed' });

@@ -51,7 +51,7 @@ export const ENDPOINT_LIMITS: Record<string, RateLimitConfig> = {
   '/pair/complete': { maxRequests: 10, windowMs: 60_000 },
   '/token': { maxRequests: 30, windowMs: 60_000 },
   '/turn/credentials': { maxRequests: 20, windowMs: 60_000 },
-  '/ws': { maxRequests: 5, windowMs: 60_000 },
+  '/ws': { maxRequests: 30, windowMs: 60_000 },
 };
 
 // --- Core rate limit check ---

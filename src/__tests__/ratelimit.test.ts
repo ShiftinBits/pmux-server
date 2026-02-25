@@ -147,8 +147,8 @@ describe('checkRateLimit', () => {
       expect(ENDPOINT_LIMITS['/turn/credentials']!.windowMs).toBe(60_000);
     });
 
-    it('/ws allows 5 per minute', () => {
-      expect(ENDPOINT_LIMITS['/ws']!.maxRequests).toBe(5);
+    it('/ws allows 30 per minute', () => {
+      expect(ENDPOINT_LIMITS['/ws']!.maxRequests).toBe(30);
       expect(ENDPOINT_LIMITS['/ws']!.windowMs).toBe(60_000);
     });
   });
