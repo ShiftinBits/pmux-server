@@ -13,10 +13,10 @@ The server is a zero-knowledge relay. It facilitates WebRTC connection establish
 
 ```bash
 # Install dependencies
-pnpm install
+npm install
 
 # Start local dev server
-pnpm dev          # → http://localhost:8787
+npm run dev          # → http://localhost:8787
 
 # Health check
 curl http://localhost:8787/health
@@ -35,7 +35,7 @@ Set via `wrangler secret put <NAME>`:
 ## Deployment
 
 ```bash
-pnpm deploy       # → deploys to Cloudflare
+npm run deploy       # → deploys to Cloudflare
 ```
 
 Worker name: `pmux-signaling`

@@ -19,9 +19,9 @@ WebSocket: `/ws` (via Durable Object) — auth, presence, SDP/ICE relay
 ## Commands
 
 ```bash
-pnpm dev        # npx wrangler dev (local development)
-pnpm deploy     # npx wrangler deploy (production)
-pnpm test       # run tests
+npm run dev        # npx wrangler dev (local development)
+npm run deploy     # npx wrangler deploy (production)
+npm test           # run tests
 ```
 
 ## Environment
