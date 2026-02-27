@@ -66,9 +66,6 @@ export class SignalingDO implements DurableObject {
   private env: Env;
   private initialized = false;
 
-  // Ephemeral pairing state (in-memory, not SQLite)
-  private pairingSessions = new Map<string, PairingSession>();
-
   // In-memory WebSocket cache indexed by deviceId (rebuilt after hibernation wake)
   private connections = new Map<string, WebSocket>();
 
@@ -115,6 +112,16 @@ export class SignalingDO implements DurableObject {
     this.sql.exec(
       'CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id)'
     );
+
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS pairing_sessions (
+        code TEXT PRIMARY KEY,
+        host_device_id TEXT NOT NULL,
+        host_x25519_public_key TEXT NOT NULL,
+        host_ed_public_key TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+      )
+    `);
 
     this.initialized = true;
   }
@@ -224,49 +231,63 @@ export class SignalingDO implements DurableObject {
 
   /**
    * Create a pairing session. Returns a 6-character alphanumeric code.
+   * Stored in SQLite so it survives DO hibernation.
    */
   createPairingSession(
     hostDeviceId: string,
     hostX25519PublicKey: string,
     hostEdPublicKey: string
   ): string {
+    this.ensureSchema();
     // Clean up expired sessions
     this.cleanExpiredPairings();
 
     let code: string;
     do {
       code = generatePairingCode();
-    } while (this.pairingSessions.has(code));
-    this.pairingSessions.set(code, {
+    } while (this.sql.exec('SELECT 1 FROM pairing_sessions WHERE code = ?', code).toArray().length > 0);
+
+    this.sql.exec(
+      'INSERT INTO pairing_sessions (code, host_device_id, host_x25519_public_key, host_ed_public_key, expires_at) VALUES (?, ?, ?, ?, ?)',
+      code,
       hostDeviceId,
       hostX25519PublicKey,
       hostEdPublicKey,
-      expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
-    });
+      Date.now() + 5 * 60 * 1000
+    );
 
     return code;
   }
 
   /**
    * Consume a pairing session by code. Returns the session and removes it (single-use).
+   * Reads from SQLite so it survives DO hibernation.
    */
   consumePairingSession(code: string): PairingSession | null {
+    this.ensureSchema();
     this.cleanExpiredPairings();
 
-    const session = this.pairingSessions.get(code);
-    if (!session) return null;
+    const rows = this.sql.exec(
+      'SELECT host_device_id, host_x25519_public_key, host_ed_public_key, expires_at FROM pairing_sessions WHERE code = ?',
+      code
+    ).toArray();
 
-    this.pairingSessions.delete(code);
-    return session;
+    if (rows.length === 0) return null;
+
+    const row = rows[0]!;
+    this.sql.exec('DELETE FROM pairing_sessions WHERE code = ?', code);
+
+    return {
+      hostDeviceId: row.host_device_id as string,
+      hostX25519PublicKey: row.host_x25519_public_key as string,
+      hostEdPublicKey: row.host_ed_public_key as string,
+      expiresAt: row.expires_at as number,
+    };
   }
 
   private cleanExpiredPairings(): void {
-    const now = Date.now();
-    for (const [code, session] of this.pairingSessions) {
-      if (session.expiresAt <= now) {
-        this.pairingSessions.delete(code);
-      }
-    }
+    this.ensureSchema();
+    this.sql.exec('DELETE FROM pairing_sessions WHERE expires_at <= ?', Date.now());
   }
 
   // --- WebSocket connection management ---
@@ -314,6 +335,26 @@ export class SignalingDO implements DurableObject {
         att.deviceId !== excludeDeviceId
       ) {
         wsSend(ws, message);
+      }
+    }
+  }
+
+  /**
+   * Send a message to ALL WebSocket connections for a specific device.
+   * Iterates hibernated WebSockets directly (not the 1:1 connections map)
+   * so that every connection receives the message — critical when a device
+   * has multiple concurrent connections (e.g., background agent + pair CLI).
+   */
+  private notifyDevice(deviceId: string, message: unknown): void {
+    if (!this.state.getWebSockets) return;
+    for (const ws of this.state.getWebSockets()) {
+      const att = ws.deserializeAttachment() as WsAttachment | null;
+      if (att?.authenticated && att.deviceId === deviceId) {
+        try {
+          wsSend(ws, message);
+        } catch {
+          // WebSocket may have disconnected
+        }
       }
     }
   }
@@ -821,19 +862,15 @@ export class SignalingDO implements DurableObject {
       hostDevice.userId
     );
 
-    // Relay mobile's X25519 key to host via WebSocket if connected
-    const hostWs = this.getConnection(session.hostDeviceId);
-    if (hostWs) {
-      try {
-        hostWs.send(JSON.stringify({
-          type: 'pair_complete',
-          mobileDeviceId: body.deviceId,
-          mobileX25519PublicKey: body.x25519PublicKey,
-        }));
-      } catch {
-        // Host WS may have disconnected — pairing data is still stored
-      }
-    }
+    // Relay mobile's X25519 key to ALL host WebSocket connections.
+    // The host may have multiple connections (background agent + pair CLI).
+    // After DO hibernation, the connections map only stores one per device,
+    // so we iterate all WebSockets directly to ensure the pair CLI receives it.
+    this.notifyDevice(session.hostDeviceId, {
+      type: 'pair_complete',
+      mobileDeviceId: body.deviceId,
+      mobileX25519PublicKey: body.x25519PublicKey,
+    });
 
     return jsonResponse({
       hostX25519PublicKey: session.hostX25519PublicKey,
