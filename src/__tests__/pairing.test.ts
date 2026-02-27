@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { createTestDOCompat as createTestDO } from './helpers/mock-do';
+import { createTestDOCompat as createTestDO, createTestDO as createTestDOFull } from './helpers/mock-do';
+import { MockWebSocket } from './helpers/mock-websocket';
+import { createJWT } from '../auth';
 import type { SignalingDO } from '../signaling';
 
 let doInstance: SignalingDO;
@@ -262,5 +264,69 @@ describe('POST /pair/complete', () => {
 
     expect(status).toBe(400);
     expect(data['error']).toContain('Missing required fields');
+  });
+
+  it('sends pair_complete to all WebSockets for the host device', async () => {
+    const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
+    const { doInstance: do2, mockState } = await createTestDOFull();
+
+    // Helper for HTTP requests against this DO instance
+    async function post(path: string, body: unknown) {
+      const req = new Request(`http://localhost${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const res = await do2.fetch(req);
+      return { status: res.status, data: await res.json() as Record<string, unknown> };
+    }
+
+    // Initiate pairing (registers the host device)
+    const initResult = await post('/pair/initiate', {
+      deviceId: 'agent-1',
+      publicKey: 'ed25519-pub-key-agent',
+      x25519PublicKey: 'x25519-pub-key-agent',
+    });
+    expect(initResult.status).toBe(200);
+    const pairingCode = initResult.data['pairingCode'] as string;
+
+    // Create two WebSockets for the same host device (background agent + pair CLI)
+    const hostDevice = do2.getDevice('agent-1')!;
+    const token = await createJWT(hostDevice.id, hostDevice.userId, hostDevice.deviceType, JWT_SECRET);
+
+    const agentWs = new MockWebSocket();
+    const pairCliWs = new MockWebSocket();
+
+    // Add both to the hibernation API's WebSocket list
+    mockState.acceptedWebSockets.push(
+      agentWs as unknown as WebSocket,
+      pairCliWs as unknown as WebSocket,
+    );
+
+    // Authenticate both WebSockets
+    await do2.webSocketMessage(agentWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token }));
+    await do2.webSocketMessage(pairCliWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token }));
+
+    // Clear auth responses
+    agentWs.sent.length = 0;
+    pairCliWs.sent.length = 0;
+
+    // Complete pairing
+    const completeResult = await post('/pair/complete', {
+      pairingCode,
+      deviceId: 'mobile-1',
+      publicKey: 'ed25519-pub-key-mobile',
+      x25519PublicKey: 'x25519-pub-key-mobile',
+    });
+    expect(completeResult.status).toBe(200);
+
+    // Both WebSockets should have received pair_complete
+    const agentMsgs = agentWs.messagesOfType('pair_complete');
+    const pairCliMsgs = pairCliWs.messagesOfType('pair_complete');
+
+    expect(agentMsgs).toHaveLength(1);
+    expect(pairCliMsgs).toHaveLength(1);
+    expect(agentMsgs[0]['mobileDeviceId']).toBe('mobile-1');
+    expect(pairCliMsgs[0]['mobileX25519PublicKey']).toBe('x25519-pub-key-mobile');
   });
 });
