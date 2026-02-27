@@ -5,7 +5,7 @@
   "description": "Cloudflare Worker + Durable Object signaling server for PocketMux",
   "license": "MIT",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --ip 0.0.0.0",
     "deploy": "wrangler deploy",
     "test": "vitest run",
     "test:integration": "vitest run src/__tests__/integration/"
