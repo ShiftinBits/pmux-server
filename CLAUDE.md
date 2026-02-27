@@ -9,7 +9,7 @@ Cloudflare Worker + Durable Object signaling server for PocketMux.
 - All endpoints must match spec Section 5.1
 - TypeScript strict mode, no `any`
 - Worker name: `pmux-signaling`
-- Custom domain: `signal.pocketmux.dev`
+- Custom domain: `signal.pmux.io`
 
 ## Endpoints (spec Section 5.1)
 

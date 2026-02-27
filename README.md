@@ -39,7 +39,7 @@ npm run deploy       # → deploys to Cloudflare
 ```
 
 Worker name: `pmux-signaling`
-Custom domain: `signal.pocketmux.dev` (configured in Cloudflare dashboard)
+Custom domain: `signal.pmux.io` (configured in Cloudflare dashboard)
 
 ## License
 
