@@ -394,6 +394,7 @@ describe('POST /pair/complete', () => {
     // Old mobile should have received device_unpaired notification
     const unpairedMsgs = mobile1Ws.messagesOfType('device_unpaired');
     expect(unpairedMsgs).toHaveLength(1);
-    expect(unpairedMsgs[0]!['deviceId']).toBe('agent-1');
+    expect(unpairedMsgs[0]!['hostDeviceId']).toBe('agent-1');
+    expect(unpairedMsgs[0]!['reason']).toBe('replaced_by_new_pairing');
   });
 });

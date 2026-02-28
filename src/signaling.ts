@@ -512,6 +512,7 @@ export class SignalingDO implements DurableObject {
       case 'sdp_offer':
       case 'sdp_answer':
       case 'ice_candidate':
+      case 'connection_rejected':
         this.relaySignalingMessage(attachment, data);
         break;
 
@@ -867,13 +868,18 @@ export class SignalingDO implements DurableObject {
 
     // Check if this host already has a paired mobile — if so, replace it
     const existingMobileId = this.getPairedMobile(session.hostDeviceId);
-    if (existingMobileId) {
+    if (existingMobileId && existingMobileId !== body.deviceId) {
       // Notify the old mobile that it has been unpaired
       this.notifyDevice(existingMobileId, {
         type: 'device_unpaired',
-        deviceId: session.hostDeviceId,
+        reason: 'replaced_by_new_pairing',
+        hostDeviceId: session.hostDeviceId,
+        hostName: hostDevice.name ?? undefined,
       });
       // Remove the old pairing (also cleans up orphaned mobile device)
+      this.removePairing(session.hostDeviceId);
+    } else if (existingMobileId) {
+      // Same mobile re-pairing — just remove old pairing, no notification needed
       this.removePairing(session.hostDeviceId);
     }
 
