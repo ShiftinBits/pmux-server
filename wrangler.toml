@@ -1,6 +1,18 @@
 name = "pmux-signaling"
 main = "src/worker.ts"
-compatibility_date = "2024-12-01"
+compatibility_date = "2026-02-23"
+workers_dev = true
+preview_urls = true
+
+routes = [
+  { pattern = "signal.pmux.io", zone_name = "pmux.io", custom_domain = true }
+]
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
 
 [durable_objects]
 bindings = [
@@ -11,7 +23,7 @@ bindings = [
 tag = "v1"
 new_sqlite_classes = ["SignalingDO"]
 
-# Environment secrets:
-# - TURN_TOKEN_ID
+# Environment secrets (set via `wrangler secret put`):
 # - TURN_API_TOKEN
+# - TURN_TOKEN_ID
 # - JWT_SECRET
