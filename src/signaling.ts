@@ -745,17 +745,19 @@ export class SignalingDO implements DurableObject {
    * Only allows signaling between paired devices.
    */
   private handleConnectRequest(ws: WebSocket, sender: WsAttachment, targetDeviceId: string): void {
-    const targetWs = this.findWebSocket(targetDeviceId);
-    if (!targetWs) {
-      wsSend(ws, { type: 'error', error: `Device ${targetDeviceId} is not connected` });
-      return;
-    }
-
-    // Verify sender and target are paired (prevents cross-pairing signaling)
+    // Check pairing FIRST (before WS lookup) — don't reveal device existence to unpaired callers
     const hostId = sender.deviceType === 'host' ? sender.deviceId : targetDeviceId;
     const mobileId = sender.deviceType === 'mobile' ? sender.deviceId : targetDeviceId;
     if (!this.isPaired(hostId, mobileId)) {
       wsSend(ws, { type: 'error', error: `Device ${targetDeviceId} is not connected` });
+      return;
+    }
+
+    // Paired — check if target is online
+    const targetWs = this.findWebSocket(targetDeviceId);
+    if (!targetWs) {
+      // Paired but offline → send host_offline so mobile can schedule reconnect
+      wsSend(ws, { type: 'host_offline', deviceId: targetDeviceId });
       return;
     }
 

@@ -284,12 +284,13 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(requests[0]!['targetDeviceId']).toBe('mobile-1');
     });
 
-    it('returns error when target device is not connected', async () => {
+    it('returns error when target device is not paired', async () => {
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
 
       // Clear auth messages
       mobileWs.sent.length = 0;
 
+      // Target device doesn't exist and no pairing — hits isPaired check first
       await doInstance.webSocketMessage(
         mobileWs as unknown as WebSocket,
         JSON.stringify({ type: 'connect_request', targetDeviceId: 'nonexistent-agent' })
@@ -298,6 +299,52 @@ describe('WebSocket signaling [T1.8]', () => {
       const errors = mobileWs.messagesOfType('error');
       expect(errors).toHaveLength(1);
       expect(errors[0]!['error']).toContain('not connected');
+    });
+
+    it('sends host_offline when target is paired but offline', async () => {
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      // Clear auth messages
+      mobileWs.sent.length = 0;
+
+      // Mobile sends connect_request to paired agent that is NOT connected
+      await doInstance.webSocketMessage(
+        mobileWs as unknown as WebSocket,
+        JSON.stringify({ type: 'connect_request', targetDeviceId: 'agent-1' })
+      );
+
+      // Should receive host_offline, not a generic error
+      const offlineMessages = mobileWs.messagesOfType('host_offline');
+      expect(offlineMessages).toHaveLength(1);
+      expect(offlineMessages[0]!['deviceId']).toBe('agent-1');
+
+      // Should NOT receive a generic error
+      const errors = mobileWs.messagesOfType('error');
+      expect(errors).toHaveLength(0);
+    });
+
+    it('returns generic error for connect_request to unpaired device', async () => {
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      // No pairing created — agent-1 is unknown to mobile-1
+
+      // Clear auth messages
+      mobileWs.sent.length = 0;
+
+      // Mobile sends connect_request to an unpaired device
+      await doInstance.webSocketMessage(
+        mobileWs as unknown as WebSocket,
+        JSON.stringify({ type: 'connect_request', targetDeviceId: 'agent-1' })
+      );
+
+      // Should get generic error (security: don't reveal device existence)
+      const errors = mobileWs.messagesOfType('error');
+      expect(errors).toHaveLength(1);
+      expect(errors[0]!['error']).toContain('not connected');
+
+      // Should NOT receive host_offline
+      const offlineMessages = mobileWs.messagesOfType('host_offline');
+      expect(offlineMessages).toHaveLength(0);
     });
   });
 
