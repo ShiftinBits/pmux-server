@@ -14,7 +14,6 @@ export interface JWTPayload {
   sub: string;       // Subject — device ID (standard JWT claim)
   aud: string;       // Audience — must be 'pocketmux'
   deviceId: string;  // Device ID (mirrors sub for backward compatibility)
-  userId: string;
   deviceType: DeviceType;
   iat: number;
   exp: number;
@@ -119,14 +118,12 @@ const JWT_MAX_CLOCK_SKEW_S = 60; // Maximum allowed clock skew in seconds
  * Create a signed JWT for a device.
  *
  * @param deviceId - The device identifier
- * @param userId - The user identifier
  * @param deviceType - "host" or "mobile"
  * @param secret - Server-side HMAC secret
  * @returns Compact JWT string (header.payload.signature)
  */
 export async function createJWT(
   deviceId: string,
-  userId: string,
   deviceType: DeviceType,
   secret: string
 ): Promise<string> {
@@ -135,7 +132,6 @@ export async function createJWT(
     sub: deviceId,
     aud: JWT_AUDIENCE,
     deviceId,
-    userId,
     deviceType,
     iat: now,
     exp: now + Math.floor(JWT_EXPIRY_MS / 1000),

@@ -24,12 +24,10 @@ afterEach(() => {
  */
 async function setupDevice(
   deviceId: string,
-  deviceType: 'host' | 'mobile',
-  userId?: string
+  deviceType: 'host' | 'mobile'
 ): Promise<string> {
-  doInstance.registerDevice(deviceId, `pubkey-${deviceId}`, deviceType, userId);
-  const device = doInstance.getDevice(deviceId)!;
-  return createJWT(device.id, device.userId, device.deviceType, JWT_SECRET);
+  doInstance.registerDevice(deviceId, `pubkey-${deviceId}`, deviceType);
+  return createJWT(deviceId, deviceType, JWT_SECRET);
 }
 
 /**
@@ -37,10 +35,9 @@ async function setupDevice(
  */
 async function connectAndAuth(
   deviceId: string,
-  deviceType: 'host' | 'mobile',
-  userId?: string
+  deviceType: 'host' | 'mobile'
 ): Promise<{ ws: MockWebSocket; token: string }> {
-  const token = await setupDevice(deviceId, deviceType, userId);
+  const token = await setupDevice(deviceId, deviceType);
   const ws = new MockWebSocket();
 
   // Simulate Hibernation API: DO accepts the WebSocket (adds to accepted list)
@@ -212,16 +209,16 @@ describe('Signaling server efficiency [T3.10]', () => {
     });
   });
 
-  describe('SQLite index verification', () => {
-    it('idx_devices_user index exists on devices table', () => {
-      // Trigger schema initialization by registering a device
-      doInstance.registerDevice('test-device', 'test-key', 'host');
+  describe('SQLite schema verification', () => {
+    it('pairings table is functional after schema initialization', () => {
+      // Trigger schema initialization by registering devices
+      doInstance.registerDevice('test-host', 'test-key-host', 'host');
+      doInstance.registerDevice('test-mobile', 'test-key-mobile', 'mobile');
 
-      // Query EXPLAIN QUERY PLAN to verify the index is used
-      // This works with sql.js which supports EXPLAIN QUERY PLAN
-      const devices = doInstance.getDevicesByUser('nonexistent-user');
-      // If the query didn't throw, the table and index exist
-      expect(devices).toEqual([]);
+      // Create a pairing — verifies the pairings table exists and is functional
+      doInstance.createPairing('test-host', 'test-mobile');
+      expect(doInstance.isPaired('test-host', 'test-mobile')).toBe(true);
+      expect(doInstance.getPairedMobile('test-host')).toBe('test-mobile');
     });
   });
 });
@@ -320,7 +317,7 @@ describe('Correlation IDs and response timing [T3.10]', () => {
 
     // Non-public routes require auth. Provide a valid JWT so the request
     // passes auth middleware and falls through to the 404 handler.
-    const token = await createJWT('device-1', 'user-1', 'host', JWT_SECRET);
+    const token = await createJWT('device-1', 'host', JWT_SECRET);
     const request = new Request('http://localhost/nonexistent', {
       headers: new Headers({ Authorization: `Bearer ${token}` }),
     });

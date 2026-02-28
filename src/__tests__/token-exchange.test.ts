@@ -89,7 +89,6 @@ describe('POST /token', () => {
     const payload = await verifyJWT(data['token'] as string, JWT_SECRET);
     expect(payload.deviceId).toBe('agent-1');
     expect(payload.deviceType).toBe('host');
-    expect(payload.userId).toBeTypeOf('string');
   });
 
   it('rejects an invalid signature', async () => {

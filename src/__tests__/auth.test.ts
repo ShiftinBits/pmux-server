@@ -86,16 +86,15 @@ const TEST_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
 describe('createJWT', () => {
   it('creates a valid JWT string with 3 parts', async () => {
-    const token = await createJWT('device-1', 'user-1', 'host', TEST_SECRET);
+    const token = await createJWT('device-1', 'host', TEST_SECRET);
     const parts = token.split('.');
     expect(parts.length).toBe(3);
   });
 
   it('includes correct payload fields', async () => {
-    const token = await createJWT('device-1', 'user-1', 'host', TEST_SECRET);
+    const token = await createJWT('device-1', 'host', TEST_SECRET);
     const payload = JSON.parse(atob(token.split('.')[1]!.replace(/-/g, '+').replace(/_/g, '/')));
     expect(payload.deviceId).toBe('device-1');
-    expect(payload.userId).toBe('user-1');
     expect(payload.deviceType).toBe('host');
     expect(payload.iat).toBeTypeOf('number');
     expect(payload.exp).toBeTypeOf('number');
@@ -107,11 +106,10 @@ describe('createJWT', () => {
 
 describe('verifyJWT', () => {
   it('round-trips: create then verify', async () => {
-    const token = await createJWT('device-1', 'user-1', 'mobile', TEST_SECRET);
+    const token = await createJWT('device-1', 'mobile', TEST_SECRET);
     const payload = await verifyJWT(token, TEST_SECRET);
 
     expect(payload.deviceId).toBe('device-1');
-    expect(payload.userId).toBe('user-1');
     expect(payload.deviceType).toBe('mobile');
     expect(payload.exp).toBeGreaterThan(payload.iat);
     expect(payload.sub).toBe('device-1');
@@ -119,13 +117,12 @@ describe('verifyJWT', () => {
   });
 
   it('rejects a tampered token', async () => {
-    const token = await createJWT('device-1', 'user-1', 'host', TEST_SECRET);
+    const token = await createJWT('device-1', 'host', TEST_SECRET);
 
     // Tamper with payload
     const parts = token.split('.');
     const tamperedPayload = btoa(JSON.stringify({
       deviceId: 'hacker',
-      userId: 'user-1',
       deviceType: 'host',
       iat: Math.floor(Date.now() / 1000),
       exp: Math.floor(Date.now() / 1000) + 3600,
@@ -136,7 +133,7 @@ describe('verifyJWT', () => {
   });
 
   it('rejects a token signed with wrong secret', async () => {
-    const token = await createJWT('device-1', 'user-1', 'host', TEST_SECRET);
+    const token = await createJWT('device-1', 'host', TEST_SECRET);
     await expect(verifyJWT(token, 'wrong-secret-here-definitely')).rejects.toThrow(
       'signature verification failed'
     );
@@ -148,7 +145,7 @@ describe('verifyJWT', () => {
     const pastTime = Date.now() - 2 * 60 * 60 * 1000; // 2 hours ago
     vi.spyOn(Date, 'now').mockReturnValue(pastTime);
 
-    const token = await createJWT('device-1', 'user-1', 'host', TEST_SECRET);
+    const token = await createJWT('device-1', 'host', TEST_SECRET);
 
     // Restore real time — the token is now expired
     vi.spyOn(Date, 'now').mockReturnValue(realDateNow());
@@ -166,7 +163,7 @@ describe('verifyJWT', () => {
   });
 
   it('rejects JWT with alg:none header', async () => {
-    const token = await createJWT('device-1', 'user-1', 'host', TEST_SECRET);
+    const token = await createJWT('device-1', 'host', TEST_SECRET);
     const parts = token.split('.');
     // Replace header with alg:none
     const noneHeader = btoa(JSON.stringify({ alg: 'none', typ: 'JWT' }))
@@ -180,7 +177,7 @@ describe('verifyJWT', () => {
     const futureTime = Date.now() + 2 * 60 * 60 * 1000; // 2 hours from now
     vi.spyOn(Date, 'now').mockReturnValue(futureTime);
 
-    const token = await createJWT('device-1', 'user-1', 'host', TEST_SECRET);
+    const token = await createJWT('device-1', 'host', TEST_SECRET);
 
     // Restore real time — the token's iat is now 2 hours in the future
     vi.restoreAllMocks();
@@ -190,7 +187,7 @@ describe('verifyJWT', () => {
 
   it('sets expiry to ~1 hour from creation', async () => {
     const before = Math.floor(Date.now() / 1000);
-    const token = await createJWT('device-1', 'user-1', 'host', TEST_SECRET);
+    const token = await createJWT('device-1', 'host', TEST_SECRET);
     const after = Math.floor(Date.now() / 1000);
 
     const payload = await verifyJWT(token, TEST_SECRET);
@@ -204,7 +201,7 @@ describe('verifyJWT', () => {
   // --- Audience (aud) claim tests ---
 
   it('rejects JWT with wrong aud claim', async () => {
-    const token = await createJWT('device-1', 'user-1', 'host', TEST_SECRET);
+    const token = await createJWT('device-1', 'host', TEST_SECRET);
     const parts = token.split('.');
 
     // Decode payload, change aud, re-encode and re-sign
@@ -239,7 +236,7 @@ describe('verifyJWT', () => {
   });
 
   it('rejects JWT without aud claim', async () => {
-    const token = await createJWT('device-1', 'user-1', 'host', TEST_SECRET);
+    const token = await createJWT('device-1', 'host', TEST_SECRET);
     const parts = token.split('.');
 
     // Decode payload, remove aud, re-encode and re-sign
@@ -274,7 +271,7 @@ describe('verifyJWT', () => {
     const futureTime = Date.now() + 90 * 1000;
     vi.spyOn(Date, 'now').mockReturnValue(futureTime);
 
-    const token = await createJWT('device-1', 'user-1', 'host', TEST_SECRET);
+    const token = await createJWT('device-1', 'host', TEST_SECRET);
 
     // Restore real time — the token's iat is 90s in the future
     vi.restoreAllMocks();
@@ -287,7 +284,7 @@ describe('verifyJWT', () => {
     const futureTime = Date.now() + 50 * 1000;
     vi.spyOn(Date, 'now').mockReturnValue(futureTime);
 
-    const token = await createJWT('device-1', 'user-1', 'host', TEST_SECRET);
+    const token = await createJWT('device-1', 'host', TEST_SECRET);
 
     // Restore real time — the token's iat is 50s in the future (within tolerance)
     vi.restoreAllMocks();
@@ -299,7 +296,7 @@ describe('verifyJWT', () => {
   // --- Subject (sub) claim tests ---
 
   it('rejects JWT without sub claim', async () => {
-    const token = await createJWT('device-1', 'user-1', 'host', TEST_SECRET);
+    const token = await createJWT('device-1', 'host', TEST_SECRET);
     const parts = token.split('.');
 
     const payloadStr = atob(parts[1]!.replace(/-/g, '+').replace(/_/g, '/'));

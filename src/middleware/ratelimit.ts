@@ -129,8 +129,5 @@ export function rateLimitResponse(retryAfter: number): Response {
 
 // --- Constants ---
 
-/** Maximum number of paired devices per user (per host identity). */
-export const MAX_DEVICES_PER_USER = 10;
-
 /** Maximum simultaneous WebSocket connections per device ID. */
 export const MAX_WS_CONNECTIONS_PER_DEVICE = 5;

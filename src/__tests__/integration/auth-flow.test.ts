@@ -83,14 +83,14 @@ async function postJSON(
 
 async function connectAndAuth(
   deviceId: string,
-  deviceType: 'host' | 'mobile',
-  userId?: string
+  deviceType: 'host' | 'mobile'
 ): Promise<{ ws: MockWebSocket; token: string }> {
-  doInstance.registerDevice(deviceId, `pubkey-${deviceId}`, deviceType, userId);
-  const device = doInstance.getDevice(deviceId)!;
-  const token = await createJWT(device.id, device.userId, device.deviceType, JWT_SECRET);
+  doInstance.registerDevice(deviceId, `pubkey-${deviceId}`, deviceType);
+  const token = await createJWT(deviceId, deviceType, JWT_SECRET);
   const ws = new MockWebSocket();
 
+  // Must be in acceptedWebSockets for notifyDevice/notifyPairedMobile
+  mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
   doInstance.setConnection(deviceId, ws as unknown as WebSocket);
 
   await doInstance.webSocketMessage(
@@ -131,15 +131,11 @@ describe('Full auth flow integration [T3.11]', () => {
     expect(completeResult.status).toBe(200);
     expect(completeResult.data['hostDeviceId']).toBe('agent-integ');
     expect(completeResult.data['hostX25519PublicKey']).toBe('agent-x25519-pub');
+    // No userId in response
+    expect(completeResult.data['userId']).toBeUndefined();
 
-    const userId = completeResult.data['userId'] as string;
-    expect(userId).toBeTruthy();
-
-    // Verify both devices are under the same user
-    const devices = doInstance.getDevicesByUser(userId);
-    expect(devices).toHaveLength(2);
-    const deviceTypes = devices.map((d) => d.deviceType).sort();
-    expect(deviceTypes).toEqual(['host', 'mobile']);
+    // Verify pairing was created
+    expect(doInstance.isPaired('agent-integ', 'mobile-integ')).toBe(true);
 
     // 4. Agent exchanges signature for JWT
     const agentTimestamp = String(Math.floor(Date.now() / 1000));
@@ -161,7 +157,6 @@ describe('Full auth flow integration [T3.11]', () => {
     expect(agentPayload.sub).toBe('agent-integ');
     expect(agentPayload.aud).toBe('pocketmux');
     expect(agentPayload.deviceType).toBe('host');
-    expect(agentPayload.userId).toBe(userId);
 
     // 5. Mobile exchanges signature for JWT
     const mobileTimestamp = String(Math.floor(Date.now() / 1000));
@@ -181,7 +176,6 @@ describe('Full auth flow integration [T3.11]', () => {
     const mobilePayload = await verifyJWT(mobileJWT, JWT_SECRET);
     expect(mobilePayload.deviceId).toBe('mobile-integ');
     expect(mobilePayload.deviceType).toBe('mobile');
-    expect(mobilePayload.userId).toBe(userId);
 
     // 6. Both connect via WebSocket and authenticate
     const hostWs = new MockWebSocket();
@@ -297,15 +291,13 @@ describe('Full auth flow integration [T3.11]', () => {
   it('blocks WebSocket auth with expired token', async () => {
     // Register a device
     doInstance.registerDevice('agent-expired', 'pubkey-agent', 'host');
-    const device = doInstance.getDevice('agent-expired')!;
 
     // Create a JWT that is already expired (by manipulating Date.now)
     // afterEach restores Date.now if this test throws
     Date.now = () => realDateNow() - 2 * 60 * 60 * 1000; // 2 hours ago
     const expiredToken = await createJWT(
-      device.id,
-      device.userId,
-      device.deviceType,
+      'agent-expired',
+      'host',
       JWT_SECRET
     );
     Date.now = realDateNow;
@@ -322,13 +314,10 @@ describe('Full auth flow integration [T3.11]', () => {
   });
 
   it('emits host_online/offline during connection lifecycle', async () => {
-    // Register under same user
-    const hostDevice = doInstance.registerDevice('agent-notify', 'pubkey-agent', 'host');
-    const { ws: mobileWs } = await connectAndAuth(
-      'mobile-notify',
-      'mobile',
-      hostDevice.userId
-    );
+    // Register and pair host + mobile
+    doInstance.registerDevice('agent-notify', 'pubkey-agent', 'host');
+    const { ws: mobileWs } = await connectAndAuth('mobile-notify', 'mobile');
+    doInstance.createPairing('agent-notify', 'mobile-notify');
 
     // Clear mobile messages from auth
     mobileWs.sent.length = 0;
@@ -336,11 +325,11 @@ describe('Full auth flow integration [T3.11]', () => {
     // Agent connects - mobile should get host_online
     const agentToken = await createJWT(
       'agent-notify',
-      hostDevice.userId,
       'host',
       JWT_SECRET
     );
     const hostWs = new MockWebSocket();
+    mockState.acceptedWebSockets.push(hostWs as unknown as WebSocket);
     doInstance.setConnection('agent-notify', hostWs as unknown as WebSocket);
     await doInstance.webSocketMessage(
       hostWs as unknown as WebSocket,

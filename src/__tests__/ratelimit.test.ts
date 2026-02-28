@@ -3,7 +3,6 @@ import {
   checkRateLimit,
   rateLimitResponse,
   ENDPOINT_LIMITS,
-  MAX_DEVICES_PER_USER,
   MAX_WS_CONNECTIONS_PER_DEVICE,
   type RateLimitStorage,
 } from '../middleware/ratelimit';
@@ -313,109 +312,6 @@ describe('DO rate limiting integration', () => {
   });
 });
 
-// --- Device count limits ---
-
-describe('device count limits', () => {
-  let doInstance: SignalingDO;
-
-  beforeEach(async () => {
-    doInstance = await createTestDO();
-  });
-
-  async function postJSON(
-    path: string,
-    body: unknown
-  ): Promise<{ status: number; data: Record<string, unknown> }> {
-    const request = new Request(`http://localhost${path}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Client-IP': '127.0.0.1',
-      },
-      body: JSON.stringify(body),
-    });
-    const response = await doInstance.fetch(request);
-    const data = await response.json() as Record<string, unknown>;
-    return { status: response.status, data };
-  }
-
-  it('allows up to MAX_DEVICES_PER_USER devices', async () => {
-    expect(MAX_DEVICES_PER_USER).toBe(10);
-
-    // Initiate pairing (creates user + agent device = 1 device)
-    const initResult = await postJSON('/pair/initiate', {
-      deviceId: 'agent-1',
-      publicKey: 'pub-key-agent',
-      x25519PublicKey: 'x25519-key-agent',
-    });
-    const pairingCode = initResult.data['pairingCode'] as string;
-
-    // Complete pairing to establish user association
-    const completeResult = await postJSON('/pair/complete', {
-      pairingCode,
-      deviceId: 'mobile-1',
-      publicKey: 'pub-key-mobile-1',
-      x25519PublicKey: 'x25519-key-mobile-1',
-    });
-    expect(completeResult.status).toBe(200);
-    const userId = completeResult.data['userId'] as string;
-
-    // Register additional devices directly (up to the limit)
-    // Already have 2 devices (agent-1, mobile-1), need 8 more to reach 10
-    for (let i = 2; i < MAX_DEVICES_PER_USER; i++) {
-      doInstance.registerDevice(`mobile-${i}`, `pub-key-mobile-${i}`, 'mobile', userId);
-    }
-
-    // Verify we're at the limit
-    const devices = doInstance.getDevicesByUser(userId);
-    expect(devices).toHaveLength(MAX_DEVICES_PER_USER);
-  });
-
-  it('rejects 11th device pairing with 400', async () => {
-    // Create agent + 9 mobile devices = 10 total
-    const initResult = await postJSON('/pair/initiate', {
-      deviceId: 'agent-1',
-      publicKey: 'pub-key-agent',
-      x25519PublicKey: 'x25519-key-agent',
-    });
-    const pairingCode1 = initResult.data['pairingCode'] as string;
-
-    const completeResult = await postJSON('/pair/complete', {
-      pairingCode: pairingCode1,
-      deviceId: 'mobile-1',
-      publicKey: 'pub-key-mobile-1',
-      x25519PublicKey: 'x25519-key-mobile-1',
-    });
-    const userId = completeResult.data['userId'] as string;
-
-    // Register 8 more devices to reach 10 total
-    for (let i = 2; i <= 9; i++) {
-      doInstance.registerDevice(`mobile-${i}`, `pub-key-mobile-${i}`, 'mobile', userId);
-    }
-
-    // Verify we're at 10
-    expect(doInstance.countDevicesByUser(userId)).toBe(10);
-
-    // Try to pair an 11th device — should be rejected
-    const initResult2 = await postJSON('/pair/initiate', {
-      deviceId: 'agent-1',
-      publicKey: 'pub-key-agent',
-      x25519PublicKey: 'x25519-key-agent',
-    });
-    const pairingCode2 = initResult2.data['pairingCode'] as string;
-
-    const { status, data } = await postJSON('/pair/complete', {
-      pairingCode: pairingCode2,
-      deviceId: 'mobile-overflow',
-      publicKey: 'pub-key-mobile-overflow',
-      x25519PublicKey: 'x25519-key-mobile-overflow',
-    });
-
-    expect(status).toBe(400);
-    expect(data['error']).toContain('Maximum device limit');
-  });
-});
-
 // --- WebSocket connection limits ---
 
 describe('WebSocket connection limits', () => {
@@ -427,20 +323,17 @@ describe('WebSocket connection limits', () => {
 
   async function setupDevice(
     deviceId: string,
-    deviceType: 'host' | 'mobile',
-    userId?: string
+    deviceType: 'host' | 'mobile'
   ): Promise<string> {
-    doInstance.registerDevice(deviceId, `pubkey-${deviceId}`, deviceType, userId);
-    const device = doInstance.getDevice(deviceId)!;
-    return createJWT(device.id, device.userId, device.deviceType, JWT_SECRET);
+    doInstance.registerDevice(deviceId, `pubkey-${deviceId}`, deviceType);
+    return createJWT(deviceId, deviceType, JWT_SECRET);
   }
 
   async function connectAndAuth(
     deviceId: string,
-    deviceType: 'host' | 'mobile',
-    userId?: string
+    deviceType: 'host' | 'mobile'
   ): Promise<{ ws: MockWebSocket; token: string }> {
-    const token = await setupDevice(deviceId, deviceType, userId);
+    const token = await setupDevice(deviceId, deviceType);
     const ws = new MockWebSocket();
 
     doInstance.setConnection(deviceId, ws as unknown as WebSocket);
@@ -505,7 +398,6 @@ describe('WebSocket connection limits', () => {
       const ws = new MockWebSocket();
       ws.serializeAttachment({
         deviceId: 'agent-1',
-        userId: 'user-1',
         deviceType: 'host',
         authenticated: true,
       });

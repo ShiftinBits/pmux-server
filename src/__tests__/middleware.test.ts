@@ -28,12 +28,12 @@ const mockEnv: Env = {
 
 describe('auth middleware', () => {
   it('passes valid JWT through', async () => {
-    const token = await createJWT('device-1', 'user-1', 'host', JWT_SECRET);
+    const token = await createJWT('device-1', 'host', JWT_SECRET);
     const result = await authenticateRequest(makeRequest(`Bearer ${token}`), mockEnv);
 
     expect(result.error).toBeUndefined();
     expect(result.payload?.deviceId).toBe('device-1');
-    expect(result.payload?.userId).toBe('user-1');
+    expect(result.payload?.deviceId).toBe('device-1');
   });
 
   it('rejects missing Authorization header', async () => {
@@ -51,7 +51,7 @@ describe('auth middleware', () => {
     const realDateNow = Date.now;
     Date.now = () => realDateNow() - 2 * 60 * 60 * 1000; // 2 hours ago
 
-    const token = await createJWT('device-1', 'user-1', 'host', JWT_SECRET);
+    const token = await createJWT('device-1', 'host', JWT_SECRET);
 
     Date.now = realDateNow; // restore
 
@@ -60,7 +60,7 @@ describe('auth middleware', () => {
   });
 
   it('rejects tampered token', async () => {
-    const token = await createJWT('device-1', 'user-1', 'host', JWT_SECRET);
+    const token = await createJWT('device-1', 'host', JWT_SECRET);
     // Tamper with the token
     const parts = token.split('.');
     const tampered = `${parts[0]}.${parts[1]}abc.${parts[2]}`;
@@ -70,7 +70,7 @@ describe('auth middleware', () => {
   });
 
   it('rejects token signed with wrong secret', async () => {
-    const token = await createJWT('device-1', 'user-1', 'host', 'different-secret-entirely');
+    const token = await createJWT('device-1', 'host', 'different-secret-entirely');
     const result = await authenticateRequest(makeRequest(`Bearer ${token}`), mockEnv);
     expect(result.error).toContain('signature verification failed');
   });

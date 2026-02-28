@@ -14,8 +14,6 @@ import { generateTurnCredentials } from './turn';
 import {
   checkRateLimit,
   rateLimitResponse,
-  ENDPOINT_LIMITS,
-  MAX_DEVICES_PER_USER,
   MAX_WS_CONNECTIONS_PER_DEVICE,
   type RateLimitStorage,
 } from './middleware/ratelimit';
@@ -40,7 +38,6 @@ export interface PairingSession {
 /** Per-WebSocket metadata, survives DO hibernation via serializeAttachment. */
 export interface WsAttachment {
   deviceId: string;
-  userId: string;
   deviceType: DeviceType;
   authenticated: boolean;
   /** Epoch ms of last received message (for idle timeout). */
@@ -353,22 +350,13 @@ export class SignalingDO implements DurableObject {
   }
 
   /**
-   * Send a message to all connected mobile devices belonging to a user.
+   * Send a message to the paired mobile device of a host.
+   * Looks up the pairing table and notifies all WebSocket connections for that mobile.
    */
-  private notifyMobileDevices(userId: string, message: unknown, excludeDeviceId?: string): void {
-    // Always rebuild cache to ensure no WebSockets are missed after hibernation wake
-    this.rebuildConnectionCache();
-
-    for (const [, ws] of this.connections) {
-      const att = ws.deserializeAttachment() as WsAttachment | null;
-      if (
-        att?.authenticated &&
-        att.userId === userId &&
-        att.deviceType === 'mobile' &&
-        att.deviceId !== excludeDeviceId
-      ) {
-        wsSend(ws, message);
-      }
+  private notifyPairedMobile(hostDeviceId: string, message: unknown): void {
+    const mobileId = this.getPairedMobile(hostDeviceId);
+    if (mobileId) {
+      this.notifyDevice(mobileId, message);
     }
   }
 
@@ -551,9 +539,9 @@ export class SignalingDO implements DurableObject {
     // Decrement WebSocket connection count
     this.decrementWsCount(attachment.deviceId);
 
-    // If host disconnected, notify mobile clients
+    // If host disconnected, notify the paired mobile
     if (attachment.deviceType === 'host') {
-      this.notifyMobileDevices(attachment.userId, {
+      this.notifyPairedMobile(attachment.deviceId, {
         type: 'host_offline',
         deviceId: attachment.deviceId,
       });
@@ -570,9 +558,9 @@ export class SignalingDO implements DurableObject {
         this.connections.delete(attachment.deviceId);
       }
       this.decrementWsCount(attachment.deviceId);
-      // Notify mobile clients if host errored out
+      // Notify the paired mobile if host errored out
       if (attachment.deviceType === 'host') {
-        this.notifyMobileDevices(attachment.userId, {
+        this.notifyPairedMobile(attachment.deviceId, {
           type: 'host_offline',
           deviceId: attachment.deviceId,
         });
@@ -693,7 +681,6 @@ export class SignalingDO implements DurableObject {
 
       const attachment: WsAttachment = {
         deviceId: payload.deviceId,
-        userId: payload.userId,
         deviceType: payload.deviceType,
         authenticated: true,
         lastMessageTime: Date.now(),
@@ -704,7 +691,7 @@ export class SignalingDO implements DurableObject {
       this.connections.set(payload.deviceId, ws);
       this.incrementWsCount(payload.deviceId);
 
-      // If host, notify connected mobile clients of host_online (with name from DB)
+      // If host, notify the paired mobile of host_online (with name from DB)
       if (payload.deviceType === 'host') {
         const hostDevice = this.getDevice(payload.deviceId);
         const hostOnlineMsg: HostOnlineMessage = {
@@ -714,24 +701,20 @@ export class SignalingDO implements DurableObject {
         if (hostDevice?.name) {
           hostOnlineMsg.name = hostDevice.name;
         }
-        this.notifyMobileDevices(payload.userId, hostOnlineMsg);
+        const pairedMobileId = this.getPairedMobile(payload.deviceId);
+        if (pairedMobileId) {
+          this.notifyDevice(pairedMobileId, hostOnlineMsg);
+        }
       }
 
-      // If mobile, send current presence snapshot for all connected hosts.
-      // Read directly from getWebSockets() instead of rebuildConnectionCache()
-      // to avoid overwriting the connections map entry for this mobile's deviceId
-      // (there may be multiple WebSockets for the same mobile device — one for
-      // presence on the host list, another for WebRTC signaling).
-      if (payload.deviceType === 'mobile' && this.state.getWebSockets) {
-        for (const connWs of this.state.getWebSockets()) {
-          const att = connWs.deserializeAttachment() as WsAttachment | null;
-          if (
-            att?.authenticated &&
-            att.userId === payload.userId &&
-            att.deviceType === 'host'
-          ) {
-            const device = this.getDevice(att.deviceId);
-            const msg: HostOnlineMessage = { type: 'host_online', deviceId: att.deviceId };
+      // If mobile, send current presence snapshot for all paired hosts that are connected.
+      if (payload.deviceType === 'mobile') {
+        const pairedHosts = this.getHostsForMobile(payload.deviceId);
+        for (const hostDeviceId of pairedHosts) {
+          const hostWs = this.findWebSocket(hostDeviceId);
+          if (hostWs) {
+            const device = this.getDevice(hostDeviceId);
+            const msg: HostOnlineMessage = { type: 'host_online', deviceId: hostDeviceId };
             if (device?.name) {
               msg.name = device.name;
             }
@@ -750,6 +733,7 @@ export class SignalingDO implements DurableObject {
   /**
    * Handle connect_request: mobile wants to connect to a host.
    * Relays the request to the target host with the mobile's deviceId.
+   * Only allows signaling between paired devices.
    */
   private handleConnectRequest(ws: WebSocket, sender: WsAttachment, targetDeviceId: string): void {
     const targetWs = this.findWebSocket(targetDeviceId);
@@ -758,9 +742,10 @@ export class SignalingDO implements DurableObject {
       return;
     }
 
-    // Verify target belongs to the same user (prevents cross-user signaling)
-    const targetAtt = targetWs.deserializeAttachment() as WsAttachment | null;
-    if (!targetAtt || targetAtt.userId !== sender.userId) {
+    // Verify sender and target are paired (prevents cross-pairing signaling)
+    const hostId = sender.deviceType === 'host' ? sender.deviceId : targetDeviceId;
+    const mobileId = sender.deviceType === 'mobile' ? sender.deviceId : targetDeviceId;
+    if (!this.isPaired(hostId, mobileId)) {
       wsSend(ws, { type: 'error', error: `Device ${targetDeviceId} is not connected` });
       return;
     }
@@ -775,6 +760,7 @@ export class SignalingDO implements DurableObject {
   /**
    * Relay SDP/ICE signaling messages between devices.
    * Swaps targetDeviceId to the sender's deviceId so the recipient knows the origin.
+   * Only allows signaling between paired devices.
    */
   private relaySignalingMessage(
     sender: WsAttachment,
@@ -783,9 +769,10 @@ export class SignalingDO implements DurableObject {
     const targetWs = this.findWebSocket(data.targetDeviceId);
     if (!targetWs) return;
 
-    // Verify target belongs to the same user (prevents cross-user signaling)
-    const targetAtt = targetWs.deserializeAttachment() as WsAttachment | null;
-    if (!targetAtt || targetAtt.userId !== sender.userId) return;
+    // Verify sender and target are paired (prevents cross-pairing signaling)
+    const hostId = sender.deviceType === 'host' ? sender.deviceId : data.targetDeviceId;
+    const mobileId = sender.deviceType === 'mobile' ? sender.deviceId : data.targetDeviceId;
+    if (!this.isPaired(hostId, mobileId)) return;
 
     // Relay with sender's deviceId as the origin
     wsSend(targetWs, {
@@ -825,7 +812,7 @@ export class SignalingDO implements DurableObject {
     // Register the host device if not already registered, or update name
     const existing = this.getDevice(body.deviceId);
     if (!existing) {
-      this.registerDevice(body.deviceId, body.publicKey, 'host', undefined, body.name);
+      this.registerDevice(body.deviceId, body.publicKey, 'host', body.name);
     } else if (body.name !== undefined && existing.publicKey === body.publicKey) {
       // Only update name if the caller proves identity via matching publicKey
       this.updateDeviceName(body.deviceId, body.name);
@@ -844,7 +831,7 @@ export class SignalingDO implements DurableObject {
    * POST /pair/complete
    * Mobile calls this with the pairing code to complete pairing.
    * Body: { pairingCode, deviceId, publicKey, x25519PublicKey }
-   * Returns: { hostX25519PublicKey, hostDeviceId, userId, hostName? }
+   * Returns: { hostX25519PublicKey, hostDeviceId, hostName? }
    */
   private async handlePairComplete(request: Request): Promise<Response> {
     let body: {
@@ -872,28 +859,33 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Invalid or expired pairing code' }, 404);
     }
 
-    // Get the host device to find its userId
+    // Get the host device
     const hostDevice = this.getDevice(session.hostDeviceId);
     if (!hostDevice) {
       return jsonResponse({ error: 'Host device not found' }, 500);
     }
 
-    // Enforce device count limit per user
-    const deviceCount = this.countDevicesByUser(hostDevice.userId);
-    if (deviceCount >= MAX_DEVICES_PER_USER) {
-      return jsonResponse(
-        { error: `Maximum device limit reached (${MAX_DEVICES_PER_USER})` },
-        400
-      );
+    // Check if this host already has a paired mobile — if so, replace it
+    const existingMobileId = this.getPairedMobile(session.hostDeviceId);
+    if (existingMobileId) {
+      // Notify the old mobile that it has been unpaired
+      this.notifyDevice(existingMobileId, {
+        type: 'device_unpaired',
+        deviceId: session.hostDeviceId,
+      });
+      // Remove the old pairing (also cleans up orphaned mobile device)
+      this.removePairing(session.hostDeviceId);
     }
 
-    // Register the mobile device under the same user as the host
+    // Register the mobile device
     this.registerDevice(
       body.deviceId,
       body.publicKey,
-      'mobile',
-      hostDevice.userId
+      'mobile'
     );
+
+    // Create the pairing
+    this.createPairing(session.hostDeviceId, body.deviceId);
 
     // Relay mobile's X25519 key to ALL host WebSocket connections.
     // The host may have multiple connections (background agent + pair CLI).
@@ -908,7 +900,6 @@ export class SignalingDO implements DurableObject {
     return jsonResponse({
       hostX25519PublicKey: session.hostX25519PublicKey,
       hostDeviceId: session.hostDeviceId,
-      userId: hostDevice.userId,
       hostName: hostDevice.name ?? '',
     });
   }
@@ -969,7 +960,6 @@ export class SignalingDO implements DurableObject {
     // Issue JWT
     const token = await createJWT(
       device.id,
-      device.userId,
       device.deviceType,
       this.env.JWT_SECRET
     );

@@ -72,7 +72,6 @@ export default {
         headers: new Headers([
           ...request.headers,
           ['X-Device-Id', authResult.payload!.deviceId],
-          ['X-User-Id', authResult.payload!.userId],
           ['X-Device-Type', authResult.payload!.deviceType],
           ['X-Client-IP', clientIp],
         ]),

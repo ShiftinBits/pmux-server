@@ -20,12 +20,10 @@ beforeEach(async () => {
  */
 async function setupDevice(
   deviceId: string,
-  deviceType: 'host' | 'mobile',
-  userId?: string
+  deviceType: 'host' | 'mobile'
 ): Promise<string> {
-  doInstance.registerDevice(deviceId, `pubkey-${deviceId}`, deviceType, userId);
-  const device = doInstance.getDevice(deviceId)!;
-  return createJWT(device.id, device.userId, device.deviceType, JWT_SECRET);
+  doInstance.registerDevice(deviceId, `pubkey-${deviceId}`, deviceType);
+  return createJWT(deviceId, deviceType, JWT_SECRET);
 }
 
 /**
@@ -33,13 +31,14 @@ async function setupDevice(
  */
 async function connectAndAuth(
   deviceId: string,
-  deviceType: 'host' | 'mobile',
-  userId?: string
+  deviceType: 'host' | 'mobile'
 ): Promise<{ ws: MockWebSocket; token: string }> {
-  const token = await setupDevice(deviceId, deviceType, userId);
+  const token = await setupDevice(deviceId, deviceType);
   const ws = new MockWebSocket();
 
-  // Simulate Hibernation API: DO accepts the WebSocket
+  // Simulate Hibernation API: DO accepts the WebSocket (must be in acceptedWebSockets
+  // for notifyDevice/notifyPairedMobile to find it via state.getWebSockets())
+  mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
   doInstance.setConnection(deviceId, ws as unknown as WebSocket);
 
   // Authenticate
@@ -119,11 +118,11 @@ describe('WebSocket signaling [T1.8]', () => {
   });
 
   describe('host_online / host_offline', () => {
-    it('emits host_online to mobile when host authenticates', async () => {
-      // Register host and mobile under same user
+    it('emits host_online to paired mobile when host authenticates', async () => {
+      // Register host, mobile, and create pairing
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
       const agentToken = await setupDevice('agent-1', 'host');
-      const hostDevice = doInstance.getDevice('agent-1')!;
-      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile', hostDevice.userId);
+      doInstance.createPairing('agent-1', 'mobile-1');
 
       // Clear messages from mobile auth
       mobileWs.sent.length = 0;
@@ -143,11 +142,11 @@ describe('WebSocket signaling [T1.8]', () => {
 
     it('includes name in host_online when host has a name', async () => {
       // Register host with a name
-      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host', undefined, 'my-workstation');
-      const hostDevice = doInstance.getDevice('agent-1')!;
-      const agentToken = await createJWT(hostDevice.id, hostDevice.userId, hostDevice.deviceType, JWT_SECRET);
+      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host', 'my-workstation');
+      const agentToken = await createJWT('agent-1', 'host', JWT_SECRET);
 
-      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile', hostDevice.userId);
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
       mobileWs.sent.length = 0;
 
       // Host authenticates
@@ -167,8 +166,8 @@ describe('WebSocket signaling [T1.8]', () => {
     it('omits name from host_online when host has no name', async () => {
       // Register host without a name
       const agentToken = await setupDevice('agent-1', 'host');
-      const hostDevice = doInstance.getDevice('agent-1')!;
-      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile', hostDevice.userId);
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
       mobileWs.sent.length = 0;
 
       // Host authenticates
@@ -187,9 +186,8 @@ describe('WebSocket signaling [T1.8]', () => {
 
     it('includes name in presence snapshot when mobile authenticates', async () => {
       // Register host with a name and connect it
-      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host', undefined, 'dev-server');
-      const hostDevice = doInstance.getDevice('agent-1')!;
-      const agentToken = await createJWT(hostDevice.id, hostDevice.userId, hostDevice.deviceType, JWT_SECRET);
+      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host', 'dev-server');
+      const agentToken = await createJWT('agent-1', 'host', JWT_SECRET);
 
       // Connect and auth the host — must also add to acceptedWebSockets
       // so state.getWebSockets() returns it during presence snapshot scan
@@ -201,8 +199,18 @@ describe('WebSocket signaling [T1.8]', () => {
         JSON.stringify({ type: 'auth', token: agentToken })
       );
 
-      // Now mobile connects — should get presence snapshot with name
-      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile', hostDevice.userId);
+      // Register mobile and create pairing BEFORE mobile connects
+      doInstance.registerDevice('mobile-1', 'pubkey-mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      // Now mobile connects ��� should get presence snapshot with name
+      const mobileToken = await createJWT('mobile-1', 'mobile', JWT_SECRET);
+      const mobileWs = new MockWebSocket();
+      doInstance.setConnection('mobile-1', mobileWs as unknown as WebSocket);
+      await doInstance.webSocketMessage(
+        mobileWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: mobileToken })
+      );
 
       const onlineMessages = mobileWs.messagesOfType('host_online');
       expect(onlineMessages).toHaveLength(1);
@@ -210,11 +218,11 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(onlineMessages[0]!['name']).toBe('dev-server');
     });
 
-    it('emits host_offline to mobile when host disconnects', async () => {
-      // Set up both under same user
-      const hostDevice = doInstance.registerDevice('agent-1', 'pubkey-agent', 'host');
-      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile', hostDevice.userId);
-      const { ws: hostWs } = await connectAndAuth('agent-1', 'host', hostDevice.userId);
+    it('emits host_offline to paired mobile when host disconnects', async () => {
+      // Set up host and mobile with pairing
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
 
       // Clear prior messages
       mobileWs.sent.length = 0;
@@ -234,9 +242,9 @@ describe('WebSocket signaling [T1.8]', () => {
     });
 
     it('does not emit host_offline when mobile disconnects', async () => {
-      const hostDevice = doInstance.registerDevice('agent-1', 'pubkey-agent', 'host');
-      const { ws: hostWs } = await connectAndAuth('agent-1', 'host', hostDevice.userId);
-      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile', hostDevice.userId);
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
 
       // Clear prior messages
       hostWs.sent.length = 0;
@@ -256,10 +264,10 @@ describe('WebSocket signaling [T1.8]', () => {
   });
 
   describe('connect_request relay', () => {
-    it('relays connect_request from mobile to agent', async () => {
-      const hostDevice = doInstance.registerDevice('agent-1', 'pubkey-agent', 'host');
-      const { ws: hostWs } = await connectAndAuth('agent-1', 'host', hostDevice.userId);
-      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile', hostDevice.userId);
+    it('relays connect_request from mobile to agent when paired', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
 
       // Clear prior messages
       hostWs.sent.length = 0;
@@ -294,10 +302,10 @@ describe('WebSocket signaling [T1.8]', () => {
   });
 
   describe('SDP/ICE relay', () => {
-    it('relays sdp_offer from agent to mobile', async () => {
-      const hostDevice = doInstance.registerDevice('agent-1', 'pubkey-agent', 'host');
-      const { ws: hostWs } = await connectAndAuth('agent-1', 'host', hostDevice.userId);
-      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile', hostDevice.userId);
+    it('relays sdp_offer from agent to mobile when paired', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
 
       // Clear prior messages
       mobileWs.sent.length = 0;
@@ -319,10 +327,10 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(offers[0]!['targetDeviceId']).toBe('agent-1');
     });
 
-    it('relays sdp_answer from mobile to agent', async () => {
-      const hostDevice = doInstance.registerDevice('agent-1', 'pubkey-agent', 'host');
-      const { ws: hostWs } = await connectAndAuth('agent-1', 'host', hostDevice.userId);
-      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile', hostDevice.userId);
+    it('relays sdp_answer from mobile to agent when paired', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
 
       // Clear prior messages
       hostWs.sent.length = 0;
@@ -344,10 +352,10 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(answers[0]!['targetDeviceId']).toBe('mobile-1');
     });
 
-    it('relays ice_candidate bidirectionally', async () => {
-      const hostDevice = doInstance.registerDevice('agent-1', 'pubkey-agent', 'host');
-      const { ws: hostWs } = await connectAndAuth('agent-1', 'host', hostDevice.userId);
-      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile', hostDevice.userId);
+    it('relays ice_candidate bidirectionally when paired', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
 
       // Clear prior messages
       hostWs.sent.length = 0;
@@ -387,8 +395,7 @@ describe('WebSocket signaling [T1.8]', () => {
     });
 
     it('silently drops relay to disconnected target', async () => {
-      const hostDevice = doInstance.registerDevice('agent-1', 'pubkey-agent', 'host');
-      const { ws: hostWs } = await connectAndAuth('agent-1', 'host', hostDevice.userId);
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
 
       // Agent sends SDP offer to a mobile that never connected
       await doInstance.webSocketMessage(
@@ -407,10 +414,10 @@ describe('WebSocket signaling [T1.8]', () => {
 
   describe('full signaling flow', () => {
     it('agent and mobile exchange SDP/ICE through the DO', async () => {
-      // 1. Register devices under same user
-      const hostDevice = doInstance.registerDevice('agent-1', 'pubkey-agent', 'host');
-      const { ws: hostWs } = await connectAndAuth('agent-1', 'host', hostDevice.userId);
-      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile', hostDevice.userId);
+      // 1. Register devices and create pairing
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
 
       // Clear auth messages
       hostWs.sent.length = 0;
@@ -483,16 +490,15 @@ describe('WebSocket signaling [T1.8]', () => {
     });
   });
 
-  describe('cross-user isolation', () => {
-    it('rejects connect_request to device owned by different user', async () => {
-      // User A's agent
+  describe('cross-pairing isolation', () => {
+    it('rejects connect_request to unpaired device', async () => {
+      // Agent and mobile exist but are NOT paired
       const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
-      // User B's mobile (different user)
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
 
       mobileWs.sent.length = 0;
 
-      // Mobile tries to connect to agent owned by a different user
+      // Mobile tries to connect to agent it's not paired with
       await doInstance.webSocketMessage(
         mobileWs as unknown as WebSocket,
         JSON.stringify({ type: 'connect_request', targetDeviceId: 'agent-1' })
@@ -508,15 +514,14 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(hostRequests).toHaveLength(0);
     });
 
-    it('silently drops SDP relay to device owned by different user', async () => {
-      // User A's agent
+    it('silently drops SDP relay to unpaired device', async () => {
+      // Agent and mobile exist but are NOT paired
       const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
-      // User B's mobile (different user)
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
 
       mobileWs.sent.length = 0;
 
-      // Agent tries to send SDP offer to mobile owned by a different user
+      // Agent tries to send SDP offer to unpaired mobile
       await doInstance.webSocketMessage(
         hostWs as unknown as WebSocket,
         JSON.stringify({
@@ -545,10 +550,10 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(hostWs.closeCode).toBe(1011);
     });
 
-    it('emits host_offline on webSocketError for host', async () => {
-      const hostDevice = doInstance.registerDevice('agent-1', 'pubkey-agent', 'host');
-      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile', hostDevice.userId);
-      const { ws: hostWs } = await connectAndAuth('agent-1', 'host', hostDevice.userId);
+    it('emits host_offline on webSocketError for paired host', async () => {
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      doInstance.createPairing('agent-1', 'mobile-1');
 
       mobileWs.sent.length = 0;
 
