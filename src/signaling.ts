@@ -680,6 +680,14 @@ export class SignalingDO implements DurableObject {
         return;
       }
 
+      // Verify device still exists in DB (may have been deleted by orphan cleanup after re-pairing)
+      const device = this.getDevice(payload.deviceId);
+      if (!device) {
+        wsSend(ws, { type: 'error', error: 'Device not found' });
+        ws.close(4004, 'Device not found');
+        return;
+      }
+
       const attachment: WsAttachment = {
         deviceId: payload.deviceId,
         deviceType: payload.deviceType,

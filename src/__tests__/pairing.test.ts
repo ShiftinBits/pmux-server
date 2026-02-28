@@ -397,4 +397,68 @@ describe('POST /pair/complete', () => {
     expect(unpairedMsgs[0]!['hostDeviceId']).toBe('agent-1');
     expect(unpairedMsgs[0]!['reason']).toBe('replaced_by_new_pairing');
   });
+
+  it('same mobile re-pairing does not send device_unpaired notification', async () => {
+    const { doInstance: do2, mockState } = await createTestDOFull();
+    const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
+
+    async function post(path: string, body: unknown) {
+      const req = new Request(`http://localhost${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const res = await do2.fetch(req);
+      return { status: res.status, data: await res.json() as Record<string, unknown> };
+    }
+
+    // First pairing: agent-1 + mobile-1
+    const init1 = await post('/pair/initiate', {
+      deviceId: 'agent-1',
+      publicKey: 'ed25519-pub-key-agent',
+      x25519PublicKey: 'x25519-pub-key-agent',
+    });
+    const code1 = init1.data['pairingCode'] as string;
+
+    await post('/pair/complete', {
+      pairingCode: code1,
+      deviceId: 'mobile-1',
+      publicKey: 'ed25519-pub-key-mobile-1',
+      x25519PublicKey: 'x25519-pub-key-mobile-1',
+    });
+    expect(do2.isPaired('agent-1', 'mobile-1')).toBe(true);
+
+    // Connect mobile-1 via WebSocket
+    const mobile1Token = await createJWT('mobile-1', 'mobile', JWT_SECRET);
+    const mobile1Ws = new MockWebSocket();
+    mockState.acceptedWebSockets.push(mobile1Ws as unknown as WebSocket);
+    do2.setConnection('mobile-1', mobile1Ws as unknown as WebSocket);
+    await do2.webSocketMessage(
+      mobile1Ws as unknown as WebSocket,
+      JSON.stringify({ type: 'auth', token: mobile1Token })
+    );
+    mobile1Ws.sent.length = 0;
+
+    // Same mobile re-pairs with same host
+    const init2 = await post('/pair/initiate', {
+      deviceId: 'agent-1',
+      publicKey: 'ed25519-pub-key-agent',
+      x25519PublicKey: 'x25519-pub-key-agent-2',
+    });
+    const code2 = init2.data['pairingCode'] as string;
+
+    await post('/pair/complete', {
+      pairingCode: code2,
+      deviceId: 'mobile-1',
+      publicKey: 'ed25519-pub-key-mobile-1',
+      x25519PublicKey: 'x25519-pub-key-mobile-1b',
+    });
+
+    // Pairing should still exist
+    expect(do2.isPaired('agent-1', 'mobile-1')).toBe(true);
+
+    // NO device_unpaired notification should have been sent
+    const unpairedMsgs = mobile1Ws.messagesOfType('device_unpaired');
+    expect(unpairedMsgs).toHaveLength(0);
+  });
 });
