@@ -1,7 +1,7 @@
 /**
  * SignalingDO — Durable Object for WebSocket signaling, presence, and storage.
  *
- * Uses built-in SQLite for persistent device/user storage.
+ * Uses built-in SQLite for persistent device/pairing storage.
  * Uses in-memory maps for ephemeral state (pairing codes, WebSocket sessions).
  * Uses the WebSocket Hibernation API for cost-efficient persistent connections.
  * Uses DO key-value storage for rate limit counters.
@@ -24,15 +24,9 @@ import {
 
 export interface StoredDevice {
   id: string;
-  userId: string;
   publicKey: string;
   deviceType: DeviceType;
   name: string | null;
-  createdAt: number;
-}
-
-export interface StoredUser {
-  id: string;
   createdAt: number;
 }
 
@@ -92,16 +86,8 @@ export class SignalingDO implements DurableObject {
     if (this.initialized) return;
 
     this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
-        created_at INTEGER NOT NULL
-      )
-    `);
-
-    this.sql.exec(`
       CREATE TABLE IF NOT EXISTS devices (
         id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL REFERENCES users(id),
         public_key TEXT NOT NULL UNIQUE,
         device_type TEXT NOT NULL CHECK(device_type IN ('host', 'mobile')),
         name TEXT,
@@ -109,9 +95,13 @@ export class SignalingDO implements DurableObject {
       )
     `);
 
-    this.sql.exec(
-      'CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id)'
-    );
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS pairings (
+        host_device_id TEXT PRIMARY KEY REFERENCES devices(id),
+        mobile_device_id TEXT NOT NULL REFERENCES devices(id),
+        created_at INTEGER NOT NULL
+      )
+    `);
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS pairing_sessions (
@@ -129,66 +119,109 @@ export class SignalingDO implements DurableObject {
   // --- Device CRUD ---
 
   /**
-   * Register a new device. If no userId is provided, creates a new user.
-   * Returns the userId and deviceId.
+   * Register a device. INSERT OR REPLACE — re-registering updates the record.
+   * Returns the deviceId.
    */
   registerDevice(
     deviceId: string,
     publicKey: string,
     deviceType: DeviceType,
-    userId?: string,
     name?: string
-  ): { userId: string; deviceId: string } {
+  ): { deviceId: string } {
     this.ensureSchema();
     const now = Math.floor(Date.now() / 1000);
 
-    if (!userId) {
-      // First device — create a new user
-      userId = crypto.randomUUID();
-      this.sql.exec(
-        'INSERT INTO users (id, created_at) VALUES (?, ?)',
-        userId,
-        now
-      );
-    }
-
     this.sql.exec(
-      'INSERT OR REPLACE INTO devices (id, user_id, public_key, device_type, name, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      'INSERT OR REPLACE INTO devices (id, public_key, device_type, name, created_at) VALUES (?, ?, ?, ?, ?)',
       deviceId,
-      userId,
       publicKey,
       deviceType,
       name ?? null,
       now
     );
 
-    return { userId, deviceId };
+    return { deviceId };
+  }
+
+  // --- Pairing CRUD ---
+
+  /**
+   * Create a pairing between a host and a mobile device.
+   * Uses INSERT OR REPLACE — a host can only be paired with one mobile at a time.
+   */
+  createPairing(hostDeviceId: string, mobileDeviceId: string): void {
+    this.ensureSchema();
+    const now = Math.floor(Date.now() / 1000);
+    this.sql.exec(
+      'INSERT OR REPLACE INTO pairings (host_device_id, mobile_device_id, created_at) VALUES (?, ?, ?)',
+      hostDeviceId,
+      mobileDeviceId,
+      now
+    );
   }
 
   /**
-   * Get all devices belonging to a user.
+   * Get the paired mobile device ID for a host, or null if not paired.
    */
-  getDevicesByUser(userId: string): StoredDevice[] {
+  getPairedMobile(hostDeviceId: string): string | null {
     this.ensureSchema();
     const rows = this.sql.exec(
-      'SELECT id, user_id, public_key, device_type, name, created_at FROM devices WHERE user_id = ?',
-      userId
+      'SELECT mobile_device_id FROM pairings WHERE host_device_id = ?',
+      hostDeviceId
     );
-
-    return [...rows].map(rowToDevice);
+    const results = [...rows];
+    if (results.length === 0) return null;
+    return results[0]!['mobile_device_id'] as string;
   }
 
   /**
-   * Count devices belonging to a user.
+   * Check if a specific host-mobile pairing exists.
    */
-  countDevicesByUser(userId: string): number {
+  isPaired(hostDeviceId: string, mobileDeviceId: string): boolean {
     this.ensureSchema();
     const rows = this.sql.exec(
-      'SELECT COUNT(*) as count FROM devices WHERE user_id = ?',
-      userId
+      'SELECT 1 FROM pairings WHERE host_device_id = ? AND mobile_device_id = ?',
+      hostDeviceId,
+      mobileDeviceId
     );
-    const result = [...rows][0];
-    return (result?.['count'] as number) ?? 0;
+    return [...rows].length > 0;
+  }
+
+  /**
+   * Remove the pairing for a host device.
+   * If the mobile device has no remaining pairings, removes the orphaned mobile device.
+   * Returns the removed mobile device ID, or null if no pairing existed.
+   */
+  removePairing(hostDeviceId: string): string | null {
+    this.ensureSchema();
+    // Find the mobile device ID before deleting
+    const mobileId = this.getPairedMobile(hostDeviceId);
+    if (!mobileId) return null;
+
+    this.sql.exec('DELETE FROM pairings WHERE host_device_id = ?', hostDeviceId);
+
+    // Clean up orphaned mobile device (no remaining pairings referencing it)
+    const remaining = this.sql.exec(
+      'SELECT 1 FROM pairings WHERE mobile_device_id = ?',
+      mobileId
+    );
+    if ([...remaining].length === 0) {
+      this.sql.exec('DELETE FROM devices WHERE id = ?', mobileId);
+    }
+
+    return mobileId;
+  }
+
+  /**
+   * Get all host device IDs paired with a given mobile device.
+   */
+  getHostsForMobile(mobileDeviceId: string): string[] {
+    this.ensureSchema();
+    const rows = this.sql.exec(
+      'SELECT host_device_id FROM pairings WHERE mobile_device_id = ?',
+      mobileDeviceId
+    );
+    return [...rows].map(row => row['host_device_id'] as string);
   }
 
   /**
@@ -197,7 +230,7 @@ export class SignalingDO implements DurableObject {
   getDevice(deviceId: string): StoredDevice | null {
     this.ensureSchema();
     const rows = this.sql.exec(
-      'SELECT id, user_id, public_key, device_type, name, created_at FROM devices WHERE id = ?',
+      'SELECT id, public_key, device_type, name, created_at FROM devices WHERE id = ?',
       deviceId
     );
 
@@ -967,7 +1000,6 @@ export class SignalingDO implements DurableObject {
 function rowToDevice(row: Record<string, SqlStorageValue>): StoredDevice {
   return {
     id: row['id'] as string,
-    userId: row['user_id'] as string,
     publicKey: row['public_key'] as string,
     deviceType: row['device_type'] as DeviceType,
     name: row['name'] as string | null,

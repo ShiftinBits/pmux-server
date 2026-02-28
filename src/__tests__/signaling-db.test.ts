@@ -9,7 +9,7 @@ beforeEach(async () => {
 });
 
 describe('device registration', () => {
-  it('registers a host device and creates a new user', () => {
+  it('registers a host device and returns deviceId', () => {
     const result = doInstance.registerDevice(
       'agent-device-1',
       'ed25519-public-key-agent',
@@ -17,28 +17,39 @@ describe('device registration', () => {
     );
 
     expect(result.deviceId).toBe('agent-device-1');
-    expect(result.userId).toBeTruthy();
-    expect(typeof result.userId).toBe('string');
   });
 
-  it('registers a mobile device linked to an existing user', () => {
-    // First: register host (creates user)
-    const agentResult = doInstance.registerDevice(
-      'agent-device-1',
-      'ed25519-public-key-agent',
-      'host'
-    );
-
-    // Second: register mobile under the same user
-    const mobileResult = doInstance.registerDevice(
+  it('registers a mobile device', () => {
+    const result = doInstance.registerDevice(
       'mobile-device-1',
       'ed25519-public-key-mobile',
-      'mobile',
-      agentResult.userId
+      'mobile'
     );
 
-    expect(mobileResult.userId).toBe(agentResult.userId);
-    expect(mobileResult.deviceId).toBe('mobile-device-1');
+    expect(result.deviceId).toBe('mobile-device-1');
+  });
+
+  it('registers a device with an optional name', () => {
+    doInstance.registerDevice(
+      'agent-1',
+      'pub-key-agent',
+      'host',
+      'My Workstation'
+    );
+
+    const device = doInstance.getDevice('agent-1');
+    expect(device).not.toBeNull();
+    expect(device!.name).toBe('My Workstation');
+  });
+
+  it('re-registering a device replaces the old record (INSERT OR REPLACE)', () => {
+    doInstance.registerDevice('device-1', 'pub-key-v1', 'host', 'Old Name');
+    doInstance.registerDevice('device-1', 'pub-key-v2', 'host', 'New Name');
+
+    const device = doInstance.getDevice('device-1');
+    expect(device).not.toBeNull();
+    expect(device!.publicKey).toBe('pub-key-v2');
+    expect(device!.name).toBe('New Name');
   });
 });
 
@@ -58,35 +69,13 @@ describe('getDevice', () => {
     const device = doInstance.getDevice('nonexistent');
     expect(device).toBeNull();
   });
-});
 
-describe('getDevicesByUser', () => {
-  it('returns all devices for a user', () => {
-    const agentResult = doInstance.registerDevice(
-      'agent-1',
-      'pub-key-agent',
-      'host'
-    );
-    doInstance.registerDevice(
-      'mobile-1',
-      'pub-key-mobile',
-      'mobile',
-      agentResult.userId
-    );
+  it('does not include userId in the returned device', () => {
+    doInstance.registerDevice('device-1', 'pub-key-1', 'host');
 
-    const devices = doInstance.getDevicesByUser(agentResult.userId);
-    expect(devices).toHaveLength(2);
-
-    const types = devices.map(d => d.deviceType).sort();
-    expect(types).toEqual(['host', 'mobile']);
-
-    const ids = devices.map(d => d.id).sort();
-    expect(ids).toEqual(['agent-1', 'mobile-1']);
-  });
-
-  it('returns empty array for non-existent user', () => {
-    const devices = doInstance.getDevicesByUser('nonexistent');
-    expect(devices).toHaveLength(0);
+    const device = doInstance.getDevice('device-1');
+    expect(device).not.toBeNull();
+    expect(device).not.toHaveProperty('userId');
   });
 });
 
@@ -105,17 +94,158 @@ describe('removeDevice', () => {
     const removed = doInstance.removeDevice('nonexistent');
     expect(removed).toBe(false);
   });
+});
 
-  it('does not remove the user when removing a device', () => {
-    const result = doInstance.registerDevice('device-1', 'pub-key-1', 'host');
-    doInstance.registerDevice('device-2', 'pub-key-2', 'mobile', result.userId);
+describe('createPairing', () => {
+  it('creates a pairing between a host and a mobile device', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host', 'host');
+    doInstance.registerDevice('mobile-1', 'pub-key-mobile', 'mobile');
 
-    doInstance.removeDevice('device-1');
+    doInstance.createPairing('host-1', 'mobile-1');
 
-    // The other device should still exist under the same user
-    const remaining = doInstance.getDevicesByUser(result.userId);
-    expect(remaining).toHaveLength(1);
-    expect(remaining[0]!.id).toBe('device-2');
+    const mobileId = doInstance.getPairedMobile('host-1');
+    expect(mobileId).toBe('mobile-1');
+  });
+
+  it('replaces existing pairing for the same host (PRIMARY KEY constraint)', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host', 'host');
+    doInstance.registerDevice('mobile-1', 'pub-key-mobile-1', 'mobile');
+    doInstance.registerDevice('mobile-2', 'pub-key-mobile-2', 'mobile');
+
+    doInstance.createPairing('host-1', 'mobile-1');
+    doInstance.createPairing('host-1', 'mobile-2');
+
+    const mobileId = doInstance.getPairedMobile('host-1');
+    expect(mobileId).toBe('mobile-2');
+  });
+});
+
+describe('getPairedMobile', () => {
+  it('returns the paired mobile device ID', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host', 'host');
+    doInstance.registerDevice('mobile-1', 'pub-key-mobile', 'mobile');
+    doInstance.createPairing('host-1', 'mobile-1');
+
+    expect(doInstance.getPairedMobile('host-1')).toBe('mobile-1');
+  });
+
+  it('returns null when host has no pairing', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host', 'host');
+
+    expect(doInstance.getPairedMobile('host-1')).toBeNull();
+  });
+
+  it('returns null for non-existent host', () => {
+    expect(doInstance.getPairedMobile('nonexistent')).toBeNull();
+  });
+});
+
+describe('isPaired', () => {
+  it('returns true when pairing exists', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host', 'host');
+    doInstance.registerDevice('mobile-1', 'pub-key-mobile', 'mobile');
+    doInstance.createPairing('host-1', 'mobile-1');
+
+    expect(doInstance.isPaired('host-1', 'mobile-1')).toBe(true);
+  });
+
+  it('returns false when no pairing exists', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host', 'host');
+    doInstance.registerDevice('mobile-1', 'pub-key-mobile', 'mobile');
+
+    expect(doInstance.isPaired('host-1', 'mobile-1')).toBe(false);
+  });
+
+  it('returns false when host is paired with a different mobile', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host', 'host');
+    doInstance.registerDevice('mobile-1', 'pub-key-mobile-1', 'mobile');
+    doInstance.registerDevice('mobile-2', 'pub-key-mobile-2', 'mobile');
+    doInstance.createPairing('host-1', 'mobile-1');
+
+    expect(doInstance.isPaired('host-1', 'mobile-2')).toBe(false);
+  });
+});
+
+describe('removePairing', () => {
+  it('removes a pairing and returns the mobile device ID', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host', 'host');
+    doInstance.registerDevice('mobile-1', 'pub-key-mobile', 'mobile');
+    doInstance.createPairing('host-1', 'mobile-1');
+
+    const removedMobileId = doInstance.removePairing('host-1');
+    expect(removedMobileId).toBe('mobile-1');
+    expect(doInstance.getPairedMobile('host-1')).toBeNull();
+  });
+
+  it('returns null when no pairing exists', () => {
+    expect(doInstance.removePairing('nonexistent')).toBeNull();
+  });
+
+  it('cleans up orphaned mobile device when no remaining pairings', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host', 'host');
+    doInstance.registerDevice('mobile-1', 'pub-key-mobile', 'mobile');
+    doInstance.createPairing('host-1', 'mobile-1');
+
+    doInstance.removePairing('host-1');
+
+    // Mobile device should be deleted since it has no remaining pairings
+    const device = doInstance.getDevice('mobile-1');
+    expect(device).toBeNull();
+  });
+
+  it('does not clean up mobile device when it still has other pairings', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host-1', 'host');
+    doInstance.registerDevice('host-2', 'pub-key-host-2', 'host');
+    doInstance.registerDevice('mobile-1', 'pub-key-mobile', 'mobile');
+    doInstance.createPairing('host-1', 'mobile-1');
+    doInstance.createPairing('host-2', 'mobile-1');
+
+    doInstance.removePairing('host-1');
+
+    // Mobile device should still exist since host-2 is still paired with it
+    const device = doInstance.getDevice('mobile-1');
+    expect(device).not.toBeNull();
+
+    // host-2 pairing should still be intact
+    expect(doInstance.isPaired('host-2', 'mobile-1')).toBe(true);
+  });
+
+  it('does not remove the host device when removing a pairing', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host', 'host');
+    doInstance.registerDevice('mobile-1', 'pub-key-mobile', 'mobile');
+    doInstance.createPairing('host-1', 'mobile-1');
+
+    doInstance.removePairing('host-1');
+
+    // Host device should still exist
+    const device = doInstance.getDevice('host-1');
+    expect(device).not.toBeNull();
+  });
+});
+
+describe('getHostsForMobile', () => {
+  it('returns all host device IDs paired with a mobile', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host-1', 'host');
+    doInstance.registerDevice('host-2', 'pub-key-host-2', 'host');
+    doInstance.registerDevice('mobile-1', 'pub-key-mobile', 'mobile');
+    doInstance.createPairing('host-1', 'mobile-1');
+    doInstance.createPairing('host-2', 'mobile-1');
+
+    const hosts = doInstance.getHostsForMobile('mobile-1');
+    expect(hosts).toHaveLength(2);
+    expect(hosts.sort()).toEqual(['host-1', 'host-2']);
+  });
+
+  it('returns empty array when mobile has no pairings', () => {
+    doInstance.registerDevice('mobile-1', 'pub-key-mobile', 'mobile');
+
+    const hosts = doInstance.getHostsForMobile('mobile-1');
+    expect(hosts).toHaveLength(0);
+  });
+
+  it('returns empty array for non-existent mobile', () => {
+    const hosts = doInstance.getHostsForMobile('nonexistent');
+    expect(hosts).toHaveLength(0);
   });
 });
 
