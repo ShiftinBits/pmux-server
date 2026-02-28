@@ -48,6 +48,18 @@ export default {
       );
     }
 
+    // Root redirect — send to homepage
+    if (url.pathname === '/') {
+      return addCorrelationHeaders(
+        new Response(null, {
+          status: 308,
+          headers: { 'Location': 'https://pmux.io' },
+        }),
+        requestId,
+        startTime
+      );
+    }
+
     // Extract client IP for rate limiting (Cloudflare provides CF-Connecting-IP)
     const clientIp = extractClientIp(request);
 
