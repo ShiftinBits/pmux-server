@@ -137,6 +137,46 @@ describe('POST /pair/initiate', () => {
     const device = doInstance.getDevice('agent-1');
     expect(device!.name).toBe('original-name');
   });
+
+  it('invalidates previous pairing code when re-initiating', async () => {
+    // First initiation — get a pairing code
+    const first = await postJSON('/pair/initiate', {
+      deviceId: 'agent-1',
+      publicKey: 'ed25519-pub-key-agent',
+      x25519PublicKey: 'x25519-pub-key-agent',
+    });
+    expect(first.status).toBe(200);
+    const firstCode = first.data['pairingCode'] as string;
+
+    // Second initiation — same host, new code replaces the old one
+    const second = await postJSON('/pair/initiate', {
+      deviceId: 'agent-1',
+      publicKey: 'ed25519-pub-key-agent',
+      x25519PublicKey: 'x25519-pub-key-agent',
+    });
+    expect(second.status).toBe(200);
+    const secondCode = second.data['pairingCode'] as string;
+
+    // First code should be invalidated (404)
+    const completeFirst = await postJSON('/pair/complete', {
+      pairingCode: firstCode,
+      deviceId: 'mobile-1',
+      publicKey: 'ed25519-pub-key-mobile',
+      x25519PublicKey: 'x25519-pub-key-mobile',
+    });
+    expect(completeFirst.status).toBe(404);
+    expect(completeFirst.data['error']).toContain('Invalid or expired');
+
+    // Second code should still work (200)
+    const completeSecond = await postJSON('/pair/complete', {
+      pairingCode: secondCode,
+      deviceId: 'mobile-1',
+      publicKey: 'ed25519-pub-key-mobile',
+      x25519PublicKey: 'x25519-pub-key-mobile',
+    });
+    expect(completeSecond.status).toBe(200);
+    expect(completeSecond.data['hostDeviceId']).toBe('agent-1');
+  });
 });
 
 describe('POST /pair/complete', () => {

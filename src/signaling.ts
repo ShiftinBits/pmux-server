@@ -272,6 +272,9 @@ export class SignalingDO implements DurableObject {
     // Clean up expired sessions
     this.cleanExpiredPairings();
 
+    // Invalidate any existing sessions for this host (prevents multiple valid codes)
+    this.sql.exec('DELETE FROM pairing_sessions WHERE host_device_id = ?', hostDeviceId);
+
     let code: string;
     do {
       code = generatePairingCode();
