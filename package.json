@@ -19,6 +19,6 @@
     "sql.js": "^1.14.0",
     "typescript": "^5.7.0",
     "vitest": "^4.0.18",
-    "wrangler": "^4.68.0"
+    "wrangler": "^4.69.0"
   }
 }
