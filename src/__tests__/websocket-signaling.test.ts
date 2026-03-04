@@ -457,6 +457,112 @@ describe('WebSocket signaling [T1.8]', () => {
       // Should not crash — message is silently dropped
       // No error sent back for SDP/ICE relay (only connect_request gets error)
     });
+
+    it('strips unknown fields from relayed messages', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      // Clear auth messages
+      hostWs.sent.length = 0;
+      mobileWs.sent.length = 0;
+
+      // Send sdp_offer with an extra malicious field
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({
+          type: 'sdp_offer',
+          sdp: 'v=0\r\noffer',
+          targetDeviceId: 'mobile-1',
+          malicious: 'injected-payload',
+          extra: { nested: true },
+        })
+      );
+
+      const offers = mobileWs.messagesOfType('sdp_offer');
+      expect(offers).toHaveLength(1);
+      expect(offers[0]!['type']).toBe('sdp_offer');
+      expect(offers[0]!['sdp']).toBe('v=0\r\noffer');
+      expect(offers[0]!['targetDeviceId']).toBe('agent-1');
+      // Unknown fields must NOT be present
+      expect(offers[0]).not.toHaveProperty('malicious');
+      expect(offers[0]).not.toHaveProperty('extra');
+    });
+
+    it('only includes sdp field when present in original message', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      hostWs.sent.length = 0;
+      mobileWs.sent.length = 0;
+
+      // Send ice_candidate (no sdp field)
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({
+          type: 'ice_candidate',
+          candidate: 'candidate:1 1 udp 2130706431 192.168.1.1 12345 typ host',
+          targetDeviceId: 'mobile-1',
+        })
+      );
+
+      const candidates = mobileWs.messagesOfType('ice_candidate');
+      expect(candidates).toHaveLength(1);
+      expect(candidates[0]!['candidate']).toContain('192.168.1.1');
+      expect(candidates[0]!['targetDeviceId']).toBe('agent-1');
+      // sdp should not be present on ice_candidate relay
+      expect(candidates[0]).not.toHaveProperty('sdp');
+    });
+
+    it('rejects oversized WebSocket messages', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+
+      // Send a message exceeding 16 KB
+      const oversizedPayload = JSON.stringify({
+        type: 'sdp_offer',
+        sdp: 'x'.repeat(20_000),
+        targetDeviceId: 'mobile-1',
+      });
+
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        oversizedPayload
+      );
+
+      const errors = hostWs.messagesOfType('error');
+      expect(errors).toHaveLength(1);
+      expect(errors[0]!['error']).toBe('Message too large');
+    });
+
+    it('relays connection_rejected with reason field preserved', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      hostWs.sent.length = 0;
+      mobileWs.sent.length = 0;
+
+      // Agent rejects connection with a reason
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({
+          type: 'connection_rejected',
+          reason: 'already_connected',
+          targetDeviceId: 'mobile-1',
+        })
+      );
+
+      const rejections = mobileWs.messagesOfType('connection_rejected');
+      expect(rejections).toHaveLength(1);
+      expect(rejections[0]!['reason']).toBe('already_connected');
+      expect(rejections[0]!['targetDeviceId']).toBe('agent-1');
+      // Should not have extra fields
+      expect(Object.keys(rejections[0]!)).toEqual(
+        expect.arrayContaining(['type', 'reason', 'targetDeviceId'])
+      );
+      expect(Object.keys(rejections[0]!)).toHaveLength(3);
+    });
   });
 
   describe('full signaling flow', () => {

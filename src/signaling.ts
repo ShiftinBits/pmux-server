@@ -18,6 +18,9 @@ import {
   type RateLimitStorage,
 } from './middleware/ratelimit';
 
+/** Maximum WebSocket message length in characters (16K — generous for SDP/ICE signaling). */
+const MAX_WS_MESSAGE_SIZE = 16_384;
+
 // --- Types ---
 
 export interface StoredDevice {
@@ -474,6 +477,11 @@ export class SignalingDO implements DurableObject {
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== 'string') return;
 
+    if (message.length > MAX_WS_MESSAGE_SIZE) {
+      wsSend(ws, { type: 'error', error: 'Message too large' });
+      return;
+    }
+
     // Update lastMessageTime on every received message (for idle timeout tracking)
     this.touchWebSocket(ws);
 
@@ -788,10 +796,13 @@ export class SignalingDO implements DurableObject {
     const mobileId = sender.deviceType === 'mobile' ? sender.deviceId : data.targetDeviceId;
     if (!this.isPaired(hostId, mobileId)) return;
 
-    // Relay with sender's deviceId as the origin
+    // Relay only known fields — never spread untrusted data
     wsSend(targetWs, {
-      ...data,
+      type: data.type,
       targetDeviceId: sender.deviceId,
+      ...(data.sdp !== undefined && { sdp: data.sdp }),
+      ...(data.candidate !== undefined && { candidate: data.candidate }),
+      ...('reason' in data && data.reason !== undefined && { reason: data.reason }),
     });
   }
 
