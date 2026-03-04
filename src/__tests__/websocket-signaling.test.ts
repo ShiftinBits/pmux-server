@@ -284,7 +284,7 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(requests[0]!['targetDeviceId']).toBe('mobile-1');
     });
 
-    it('returns error when target device is not paired', async () => {
+    it('returns connection_rejected when target device is not paired', async () => {
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
 
       // Clear auth messages
@@ -296,9 +296,9 @@ describe('WebSocket signaling [T1.8]', () => {
         JSON.stringify({ type: 'connect_request', targetDeviceId: 'nonexistent-agent' })
       );
 
-      const errors = mobileWs.messagesOfType('error');
-      expect(errors).toHaveLength(1);
-      expect(errors[0]!['error']).toContain('not connected');
+      const rejections = mobileWs.messagesOfType('connection_rejected');
+      expect(rejections).toHaveLength(1);
+      expect(rejections[0]!['reason']).toBe('not_paired');
     });
 
     it('sends host_offline when target is paired but offline', async () => {
@@ -324,7 +324,7 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(errors).toHaveLength(0);
     });
 
-    it('returns generic error for connect_request to unpaired device', async () => {
+    it('returns connection_rejected for connect_request to unpaired device', async () => {
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
       // No pairing created — agent-1 is unknown to mobile-1
 
@@ -337,10 +337,10 @@ describe('WebSocket signaling [T1.8]', () => {
         JSON.stringify({ type: 'connect_request', targetDeviceId: 'agent-1' })
       );
 
-      // Should get generic error (security: don't reveal device existence)
-      const errors = mobileWs.messagesOfType('error');
-      expect(errors).toHaveLength(1);
-      expect(errors[0]!['error']).toContain('not connected');
+      // Should get connection_rejected (security: don't reveal device existence)
+      const rejections = mobileWs.messagesOfType('connection_rejected');
+      expect(rejections).toHaveLength(1);
+      expect(rejections[0]!['reason']).toBe('not_paired');
 
       // Should NOT receive host_offline
       const offlineMessages = mobileWs.messagesOfType('host_offline');
@@ -660,10 +660,10 @@ describe('WebSocket signaling [T1.8]', () => {
         JSON.stringify({ type: 'connect_request', targetDeviceId: 'agent-1' })
       );
 
-      // Should get an error, not relay to the agent
-      const errors = mobileWs.messagesOfType('error');
-      expect(errors).toHaveLength(1);
-      expect(errors[0]!['error']).toContain('not connected');
+      // Should get connection_rejected, not relay to the agent
+      const rejections = mobileWs.messagesOfType('connection_rejected');
+      expect(rejections).toHaveLength(1);
+      expect(rejections[0]!['reason']).toBe('not_paired');
 
       // Agent should NOT have received anything
       const hostRequests = hostWs.messagesOfType('connect_request');

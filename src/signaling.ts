@@ -761,7 +761,7 @@ export class SignalingDO implements DurableObject {
     const hostId = sender.deviceType === 'host' ? sender.deviceId : targetDeviceId;
     const mobileId = sender.deviceType === 'mobile' ? sender.deviceId : targetDeviceId;
     if (!this.isPaired(hostId, mobileId)) {
-      wsSend(ws, { type: 'error', error: `Device ${targetDeviceId} is not connected` });
+      wsSend(ws, { type: 'connection_rejected', reason: 'not_paired' });
       return;
     }
 
