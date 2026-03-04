@@ -812,20 +812,27 @@ export class SignalingDO implements DurableObject {
   /**
    * POST /pair/initiate
    * Host calls this to start pairing. Creates a pairing session.
-   * Body: { deviceId, publicKey, x25519PublicKey, name? }
+   * Body: { deviceId, publicKey, x25519PublicKey, timestamp, signature, name? }
    * Returns: { pairingCode }
    */
   private async handlePairInitiate(request: Request): Promise<Response> {
-    let body: { deviceId?: string; publicKey?: string; x25519PublicKey?: string; name?: string };
+    let body: {
+      deviceId?: string;
+      publicKey?: string;
+      x25519PublicKey?: string;
+      timestamp?: string;
+      signature?: string;
+      name?: string;
+    };
     try {
       body = await request.json() as typeof body;
     } catch {
       return jsonResponse({ error: 'Invalid JSON' }, 400);
     }
 
-    if (!body.deviceId || !body.publicKey || !body.x25519PublicKey) {
+    if (!body.deviceId || !body.publicKey || !body.x25519PublicKey || !body.timestamp || !body.signature) {
       return jsonResponse(
-        { error: 'Missing required fields: deviceId, publicKey, x25519PublicKey' },
+        { error: 'Missing required fields: deviceId, publicKey, x25519PublicKey, timestamp, signature' },
         400
       );
     }
@@ -835,12 +842,35 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Name must be a string of 64 characters or fewer' }, 400);
     }
 
-    // Register the host device if not already registered, or update name
+    // Validate timestamp is within 5-minute window
+    const ts = parseInt(body.timestamp, 10);
+    const now = Math.floor(Date.now() / 1000);
+    if (isNaN(ts) || Math.abs(now - ts) > 300) {
+      return jsonResponse({ error: 'Timestamp out of range' }, 401);
+    }
+
+    // Verify signature against stored key (if device exists) or request body key
     const existing = this.getDevice(body.deviceId);
+    const verifyKey = existing ? existing.publicKey : body.publicKey;
+    const message = new TextEncoder().encode(body.deviceId + body.timestamp);
+    const publicKeyBytes = base64ToBytes(verifyKey);
+    const signatureBytes = base64ToBytes(body.signature);
+
+    let valid: boolean;
+    try {
+      valid = await verifyEd25519Signature(publicKeyBytes, message, signatureBytes);
+    } catch {
+      return jsonResponse({ error: 'Invalid signature format' }, 401);
+    }
+    if (!valid) {
+      return jsonResponse({ error: 'Signature verification failed' }, 401);
+    }
+
+    // Register the host device if not already registered, or update name
     if (!existing) {
       this.registerDevice(body.deviceId, body.publicKey, 'host', body.name);
-    } else if (body.name !== undefined && existing.publicKey === body.publicKey) {
-      // Only update name if the caller proves identity via matching publicKey
+    } else if (body.name !== undefined) {
+      // Signature already verified against stored key, safe to update name
       this.updateDeviceName(body.deviceId, body.name);
     }
 
