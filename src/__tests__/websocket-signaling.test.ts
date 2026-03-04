@@ -534,6 +534,35 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(errors).toHaveLength(1);
       expect(errors[0]!['error']).toBe('Message too large');
     });
+
+    it('relays connection_rejected with reason field preserved', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      hostWs.sent.length = 0;
+      mobileWs.sent.length = 0;
+
+      // Agent rejects connection with a reason
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({
+          type: 'connection_rejected',
+          reason: 'already_connected',
+          targetDeviceId: 'mobile-1',
+        })
+      );
+
+      const rejections = mobileWs.messagesOfType('connection_rejected');
+      expect(rejections).toHaveLength(1);
+      expect(rejections[0]!['reason']).toBe('already_connected');
+      expect(rejections[0]!['targetDeviceId']).toBe('agent-1');
+      // Should not have extra fields
+      expect(Object.keys(rejections[0]!)).toEqual(
+        expect.arrayContaining(['type', 'reason', 'targetDeviceId'])
+      );
+      expect(Object.keys(rejections[0]!)).toHaveLength(3);
+    });
   });
 
   describe('full signaling flow', () => {

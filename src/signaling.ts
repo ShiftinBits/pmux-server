@@ -18,7 +18,7 @@ import {
   type RateLimitStorage,
 } from './middleware/ratelimit';
 
-/** Maximum WebSocket message size in bytes (16 KB — generous for SDP/ICE signaling). */
+/** Maximum WebSocket message length in characters (16K — generous for SDP/ICE signaling). */
 const MAX_WS_MESSAGE_SIZE = 16_384;
 
 // --- Types ---
@@ -802,6 +802,7 @@ export class SignalingDO implements DurableObject {
       targetDeviceId: sender.deviceId,
       ...(data.sdp !== undefined && { sdp: data.sdp }),
       ...(data.candidate !== undefined && { candidate: data.candidate }),
+      ...('reason' in data && data.reason !== undefined && { reason: data.reason }),
     });
   }
 
