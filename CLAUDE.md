@@ -86,7 +86,7 @@ Real Web Crypto used in tests (not mocked). Ed25519 keys generated per-test.
 - **Hibernation cache rebuild**: After DO wake, `connections` map is empty. `rebuildConnectionCache()` scans `state.getWebSockets()` to restore. See `signaling.ts` — `findWebSocket()`.
 - **notifyDevice iterates ALL WebSockets**: Not the 1:1 cache — a device may have multiple connections (agent + pair CLI). Critical for `pair_complete` delivery.
 - **Request cloning**: Worker clones request before injecting auth headers (`X-Device-Id`, `X-Device-Type`, `X-Client-IP`) to preserve body stream.
-- **Pairing code**: Rejection sampling, base32-like alphabet (no 0/O/1/I), 6 chars, 5-min expiry, single-use.
+- **Pairing code**: Direct modulo indexing (alphabet is 32 chars, divides 256 evenly), base32-like alphabet (no 0/O/1/I), 6 chars, 5-min expiry, single-use.
 - **Device orphan cleanup**: On re-pair, old mobile removed only if zero remaining pairings elsewhere.
 - **JWT defenses**: Explicit header check (HS256 only — blocks alg:none), audience `pocketmux`, sub must match deviceId, clock skew ≤60s.
 - **Alarm lifecycle**: Scheduled on first WS connection (`scheduleAlarmIfNeeded()`), re-schedules only if active connections remain after cleanup sweep.
