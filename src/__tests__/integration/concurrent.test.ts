@@ -9,13 +9,14 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { createTestDO } from '../helpers/mock-do';
+import { createTestDO, createMockKVStorage } from '../helpers/mock-do';
+import { createMockSqlStorage } from '../helpers/mock-sql-storage';
 import { MockWebSocket } from '../helpers/mock-websocket';
 import { createJWT } from '../../auth';
 import {
   MAX_WS_CONNECTIONS_PER_DEVICE,
 } from '../../middleware/ratelimit';
-import type { SignalingDO } from '../../signaling';
+import { SignalingDO } from '../../signaling';
 import type { MockDOState } from '../helpers/mock-do';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
@@ -302,13 +303,6 @@ describe('Concurrent connections integration [T3.11]', () => {
       // Simulate hibernation wake: create a new DO instance sharing the same
       // backing state (SQL + acceptedWebSockets). The new DO's in-memory maps
       // are empty, just like after a real hibernation wake.
-      const { createMockSqlStorage } = await import('../helpers/mock-sql-storage');
-      const { createMockKVStorage } = await import('../helpers/mock-do');
-      const { SignalingDO } = await import('../../signaling');
-
-      // The mock state's acceptedWebSockets already contains the sockets with
-      // their serialized attachments (set by handleWsAuth). We need to build a
-      // new DO that sees the same getWebSockets() but has fresh in-memory maps.
       const freshMockKV = createMockKVStorage();
       const freshSql = await createMockSqlStorage();
       const freshMockState = {
