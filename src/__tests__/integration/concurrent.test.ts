@@ -280,6 +280,99 @@ describe('Concurrent connections integration [T3.11]', () => {
       expect(doInstance.getWsConnectionCount('agent-ws-reopen')).toBe(5);
     });
 
+    it('rebuilds wsConnectionCounts after hibernation wake', async () => {
+      const token = await setupDevice('agent-ws-hibernate', 'host');
+
+      // Open 3 authenticated connections (builds up wsConnectionCounts).
+      // Push each socket to acceptedWebSockets first (simulating the WebSocket
+      // upgrade path), so getWebSockets() returns them after "hibernation".
+      const sockets: MockWebSocket[] = [];
+      for (let i = 0; i < 3; i++) {
+        const ws = new MockWebSocket();
+        mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
+        await doInstance.webSocketMessage(
+          ws as unknown as WebSocket,
+          JSON.stringify({ type: 'auth', token })
+        );
+        expect(ws.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+        sockets.push(ws);
+      }
+      expect(doInstance.getWsConnectionCount('agent-ws-hibernate')).toBe(3);
+
+      // Simulate hibernation wake: create a new DO instance sharing the same
+      // backing state (SQL + acceptedWebSockets). The new DO's in-memory maps
+      // are empty, just like after a real hibernation wake.
+      const { createMockSqlStorage } = await import('../helpers/mock-sql-storage');
+      const { createMockKVStorage } = await import('../helpers/mock-do');
+      const { SignalingDO } = await import('../../signaling');
+
+      // The mock state's acceptedWebSockets already contains the sockets with
+      // their serialized attachments (set by handleWsAuth). We need to build a
+      // new DO that sees the same getWebSockets() but has fresh in-memory maps.
+      const freshMockKV = createMockKVStorage();
+      const freshSql = await createMockSqlStorage();
+      const freshMockState = {
+        storage: {
+          sql: freshSql,
+          get: freshMockKV.get,
+          put: freshMockKV.put,
+          async setAlarm(): Promise<void> {},
+          async getAlarm(): Promise<number | null> { return null; },
+          async deleteAlarm(): Promise<void> {},
+        },
+        acceptWebSocket(): void {},
+        getWebSockets(): WebSocket[] {
+          // Return the same hibernated sockets from the original DO
+          return mockState.acceptedWebSockets;
+        },
+      };
+      const freshEnv = {
+        SIGNALING: {} as DurableObjectNamespace,
+        TURN_TOKEN_ID: 'test-turn-token-id',
+        TURN_API_TOKEN: 'test-turn-api-token',
+        JWT_SECRET: 'test-jwt-secret-at-least-32-chars-long',
+      };
+      const freshDO = new SignalingDO(
+        freshMockState as unknown as DurableObjectState,
+        freshEnv
+      );
+
+      // Register the device in the fresh DO's SQL (required for auth check)
+      freshDO.registerDevice('agent-ws-hibernate', 'pubkey-agent-ws-hibernate', 'host');
+
+      // Before rebuild, in-memory counts are 0 (hibernation wiped them)
+      expect(freshDO.getWsConnectionCount('agent-ws-hibernate')).toBe(0);
+
+      // Trigger rebuildConnectionCache() via getConnection()
+      freshDO.getConnection('agent-ws-hibernate');
+
+      // After rebuild, wsConnectionCounts should reflect the 3 hibernated sockets
+      expect(freshDO.getWsConnectionCount('agent-ws-hibernate')).toBe(3);
+
+      // Verify the limit is still enforced: open 2 more (to reach 5), then the 6th fails
+      for (let i = 0; i < 2; i++) {
+        const ws = new MockWebSocket();
+        await freshDO.webSocketMessage(
+          ws as unknown as WebSocket,
+          JSON.stringify({ type: 'auth', token })
+        );
+        expect(ws.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+      }
+      expect(freshDO.getWsConnectionCount('agent-ws-hibernate')).toBe(5);
+
+      // 6th connection should be rejected
+      const wsOver = new MockWebSocket();
+      await freshDO.webSocketMessage(
+        wsOver as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token })
+      );
+      expect(wsOver.lastMessage()).toEqual({
+        type: 'error',
+        error: 'Too many WebSocket connections',
+      });
+      expect(wsOver.closed).toBe(true);
+    });
+
     it('different devices have independent connection limits', async () => {
       const token1 = await setupDevice('agent-ws-indep-1', 'host');
       const token2 = await setupDevice('agent-ws-indep-2', 'host');

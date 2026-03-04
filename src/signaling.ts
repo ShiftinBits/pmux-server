@@ -347,10 +347,13 @@ export class SignalingDO implements DurableObject {
    */
   private rebuildConnectionCache(): void {
     if (!this.state.getWebSockets) return;
+    this.wsConnectionCounts.clear();
     for (const ws of this.state.getWebSockets()) {
       const att = ws.deserializeAttachment() as WsAttachment | null;
       if (att?.authenticated && att.deviceId) {
         this.connections.set(att.deviceId, ws);
+        const count = this.wsConnectionCounts.get(att.deviceId) ?? 0;
+        this.wsConnectionCounts.set(att.deviceId, count + 1);
       }
     }
   }
