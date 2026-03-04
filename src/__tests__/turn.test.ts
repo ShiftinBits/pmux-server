@@ -113,6 +113,24 @@ describe('generateTurnCredentials', () => {
     );
   });
 
+  it('does not include raw response body in error message', async () => {
+    const sensitiveBody = 'account-id: acct_1234, endpoint: internal.cloudflare.com/v1/turn';
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      new Response(sensitiveBody, { status: 500 })
+    );
+
+    try {
+      await generateTurnCredentials(mockEnv);
+      expect.fail('Expected generateTurnCredentials to throw');
+    } catch (err) {
+      const message = (err as Error).message;
+      expect(message).toBe('Cloudflare TURN API error (500)');
+      expect(message).not.toContain(sensitiveBody);
+      expect(message).not.toContain('account-id');
+      expect(message).not.toContain('internal.cloudflare.com');
+    }
+  });
+
   it('handles network errors gracefully', async () => {
     vi.mocked(globalThis.fetch).mockRejectedValueOnce(new Error('Network error'));
 
