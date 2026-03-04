@@ -564,8 +564,9 @@ export class SignalingDO implements DurableObject {
   /**
    * Called by the runtime when a WebSocket encounters an error.
    */
-  async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
+  async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
     const attachment = ws.deserializeAttachment() as WsAttachment | null;
+    console.error('[ws-error] deviceId=%s error=%o', attachment?.deviceId, error);
     if (attachment?.authenticated) {
       if (this.connections.get(attachment.deviceId) === ws) {
         this.connections.delete(attachment.deviceId);
