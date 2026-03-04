@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { createTestDOCompat as createTestDO, createTestDO as createTestDOFull } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
-import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBody } from './helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, signEd25519, signedPairInitiateBody } from './helpers/crypto';
 import type { SignalingDO } from '../signaling';
 
 let doInstance: SignalingDO;
@@ -178,7 +178,6 @@ describe('POST /pair/initiate', () => {
   it('rejects stale timestamp', async () => {
     const staleTimestamp = String(Math.floor(Date.now() / 1000) - 600);
     const message = new TextEncoder().encode('agent-1' + staleTimestamp);
-    const { signEd25519 } = await import('./helpers/crypto');
     const sig = await signEd25519(keyPair.privateKey, message);
 
     const { status, data } = await postJSON('/pair/initiate', {
@@ -196,7 +195,6 @@ describe('POST /pair/initiate', () => {
   it('rejects future timestamp', async () => {
     const futureTimestamp = String(Math.floor(Date.now() / 1000) + 600);
     const message = new TextEncoder().encode('agent-1' + futureTimestamp);
-    const { signEd25519 } = await import('./helpers/crypto');
     const sig = await signEd25519(keyPair.privateKey, message);
 
     const { status, data } = await postJSON('/pair/initiate', {
