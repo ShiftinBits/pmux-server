@@ -533,6 +533,9 @@ describe('WebSocket signaling [T1.8]', () => {
       const errors = hostWs.messagesOfType('error');
       expect(errors).toHaveLength(1);
       expect(errors[0]!['error']).toBe('Message too large');
+      expect(hostWs.closed).toBe(true);
+      expect(hostWs.closeCode).toBe(1009);
+      expect(hostWs.closeReason).toBe('Message too large');
     });
 
     it('relays connection_rejected with reason field preserved', async () => {

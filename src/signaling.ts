@@ -479,6 +479,7 @@ export class SignalingDO implements DurableObject {
 
     if (message.length > MAX_WS_MESSAGE_SIZE) {
       wsSend(ws, { type: 'error', error: 'Message too large' });
+      ws.close(1009, 'Message too large');
       return;
     }
 
