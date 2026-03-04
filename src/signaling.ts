@@ -1017,16 +1017,12 @@ function rowToDevice(row: Record<string, SqlStorageValue>): StoredDevice {
 }
 
 function generatePairingCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 31 chars, no 0/O/1/I
-  const maxUnbiased = 248; // 31 * 8 = 248, largest multiple of 31 <= 256
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 32 chars, no 0/O/1/I
+  const bytes = new Uint8Array(6);
+  crypto.getRandomValues(bytes);
   let code = '';
-  for (let i = 0; i < 6; ) {
-    const byte = new Uint8Array(1);
-    crypto.getRandomValues(byte);
-    if (byte[0]! < maxUnbiased) {
-      code += chars[byte[0]! % chars.length];
-      i++;
-    }
+  for (let i = 0; i < 6; i++) {
+    code += chars[bytes[i]! % chars.length];
   }
   return code;
 }
