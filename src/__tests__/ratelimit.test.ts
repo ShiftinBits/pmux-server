@@ -9,6 +9,7 @@ import {
 import { createTestDOCompat as createTestDO, createMockKVStorage } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
+import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBody } from './helpers/crypto';
 import type { SignalingDO } from '../signaling';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
@@ -196,11 +197,11 @@ describe('DO rate limiting integration', () => {
   describe('pairing rate limits', () => {
     it('allows pairing requests under the limit', async () => {
       for (let i = 0; i < 10; i++) {
-        const { status } = await postJSON('/pair/initiate', {
-          deviceId: `agent-${i}`,
-          publicKey: `pub-key-${i}`,
-          x25519PublicKey: `x25519-key-${i}`,
-        });
+        const keys = await generateEd25519Keypair();
+        const body = await signedPairInitiateBody(
+          `agent-${i}`, keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
+        );
+        const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
       }
     });
@@ -208,15 +209,15 @@ describe('DO rate limiting integration', () => {
     it('blocks 11th pairing request with 429', async () => {
       // Send 10 requests (the limit)
       for (let i = 0; i < 10; i++) {
-        const { status } = await postJSON('/pair/initiate', {
-          deviceId: `agent-${i}`,
-          publicKey: `pub-key-${i}`,
-          x25519PublicKey: `x25519-key-${i}`,
-        });
+        const keys = await generateEd25519Keypair();
+        const body = await signedPairInitiateBody(
+          `agent-${i}`, keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
+        );
+        const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
       }
 
-      // 11th should be rate limited
+      // 11th should be rate limited (body doesn't matter — 429 fires before handler)
       const { status, data, response } = await postJSON('/pair/initiate', {
         deviceId: 'agent-overflow',
         publicKey: 'pub-key-overflow',
@@ -230,11 +231,11 @@ describe('DO rate limiting integration', () => {
     it('rate limits /pair/complete separately from /pair/initiate', async () => {
       // Exhaust /pair/initiate limit
       for (let i = 0; i < 10; i++) {
-        await postJSON('/pair/initiate', {
-          deviceId: `agent-${i}`,
-          publicKey: `pub-key-${i}`,
-          x25519PublicKey: `x25519-key-${i}`,
-        });
+        const keys = await generateEd25519Keypair();
+        const body = await signedPairInitiateBody(
+          `agent-${i}`, keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
+        );
+        await postJSON('/pair/initiate', body);
       }
 
       // /pair/complete should still work (separate counter)
@@ -251,11 +252,11 @@ describe('DO rate limiting integration', () => {
     it('different IPs have separate rate limits', async () => {
       // Fill limit for IP 1
       for (let i = 0; i < 10; i++) {
-        await postJSON('/pair/initiate', {
-          deviceId: `agent-${i}`,
-          publicKey: `pub-key-${i}`,
-          x25519PublicKey: `x25519-key-${i}`,
-        }, { 'X-Client-IP': '10.0.0.1' });
+        const keys = await generateEd25519Keypair();
+        const body = await signedPairInitiateBody(
+          `agent-${i}`, keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
+        );
+        await postJSON('/pair/initiate', body, { 'X-Client-IP': '10.0.0.1' });
       }
 
       // IP 1 is blocked
@@ -267,11 +268,11 @@ describe('DO rate limiting integration', () => {
       expect(blocked.status).toBe(429);
 
       // IP 2 is still allowed
-      const allowed = await postJSON('/pair/initiate', {
-        deviceId: 'agent-allowed',
-        publicKey: 'pub-key-allowed',
-        x25519PublicKey: 'x25519-key-allowed',
-      }, { 'X-Client-IP': '10.0.0.2' });
+      const keys = await generateEd25519Keypair();
+      const body = await signedPairInitiateBody(
+        'agent-allowed', keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-allowed'
+      );
+      const allowed = await postJSON('/pair/initiate', body, { 'X-Client-IP': '10.0.0.2' });
       expect(allowed.status).toBe(200);
     });
   });
@@ -510,11 +511,11 @@ describe('pairing code expiry enforcement', () => {
 
   it('rejects pairing code after 5-minute expiry', async () => {
     // Create pairing session
-    const initResult = await postJSON('/pair/initiate', {
-      deviceId: 'agent-1',
-      publicKey: 'pub-key-agent',
-      x25519PublicKey: 'x25519-key-agent',
-    });
+    const keys = await generateEd25519Keypair();
+    const body = await signedPairInitiateBody(
+      'agent-1', keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-agent'
+    );
+    const initResult = await postJSON('/pair/initiate', body);
     const code = initResult.data['pairingCode'] as string;
 
     // Advance time past 5-minute expiry
@@ -532,11 +533,11 @@ describe('pairing code expiry enforcement', () => {
   });
 
   it('accepts pairing code within 5-minute window', async () => {
-    const initResult = await postJSON('/pair/initiate', {
-      deviceId: 'agent-1',
-      publicKey: 'pub-key-agent',
-      x25519PublicKey: 'x25519-key-agent',
-    });
+    const keys = await generateEd25519Keypair();
+    const body = await signedPairInitiateBody(
+      'agent-1', keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-agent'
+    );
+    const initResult = await postJSON('/pair/initiate', body);
     const code = initResult.data['pairingCode'] as string;
 
     // Advance time to just under 5 minutes
@@ -584,11 +585,11 @@ describe('legitimate usage patterns', () => {
 
   it('normal pairing flow stays under limits', async () => {
     // A normal user: 1 pair/initiate + 1 pair/complete
-    const initResult = await postJSON('/pair/initiate', {
-      deviceId: 'agent-1',
-      publicKey: 'pub-key-agent',
-      x25519PublicKey: 'x25519-key-agent',
-    });
+    const keys = await generateEd25519Keypair();
+    const body = await signedPairInitiateBody(
+      'agent-1', keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-agent'
+    );
+    const initResult = await postJSON('/pair/initiate', body);
     expect(initResult.status).toBe(200);
 
     const { status } = await postJSON('/pair/complete', {

@@ -12,6 +12,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDO } from '../helpers/mock-do';
 import { ENDPOINT_LIMITS } from '../../middleware/ratelimit';
+import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBody } from '../helpers/crypto';
 import type { SignalingDO } from '../../signaling';
 import type { MockDOState } from '../helpers/mock-do';
 
@@ -50,6 +51,11 @@ async function postJSON(
   return { status: response.status, data, response };
 }
 
+async function signedInitiateBody(deviceId: string, x25519Key: string) {
+  const keys = await generateEd25519Keypair();
+  return signedPairInitiateBody(deviceId, keys.keyPair, bytesToBase64(keys.publicKeyRaw), x25519Key);
+}
+
 describe('Rate limiting integration [T3.11]', () => {
   describe('/pair/initiate rate limit', () => {
     it('allows 10 requests and blocks the 11th with 429', async () => {
@@ -58,15 +64,12 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Send requests up to the limit
       for (let i = 0; i < limit; i++) {
-        const { status } = await postJSON('/pair/initiate', {
-          deviceId: `agent-${i}`,
-          publicKey: `pub-key-${i}`,
-          x25519PublicKey: `x25519-key-${i}`,
-        });
+        const body = await signedInitiateBody(`agent-${i}`, `x25519-key-${i}`);
+        const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
       }
 
-      // 11th request should be rate limited
+      // 11th request should be rate limited (body doesn't matter — 429 fires before handler)
       const { status, data, response } = await postJSON('/pair/initiate', {
         deviceId: 'agent-overflow',
         publicKey: 'pub-key-overflow',
@@ -87,21 +90,15 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Send 5 requests
       for (let i = 0; i < 5; i++) {
-        const { status } = await postJSON('/pair/initiate', {
-          deviceId: `agent-persist-${i}`,
-          publicKey: `pub-key-${i}`,
-          x25519PublicKey: `x25519-key-${i}`,
-        });
+        const body = await signedInitiateBody(`agent-persist-${i}`, `x25519-key-${i}`);
+        const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
       }
 
       // Send remaining requests to hit the limit
       for (let i = 5; i < limit; i++) {
-        const { status } = await postJSON('/pair/initiate', {
-          deviceId: `agent-persist-${i}`,
-          publicKey: `pub-key-${i}`,
-          x25519PublicKey: `x25519-key-${i}`,
-        });
+        const body = await signedInitiateBody(`agent-persist-${i}`, `x25519-key-${i}`);
+        const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
       }
 
@@ -121,15 +118,8 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Exhaust limit for IP A
       for (let i = 0; i < limit; i++) {
-        const { status } = await postJSON(
-          '/pair/initiate',
-          {
-            deviceId: `agent-a-${i}`,
-            publicKey: `pub-key-a-${i}`,
-            x25519PublicKey: `x25519-key-a-${i}`,
-          },
-          { 'X-Client-IP': '10.0.0.1' }
-        );
+        const body = await signedInitiateBody(`agent-a-${i}`, `x25519-key-a-${i}`);
+        const { status } = await postJSON('/pair/initiate', body, { 'X-Client-IP': '10.0.0.1' });
         expect(status).toBe(200);
       }
 
@@ -146,27 +136,13 @@ describe('Rate limiting integration [T3.11]', () => {
       expect(blockedA.status).toBe(429);
 
       // IP B is still allowed
-      const allowedB = await postJSON(
-        '/pair/initiate',
-        {
-          deviceId: 'agent-b-1',
-          publicKey: 'pub-key-b-1',
-          x25519PublicKey: 'x25519-key-b-1',
-        },
-        { 'X-Client-IP': '10.0.0.2' }
-      );
+      const bodyB = await signedInitiateBody('agent-b-1', 'x25519-key-b-1');
+      const allowedB = await postJSON('/pair/initiate', bodyB, { 'X-Client-IP': '10.0.0.2' });
       expect(allowedB.status).toBe(200);
 
       // IP C is also allowed
-      const allowedC = await postJSON(
-        '/pair/initiate',
-        {
-          deviceId: 'agent-c-1',
-          publicKey: 'pub-key-c-1',
-          x25519PublicKey: 'x25519-key-c-1',
-        },
-        { 'X-Client-IP': '10.0.0.3' }
-      );
+      const bodyC = await signedInitiateBody('agent-c-1', 'x25519-key-c-1');
+      const allowedC = await postJSON('/pair/initiate', bodyC, { 'X-Client-IP': '10.0.0.3' });
       expect(allowedC.status).toBe(200);
     });
   });
@@ -177,11 +153,8 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Exhaust /pair/initiate limit
       for (let i = 0; i < limit; i++) {
-        await postJSON('/pair/initiate', {
-          deviceId: `agent-sep-${i}`,
-          publicKey: `pub-key-sep-${i}`,
-          x25519PublicKey: `x25519-key-sep-${i}`,
-        });
+        const body = await signedInitiateBody(`agent-sep-${i}`, `x25519-key-sep-${i}`);
+        await postJSON('/pair/initiate', body);
       }
 
       // /pair/initiate is blocked
@@ -233,11 +206,8 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Fill the limit
       for (let i = 0; i < limit; i++) {
-        await postJSON('/pair/initiate', {
-          deviceId: `agent-reset-${i}`,
-          publicKey: `pub-key-reset-${i}`,
-          x25519PublicKey: `x25519-key-reset-${i}`,
-        });
+        const body = await signedInitiateBody(`agent-reset-${i}`, `x25519-key-reset-${i}`);
+        await postJSON('/pair/initiate', body);
       }
 
       // Blocked
@@ -252,11 +222,8 @@ describe('Rate limiting integration [T3.11]', () => {
       Date.now = () => realDateNow() + windowMs + 1;
 
       // Should be allowed again
-      const allowed = await postJSON('/pair/initiate', {
-        deviceId: 'agent-reset-allowed',
-        publicKey: 'pub-key-reset-allowed',
-        x25519PublicKey: 'x25519-key-reset-allowed',
-      });
+      const body = await signedInitiateBody('agent-reset-allowed', 'x25519-key-reset-allowed');
+      const allowed = await postJSON('/pair/initiate', body);
       expect(allowed.status).toBe(200);
     });
   });
@@ -267,11 +234,8 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Fill the limit
       for (let i = 0; i < limit; i++) {
-        await postJSON('/pair/initiate', {
-          deviceId: `agent-format-${i}`,
-          publicKey: `pub-key-format-${i}`,
-          x25519PublicKey: `x25519-key-format-${i}`,
-        });
+        const body = await signedInitiateBody(`agent-format-${i}`, `x25519-key-format-${i}`);
+        await postJSON('/pair/initiate', body);
       }
 
       // Trigger 429
@@ -295,13 +259,3 @@ describe('Rate limiting integration [T3.11]', () => {
     });
   });
 });
-
-// --- Helper ---
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary);
-}

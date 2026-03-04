@@ -1,33 +1,12 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createTestDOCompat as createTestDO } from './helpers/mock-do';
 import { verifyJWT } from '../auth';
+import { generateEd25519Keypair, bytesToBase64, signEd25519, signedPairInitiateBody } from './helpers/crypto';
 import type { SignalingDO } from '../signaling';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
 let doInstance: SignalingDO;
-
-// Ed25519 key helpers
-async function generateEd25519Keypair() {
-  const keyPair = await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify']);
-  const publicKeyRaw = new Uint8Array(
-    await crypto.subtle.exportKey('raw', keyPair.publicKey)
-  );
-  return { keyPair, publicKeyRaw };
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary);
-}
-
-async function signEd25519(privateKey: CryptoKey, message: Uint8Array): Promise<Uint8Array> {
-  const sig = await crypto.subtle.sign('Ed25519', privateKey, message);
-  return new Uint8Array(sig);
-}
 
 beforeEach(async () => {
   doInstance = await createTestDO();
@@ -52,13 +31,11 @@ async function postJSON(
  */
 async function registerAgentDevice(
   deviceId: string,
-  publicKeyBase64: string
+  publicKeyBase64: string,
+  keyPair: CryptoKeyPair
 ) {
-  await postJSON('/pair/initiate', {
-    deviceId,
-    publicKey: publicKeyBase64,
-    x25519PublicKey: 'x25519-placeholder',
-  });
+  const body = await signedPairInitiateBody(deviceId, keyPair, publicKeyBase64, 'x25519-placeholder');
+  await postJSON('/pair/initiate', body);
 }
 
 describe('POST /token', () => {
@@ -67,7 +44,7 @@ describe('POST /token', () => {
     const publicKeyBase64 = bytesToBase64(publicKeyRaw);
 
     // Register device
-    await registerAgentDevice('agent-1', publicKeyBase64);
+    await registerAgentDevice('agent-1', publicKeyBase64, keyPair);
 
     // Create signature
     const timestamp = String(Math.floor(Date.now() / 1000));
@@ -92,10 +69,10 @@ describe('POST /token', () => {
   });
 
   it('rejects an invalid signature', async () => {
-    const { publicKeyRaw } = await generateEd25519Keypair();
+    const { publicKeyRaw, keyPair } = await generateEd25519Keypair();
     const publicKeyBase64 = bytesToBase64(publicKeyRaw);
 
-    await registerAgentDevice('agent-1', publicKeyBase64);
+    await registerAgentDevice('agent-1', publicKeyBase64, keyPair);
 
     // Use a garbage signature
     const badSig = bytesToBase64(new Uint8Array(64));
@@ -134,7 +111,7 @@ describe('POST /token', () => {
     const { keyPair, publicKeyRaw } = await generateEd25519Keypair();
     const publicKeyBase64 = bytesToBase64(publicKeyRaw);
 
-    await registerAgentDevice('agent-1', publicKeyBase64);
+    await registerAgentDevice('agent-1', publicKeyBase64, keyPair);
 
     // Use a timestamp from 10 minutes ago
     const staleTimestamp = String(Math.floor(Date.now() / 1000) - 600);
@@ -156,7 +133,7 @@ describe('POST /token', () => {
     const { keyPair, publicKeyRaw } = await generateEd25519Keypair();
     const publicKeyBase64 = bytesToBase64(publicKeyRaw);
 
-    await registerAgentDevice('agent-1', publicKeyBase64);
+    await registerAgentDevice('agent-1', publicKeyBase64, keyPair);
 
     // Use a timestamp 10 minutes in the future
     const futureTimestamp = String(Math.floor(Date.now() / 1000) + 600);

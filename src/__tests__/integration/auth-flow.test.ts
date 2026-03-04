@@ -14,6 +14,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDO } from '../helpers/mock-do';
 import { MockWebSocket } from '../helpers/mock-websocket';
 import { verifyJWT, createJWT } from '../../auth';
+import { generateEd25519Keypair, bytesToBase64, signEd25519, signedPairInitiateBody } from '../helpers/crypto';
 import type { SignalingDO } from '../../signaling';
 import type { MockDOState } from '../helpers/mock-do';
 
@@ -33,29 +34,6 @@ beforeEach(async () => {
 afterEach(() => {
   Date.now = realDateNow;
 });
-
-// --- Crypto helpers ---
-
-async function generateEd25519Keypair() {
-  const keyPair = await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify']);
-  const publicKeyRaw = new Uint8Array(
-    await crypto.subtle.exportKey('raw', keyPair.publicKey)
-  );
-  return { keyPair, publicKeyRaw };
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary);
-}
-
-async function signEd25519(privateKey: CryptoKey, message: Uint8Array): Promise<Uint8Array> {
-  const sig = await crypto.subtle.sign('Ed25519', privateKey, message);
-  return new Uint8Array(sig);
-}
 
 // --- HTTP helpers ---
 
@@ -112,11 +90,8 @@ describe('Full auth flow integration [T3.11]', () => {
     const mobilePubBase64 = bytesToBase64(mobileKeys.publicKeyRaw);
 
     // 2. Agent initiates pairing
-    const initResult = await postJSON('/pair/initiate', {
-      deviceId: 'agent-integ',
-      publicKey: agentPubBase64,
-      x25519PublicKey: 'agent-x25519-pub',
-    });
+    const initBody = await signedPairInitiateBody('agent-integ', agentKeys.keyPair, agentPubBase64, 'agent-x25519-pub');
+    const initResult = await postJSON('/pair/initiate', initBody);
     expect(initResult.status).toBe(200);
     const pairingCode = initResult.data['pairingCode'] as string;
     expect(pairingCode).toHaveLength(6);
@@ -266,12 +241,11 @@ describe('Full auth flow integration [T3.11]', () => {
     const realKeys = await generateEd25519Keypair();
     const wrongKeys = await generateEd25519Keypair();
 
-    // Register with the real public key
-    await postJSON('/pair/initiate', {
-      deviceId: 'agent-wrong-key',
-      publicKey: bytesToBase64(realKeys.publicKeyRaw),
-      x25519PublicKey: 'x25519-key',
-    });
+    // Register with the real public key via signed pair/initiate
+    const initBody = await signedPairInitiateBody(
+      'agent-wrong-key', realKeys.keyPair, bytesToBase64(realKeys.publicKeyRaw), 'x25519-key'
+    );
+    await postJSON('/pair/initiate', initBody);
 
     // Sign with the wrong private key
     const timestamp = String(Math.floor(Date.now() / 1000));
