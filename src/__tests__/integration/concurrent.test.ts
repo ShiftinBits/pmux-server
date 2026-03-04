@@ -177,10 +177,10 @@ describe('Concurrent connections integration [T3.11]', () => {
         JSON.stringify({ type: 'connect_request', targetDeviceId: 'agent-cross-A' })
       );
 
-      // Should get an error
-      const errors = mobileBWs.messagesOfType('error');
-      expect(errors).toHaveLength(1);
-      expect(errors[0]!['error']).toContain('not connected');
+      // Should get connection_rejected
+      const rejections = mobileBWs.messagesOfType('connection_rejected');
+      expect(rejections).toHaveLength(1);
+      expect(rejections[0]!['reason']).toBe('not_paired');
 
       // Agent A should NOT receive the request
       agentAWs.sent.length = 0;
