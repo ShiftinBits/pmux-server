@@ -37,7 +37,8 @@ export async function generateTurnCredentials(env: Env): Promise<TurnCredentials
 
   if (!response.ok) {
     const text = await response.text().catch(() => 'unknown error');
-    throw new Error(`Cloudflare TURN API error (${response.status}): ${text}`);
+    console.error(`[turn] Cloudflare TURN API error (${response.status}): ${text}`);
+    throw new Error(`Cloudflare TURN API error (${response.status})`);
   }
 
   const data = await response.json() as {

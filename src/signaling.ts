@@ -1041,8 +1041,8 @@ export class SignalingDO implements DurableObject {
       const credentials = await generateTurnCredentials(this.env);
       return jsonResponse(credentials);
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to generate TURN credentials';
-      return jsonResponse({ error: message }, 502);
+      console.error('[turn] Failed to generate credentials:', err);
+      return jsonResponse({ error: 'Failed to generate TURN credentials' }, 502);
     }
   }
 }
