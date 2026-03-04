@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createTestDOCompat as createTestDOCompat, createTestDO, type MockDOState } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
@@ -704,6 +704,24 @@ describe('WebSocket signaling [T1.8]', () => {
 
       expect(hostWs.closed).toBe(true);
       expect(hostWs.closeCode).toBe(1011);
+    });
+
+    it('logs the error via console.error', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const err = new Error('connection reset');
+      await doInstance.webSocketError(
+        hostWs as unknown as WebSocket,
+        err
+      );
+
+      expect(spy).toHaveBeenCalledWith(
+        '[ws-error] deviceId=%s error=%o',
+        'agent-1',
+        err
+      );
+      spy.mockRestore();
     });
 
     it('emits host_offline on webSocketError for paired host', async () => {
