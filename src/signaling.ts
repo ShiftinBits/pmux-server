@@ -841,6 +841,8 @@ export class SignalingDO implements DurableObject {
       targetDeviceId: sender.deviceId,
       ...(data.sdp !== undefined && { sdp: data.sdp }),
       ...(data.candidate !== undefined && { candidate: data.candidate }),
+      ...(data.sdpMid !== undefined && { sdpMid: data.sdpMid }),
+      ...(data.sdpMLineIndex !== undefined && { sdpMLineIndex: data.sdpMLineIndex }),
       ...('reason' in data && data.reason !== undefined && { reason: data.reason }),
     });
   }

@@ -408,13 +408,15 @@ describe('WebSocket signaling [T1.8]', () => {
       hostWs.sent.length = 0;
       mobileWs.sent.length = 0;
 
-      // Agent sends ICE candidate to mobile
+      // Agent sends ICE candidate to mobile (with sdpMid/sdpMLineIndex)
       await doInstance.webSocketMessage(
         hostWs as unknown as WebSocket,
         JSON.stringify({
           type: 'ice_candidate',
           candidate: 'candidate:1 1 udp 2130706431 192.168.1.1 12345 typ host',
           targetDeviceId: 'mobile-1',
+          sdpMid: '0',
+          sdpMLineIndex: 0,
         })
       );
 
@@ -425,20 +427,26 @@ describe('WebSocket signaling [T1.8]', () => {
           type: 'ice_candidate',
           candidate: 'candidate:2 1 udp 2130706431 10.0.0.1 54321 typ host',
           targetDeviceId: 'agent-1',
+          sdpMid: '0',
+          sdpMLineIndex: 0,
         })
       );
 
-      // Check mobile received agent's candidate
+      // Check mobile received agent's candidate (including sdpMid/sdpMLineIndex)
       const mobileCandidates = mobileWs.messagesOfType('ice_candidate');
       expect(mobileCandidates).toHaveLength(1);
       expect(mobileCandidates[0]!['candidate']).toContain('192.168.1.1');
       expect(mobileCandidates[0]!['targetDeviceId']).toBe('agent-1');
+      expect(mobileCandidates[0]!['sdpMid']).toBe('0');
+      expect(mobileCandidates[0]!['sdpMLineIndex']).toBe(0);
 
       // Check agent received mobile's candidate
       const hostCandidates = hostWs.messagesOfType('ice_candidate');
       expect(hostCandidates).toHaveLength(1);
       expect(hostCandidates[0]!['candidate']).toContain('10.0.0.1');
       expect(hostCandidates[0]!['targetDeviceId']).toBe('mobile-1');
+      expect(hostCandidates[0]!['sdpMid']).toBe('0');
+      expect(hostCandidates[0]!['sdpMLineIndex']).toBe(0);
     });
 
     it('silently drops relay to disconnected target', async () => {
