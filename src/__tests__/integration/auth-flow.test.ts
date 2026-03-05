@@ -100,7 +100,7 @@ describe('Full auth flow integration [T3.11]', () => {
     const completeResult = await postJSON('/pair/complete', {
       pairingCode,
       deviceId: 'mobile-integ',
-      publicKey: mobilePubBase64,
+      ed25519PublicKey: mobilePubBase64,
       x25519PublicKey: 'mobile-x25519-pub',
     });
     expect(completeResult.status).toBe(200);

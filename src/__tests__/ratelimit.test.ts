@@ -220,7 +220,7 @@ describe('DO rate limiting integration', () => {
       // 11th should be rate limited (body doesn't matter — 429 fires before handler)
       const { status, data, response } = await postJSON('/pair/initiate', {
         deviceId: 'agent-overflow',
-        publicKey: 'pub-key-overflow',
+        ed25519PublicKey: 'pub-key-overflow',
         x25519PublicKey: 'x25519-key-overflow',
       });
       expect(status).toBe(429);
@@ -242,7 +242,7 @@ describe('DO rate limiting integration', () => {
       const { status } = await postJSON('/pair/complete', {
         pairingCode: 'ABCDEF',
         deviceId: 'mobile-1',
-        publicKey: 'pub-key-mobile',
+        ed25519PublicKey: 'pub-key-mobile',
         x25519PublicKey: 'x25519-key-mobile',
       });
       // 404 because the pairing code is invalid, but NOT 429
@@ -262,7 +262,7 @@ describe('DO rate limiting integration', () => {
       // IP 1 is blocked
       const blocked = await postJSON('/pair/initiate', {
         deviceId: 'agent-blocked',
-        publicKey: 'pub-key-blocked',
+        ed25519PublicKey: 'pub-key-blocked',
         x25519PublicKey: 'x25519-key-blocked',
       }, { 'X-Client-IP': '10.0.0.1' });
       expect(blocked.status).toBe(429);
@@ -524,7 +524,7 @@ describe('pairing code expiry enforcement', () => {
     const { status, data } = await postJSON('/pair/complete', {
       pairingCode: code,
       deviceId: 'mobile-1',
-      publicKey: 'pub-key-mobile',
+      ed25519PublicKey: 'pub-key-mobile',
       x25519PublicKey: 'x25519-key-mobile',
     });
 
@@ -546,7 +546,7 @@ describe('pairing code expiry enforcement', () => {
     const { status } = await postJSON('/pair/complete', {
       pairingCode: code,
       deviceId: 'mobile-1',
-      publicKey: 'pub-key-mobile',
+      ed25519PublicKey: 'pub-key-mobile',
       x25519PublicKey: 'x25519-key-mobile',
     });
 
@@ -595,7 +595,7 @@ describe('legitimate usage patterns', () => {
     const { status } = await postJSON('/pair/complete', {
       pairingCode: initResult.data['pairingCode'],
       deviceId: 'mobile-1',
-      publicKey: 'pub-key-mobile',
+      ed25519PublicKey: 'pub-key-mobile',
       x25519PublicKey: 'x25519-key-mobile',
     });
     expect(status).toBe(200);

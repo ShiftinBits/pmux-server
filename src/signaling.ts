@@ -25,7 +25,7 @@ const MAX_WS_MESSAGE_SIZE = 16_384;
 
 export interface StoredDevice {
   id: string;
-  publicKey: string;
+  ed25519PublicKey: string;
   deviceType: DeviceType;
   name: string | null;
   createdAt: number;
@@ -91,10 +91,17 @@ export class SignalingDO implements DurableObject {
   private ensureSchema(): void {
     if (this.initialized) return;
 
+    // Migrate column name from public_key to ed25519_public_key (SB-340)
+    try {
+      this.sql.exec('ALTER TABLE devices RENAME COLUMN public_key TO ed25519_public_key');
+    } catch {
+      // Column already renamed or table doesn't exist yet — CREATE TABLE handles it
+    }
+
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS devices (
         id TEXT PRIMARY KEY,
-        public_key TEXT NOT NULL UNIQUE,
+        ed25519_public_key TEXT NOT NULL UNIQUE,
         device_type TEXT NOT NULL CHECK(device_type IN ('host', 'mobile')),
         name TEXT,
         created_at INTEGER NOT NULL
@@ -130,7 +137,7 @@ export class SignalingDO implements DurableObject {
    */
   registerDevice(
     deviceId: string,
-    publicKey: string,
+    ed25519PublicKey: string,
     deviceType: DeviceType,
     name?: string
   ): { deviceId: string } {
@@ -138,9 +145,9 @@ export class SignalingDO implements DurableObject {
     const now = Math.floor(Date.now() / 1000);
 
     this.sql.exec(
-      'INSERT OR REPLACE INTO devices (id, public_key, device_type, name, created_at) VALUES (?, ?, ?, ?, ?)',
+      'INSERT OR REPLACE INTO devices (id, ed25519_public_key, device_type, name, created_at) VALUES (?, ?, ?, ?, ?)',
       deviceId,
-      publicKey,
+      ed25519PublicKey,
       deviceType,
       name ?? null,
       now
@@ -236,7 +243,7 @@ export class SignalingDO implements DurableObject {
   getDevice(deviceId: string): StoredDevice | null {
     this.ensureSchema();
     const rows = this.sql.exec(
-      'SELECT id, public_key, device_type, name, created_at FROM devices WHERE id = ?',
+      'SELECT id, ed25519_public_key, device_type, name, created_at FROM devices WHERE id = ?',
       deviceId
     );
 
@@ -843,13 +850,13 @@ export class SignalingDO implements DurableObject {
   /**
    * POST /pair/initiate
    * Host calls this to start pairing. Creates a pairing session.
-   * Body: { deviceId, publicKey, x25519PublicKey, timestamp, signature, name? }
+   * Body: { deviceId, ed25519PublicKey, x25519PublicKey, timestamp, signature, name? }
    * Returns: { pairingCode }
    */
   private async handlePairInitiate(request: Request): Promise<Response> {
     let body: {
       deviceId?: string;
-      publicKey?: string;
+      ed25519PublicKey?: string;
       x25519PublicKey?: string;
       timestamp?: string;
       signature?: string;
@@ -861,9 +868,9 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Invalid JSON' }, 400);
     }
 
-    if (!body.deviceId || !body.publicKey || !body.x25519PublicKey || !body.timestamp || !body.signature) {
+    if (!body.deviceId || !body.ed25519PublicKey || !body.x25519PublicKey || !body.timestamp || !body.signature) {
       return jsonResponse(
-        { error: 'Missing required fields: deviceId, publicKey, x25519PublicKey, timestamp, signature' },
+        { error: 'Missing required fields: deviceId, ed25519PublicKey, x25519PublicKey, timestamp, signature' },
         400
       );
     }
@@ -882,7 +889,7 @@ export class SignalingDO implements DurableObject {
 
     // Verify signature against stored key (if device exists) or request body key
     const existing = this.getDevice(body.deviceId);
-    const verifyKey = existing ? existing.publicKey : body.publicKey;
+    const verifyKey = existing ? existing.ed25519PublicKey : body.ed25519PublicKey;
     const message = new TextEncoder().encode(body.deviceId + body.timestamp);
     const publicKeyBytes = base64ToBytes(verifyKey);
     const signatureBytes = base64ToBytes(body.signature);
@@ -899,7 +906,7 @@ export class SignalingDO implements DurableObject {
 
     // Register the host device if not already registered, or update name
     if (!existing) {
-      this.registerDevice(body.deviceId, body.publicKey, 'host', body.name);
+      this.registerDevice(body.deviceId, body.ed25519PublicKey, 'host', body.name);
     } else if (body.name !== undefined) {
       // Signature already verified against stored key, safe to update name
       this.updateDeviceName(body.deviceId, body.name);
@@ -908,7 +915,7 @@ export class SignalingDO implements DurableObject {
     const pairingCode = this.createPairingSession(
       body.deviceId,
       body.x25519PublicKey,
-      body.publicKey
+      body.ed25519PublicKey
     );
 
     return jsonResponse({ pairingCode });
@@ -917,14 +924,14 @@ export class SignalingDO implements DurableObject {
   /**
    * POST /pair/complete
    * Mobile calls this with the pairing code to complete pairing.
-   * Body: { pairingCode, deviceId, publicKey, x25519PublicKey }
+   * Body: { pairingCode, deviceId, ed25519PublicKey, x25519PublicKey }
    * Returns: { hostX25519PublicKey, hostDeviceId, hostName? }
    */
   private async handlePairComplete(request: Request): Promise<Response> {
     let body: {
       pairingCode?: string;
       deviceId?: string;
-      publicKey?: string;
+      ed25519PublicKey?: string;
       x25519PublicKey?: string;
     };
     try {
@@ -933,9 +940,9 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Invalid JSON' }, 400);
     }
 
-    if (!body.pairingCode || !body.deviceId || !body.publicKey || !body.x25519PublicKey) {
+    if (!body.pairingCode || !body.deviceId || !body.ed25519PublicKey || !body.x25519PublicKey) {
       return jsonResponse(
-        { error: 'Missing required fields: pairingCode, deviceId, publicKey, x25519PublicKey' },
+        { error: 'Missing required fields: pairingCode, deviceId, ed25519PublicKey, x25519PublicKey' },
         400
       );
     }
@@ -972,7 +979,7 @@ export class SignalingDO implements DurableObject {
     // Register the mobile device
     this.registerDevice(
       body.deviceId,
-      body.publicKey,
+      body.ed25519PublicKey,
       'mobile'
     );
 
@@ -1035,7 +1042,7 @@ export class SignalingDO implements DurableObject {
 
     // Verify the signature: sign(privateKey, deviceId + timestamp)
     const message = new TextEncoder().encode(body.deviceId + body.timestamp);
-    const publicKeyBytes = base64ToBytes(device.publicKey);
+    const publicKeyBytes = base64ToBytes(device.ed25519PublicKey);
     const signatureBytes = base64ToBytes(body.signature);
 
     let valid: boolean;
@@ -1082,7 +1089,7 @@ export class SignalingDO implements DurableObject {
 function rowToDevice(row: Record<string, SqlStorageValue>): StoredDevice {
   return {
     id: row['id'] as string,
-    publicKey: row['public_key'] as string,
+    ed25519PublicKey: row['ed25519_public_key'] as string,
     deviceType: row['device_type'] as DeviceType,
     name: row['name'] as string | null,
     createdAt: row['created_at'] as number,

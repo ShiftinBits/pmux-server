@@ -72,7 +72,7 @@ describe('Rate limiting integration [T3.11]', () => {
       // 11th request should be rate limited (body doesn't matter — 429 fires before handler)
       const { status, data, response } = await postJSON('/pair/initiate', {
         deviceId: 'agent-overflow',
-        publicKey: 'pub-key-overflow',
+        ed25519PublicKey: 'pub-key-overflow',
         x25519PublicKey: 'x25519-key-overflow',
       });
 
@@ -105,7 +105,7 @@ describe('Rate limiting integration [T3.11]', () => {
       // Next request should still be blocked (state persisted)
       const { status } = await postJSON('/pair/initiate', {
         deviceId: 'agent-persist-overflow',
-        publicKey: 'pub-key-overflow',
+        ed25519PublicKey: 'pub-key-overflow',
         x25519PublicKey: 'x25519-key-overflow',
       });
       expect(status).toBe(429);
@@ -128,7 +128,7 @@ describe('Rate limiting integration [T3.11]', () => {
         '/pair/initiate',
         {
           deviceId: 'agent-a-blocked',
-          publicKey: 'pub-key-a-blocked',
+          ed25519PublicKey: 'pub-key-a-blocked',
           x25519PublicKey: 'x25519-key-a-blocked',
         },
         { 'X-Client-IP': '10.0.0.1' }
@@ -160,7 +160,7 @@ describe('Rate limiting integration [T3.11]', () => {
       // /pair/initiate is blocked
       const blocked = await postJSON('/pair/initiate', {
         deviceId: 'agent-sep-overflow',
-        publicKey: 'pub-key-sep-overflow',
+        ed25519PublicKey: 'pub-key-sep-overflow',
         x25519PublicKey: 'x25519-key-sep-overflow',
       });
       expect(blocked.status).toBe(429);
@@ -169,7 +169,7 @@ describe('Rate limiting integration [T3.11]', () => {
       const complete = await postJSON('/pair/complete', {
         pairingCode: 'ABCDEF',
         deviceId: 'mobile-sep-1',
-        publicKey: 'pub-key-mobile',
+        ed25519PublicKey: 'pub-key-mobile',
         x25519PublicKey: 'x25519-key-mobile',
       });
       expect(complete.status).toBe(404); // Bad code, but NOT rate limited
@@ -213,7 +213,7 @@ describe('Rate limiting integration [T3.11]', () => {
       // Blocked
       const blocked = await postJSON('/pair/initiate', {
         deviceId: 'agent-reset-blocked',
-        publicKey: 'pub-key-blocked',
+        ed25519PublicKey: 'pub-key-blocked',
         x25519PublicKey: 'x25519-key-blocked',
       });
       expect(blocked.status).toBe(429);
@@ -241,7 +241,7 @@ describe('Rate limiting integration [T3.11]', () => {
       // Trigger 429
       const { status, data, response } = await postJSON('/pair/initiate', {
         deviceId: 'agent-format-overflow',
-        publicKey: 'pub-key-overflow',
+        ed25519PublicKey: 'pub-key-overflow',
         x25519PublicKey: 'x25519-key-overflow',
       });
 

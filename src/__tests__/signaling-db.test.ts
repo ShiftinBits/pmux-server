@@ -48,7 +48,7 @@ describe('device registration', () => {
 
     const device = doInstance.getDevice('device-1');
     expect(device).not.toBeNull();
-    expect(device!.publicKey).toBe('pub-key-v2');
+    expect(device!.ed25519PublicKey).toBe('pub-key-v2');
     expect(device!.name).toBe('New Name');
   });
 });
@@ -60,7 +60,7 @@ describe('getDevice', () => {
     const device = doInstance.getDevice('device-1');
     expect(device).not.toBeNull();
     expect(device!.id).toBe('device-1');
-    expect(device!.publicKey).toBe('pub-key-1');
+    expect(device!.ed25519PublicKey).toBe('pub-key-1');
     expect(device!.deviceType).toBe('host');
     expect(device!.createdAt).toBeTypeOf('number');
   });
