@@ -76,7 +76,7 @@ describe('404 Not Found', () => {
     expect(data['error']).toBe('Not Found');
   });
 
-  it('returns 404 for GET with unknown path', async () => {
+  it('returns 404 for POST with unknown path', async () => {
     const { status, data } = await sendRequest('POST', '/unknown/path');
 
     expect(status).toBe(404);
