@@ -8,7 +8,7 @@
  */
 
 import type { Env } from './worker';
-import type { DeviceType, SignalingClientMessage, HostOnlineMessage } from '@pocketmux/shared';
+import type { DeviceType, SignalingClientMessage, AuthMessage, HostOnlineMessage } from '@pocketmux/shared';
 import { verifyEd25519Signature, createJWT, verifyJWT } from './auth';
 import { generateTurnCredentials } from './turn';
 import {
@@ -544,7 +544,7 @@ export class SignalingDO implements DurableObject {
 
     // Auth must be handled before any other message type
     if (data.type === 'auth') {
-      await this.handleWsAuth(ws, data.token);
+      await this.handleWsAuth(ws, data.token, (data as AuthMessage).name);
       return;
     }
 
@@ -721,7 +721,7 @@ export class SignalingDO implements DurableObject {
    * Handle auth message: verify JWT and associate WebSocket with device.
    * Enforces per-device WebSocket connection limit.
    */
-  private async handleWsAuth(ws: WebSocket, token: string): Promise<void> {
+  private async handleWsAuth(ws: WebSocket, token: string, name?: string): Promise<void> {
     try {
       const payload = await verifyJWT(token, this.env.JWT_SECRET);
 
@@ -756,15 +756,28 @@ export class SignalingDO implements DurableObject {
       this.connections.set(payload.deviceId, ws);
       this.incrementWsCount(payload.deviceId);
 
+      // Update host name if provided in auth message
+      const validName = payload.deviceType === 'host' &&
+        typeof name === 'string' && name.length > 0 && name.length <= 64
+        ? name
+        : undefined;
+      if (validName) {
+        this.updateDeviceName(payload.deviceId, validName);
+      }
+
       // If host, notify the paired mobile of host_online (with name from DB)
       if (payload.deviceType === 'host') {
-        const hostDevice = this.getDevice(payload.deviceId);
         const hostOnlineMsg: HostOnlineMessage = {
           type: 'host_online',
           deviceId: payload.deviceId,
         };
-        if (hostDevice?.name) {
-          hostOnlineMsg.name = hostDevice.name;
+        if (validName) {
+          hostOnlineMsg.name = validName;
+        } else {
+          const hostDevice = this.getDevice(payload.deviceId);
+          if (hostDevice?.name) {
+            hostOnlineMsg.name = hostDevice.name;
+          }
         }
         const pairedMobileId = this.getPairedMobile(payload.deviceId);
         if (pairedMobileId) {
