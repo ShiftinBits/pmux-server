@@ -30,7 +30,7 @@ export async function signEd25519(privateKey: CryptoKey, message: Uint8Array): P
 export async function signedPairInitiateBody(
   deviceId: string,
   keyPair: CryptoKeyPair,
-  publicKeyBase64: string,
+  ed25519PublicKeyBase64: string,
   x25519PublicKey: string,
   name?: string
 ): Promise<Record<string, string>> {
@@ -39,7 +39,7 @@ export async function signedPairInitiateBody(
   const signature = await signEd25519(keyPair.privateKey, message);
   return {
     deviceId,
-    publicKey: publicKeyBase64,
+    ed25519PublicKey: ed25519PublicKeyBase64,
     x25519PublicKey,
     timestamp,
     signature: bytesToBase64(signature),
