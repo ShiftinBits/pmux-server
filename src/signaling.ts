@@ -409,40 +409,66 @@ export class SignalingDO implements DurableObject {
 
   // --- HTTP routing ---
 
+  /** Allowed HTTP methods per path (excluding /ws which has no method restriction). */
+  private static readonly ROUTE_METHODS: Record<string, string> = {
+    '/pair/initiate': 'POST',
+    '/pair/complete': 'POST',
+    '/token': 'POST',
+    '/turn/credentials': 'GET',
+  };
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const clientIp = request.headers.get('X-Client-IP') ?? '127.0.0.1';
     const deviceId = request.headers.get('X-Device-Id') ?? '';
 
-    // Route to specific handlers based on path, with rate limiting
-    if (url.pathname === '/pair/initiate' && request.method === 'POST') {
-      const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/pair/initiate');
-      if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
-      return this.handlePairInitiate(request);
+    // Check method-restricted routes first
+    const allowedMethod = SignalingDO.ROUTE_METHODS[url.pathname];
+    if (allowedMethod !== undefined) {
+      if (request.method !== allowedMethod) {
+        return new Response(JSON.stringify({ error: 'Method Not Allowed' }), {
+          status: 405,
+          headers: { 'Content-Type': 'application/json', 'Allow': allowedMethod },
+        });
+      }
+
+      // Method matches — apply rate limiting and dispatch to handler
+      switch (url.pathname) {
+        case '/pair/initiate': {
+          const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/pair/initiate');
+          if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+          return this.handlePairInitiate(request);
+        }
+        case '/pair/complete': {
+          const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/pair/complete');
+          if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+          return this.handlePairComplete(request);
+        }
+        case '/token': {
+          // Token uses IP as key since device ID comes from the request body (pre-auth)
+          const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/token');
+          if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+          return this.handleTokenExchange(request);
+        }
+        case '/turn/credentials': {
+          const rl = await checkRateLimit(this.rateLimitStorage, deviceId || clientIp, '/turn/credentials');
+          if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+          return this.handleTurnCredentials();
+        }
+      }
     }
-    if (url.pathname === '/pair/complete' && request.method === 'POST') {
-      const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/pair/complete');
-      if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
-      return this.handlePairComplete(request);
-    }
-    if (url.pathname === '/token' && request.method === 'POST') {
-      // Token uses IP as key since device ID comes from the request body (pre-auth)
-      const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/token');
-      if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
-      return this.handleTokenExchange(request);
-    }
-    if (url.pathname === '/turn/credentials' && request.method === 'GET') {
-      const rl = await checkRateLimit(this.rateLimitStorage, deviceId || clientIp, '/turn/credentials');
-      if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
-      return this.handleTurnCredentials();
-    }
+
+    // /ws has no method restriction (upgrade check is inside the handler)
     if (url.pathname === '/ws') {
       const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/ws');
       if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
       return this.handleWebSocketUpgrade(request);
     }
 
-    return new Response('Not Found', { status: 404 });
+    return new Response(JSON.stringify({ error: 'Not Found' }), {
+      status: 404,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 
   // --- WebSocket upgrade [T1.8] ---
