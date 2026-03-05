@@ -423,6 +423,7 @@ export class SignalingDO implements DurableObject {
     '/pair/complete': 'POST',
     '/token': 'POST',
     '/turn/credentials': 'GET',
+    '/pairing': 'DELETE',
   };
 
   async fetch(request: Request): Promise<Response> {
@@ -462,6 +463,11 @@ export class SignalingDO implements DurableObject {
           const rl = await checkRateLimit(this.rateLimitStorage, deviceId || clientIp, '/turn/credentials');
           if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
           return this.handleTurnCredentials();
+        }
+        case '/pairing': {
+          const rl = await checkRateLimit(this.rateLimitStorage, deviceId || clientIp, '/pairing');
+          if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+          return this.handleDeletePairing(request);
         }
       }
     }
@@ -1069,6 +1075,35 @@ export class SignalingDO implements DurableObject {
   }
 
   // --- TURN credentials [T3.5] ---
+
+  /**
+   * DELETE /pairing
+   * Removes the pairing for the authenticated host device and notifies
+   * the paired mobile via device_unpaired. Called by `pmux unpair`.
+   */
+  private handleDeletePairing(request: Request): Response {
+    const hostDeviceId = request.headers.get('X-Device-Id') ?? '';
+    if (!hostDeviceId) {
+      return jsonResponse({ error: 'Missing device ID' }, 400);
+    }
+
+    // Get host device name before removing pairing (for the notification)
+    const hostDevice = this.getDevice(hostDeviceId);
+    const hostName = hostDevice?.name ?? undefined;
+
+    // Notify the paired mobile before removing the pairing record
+    this.notifyPairedMobile(hostDeviceId, {
+      type: 'device_unpaired',
+      reason: 'host_unpaired',
+      hostDeviceId,
+      hostName,
+    });
+
+    // Remove pairing (also cleans up orphaned mobile device)
+    const removedMobileId = this.removePairing(hostDeviceId);
+
+    return jsonResponse({ removed: removedMobileId !== null });
+  }
 
   /**
    * GET /turn/credentials

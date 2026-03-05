@@ -521,3 +521,146 @@ describe('POST /pair/complete', () => {
     expect(unpairedMsgs).toHaveLength(0);
   });
 });
+
+describe('DELETE /pairing', () => {
+  it('removes existing pairing and returns removed: true', async () => {
+    const { doInstance: do2 } = await createTestDOFull();
+
+    const keys = await generateEd25519Keypair();
+    const kp = keys.keyPair;
+    const pubBase64 = bytesToBase64(keys.publicKeyRaw);
+
+    async function post(path: string, body: unknown) {
+      const req = new Request(`http://localhost${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const res = await do2.fetch(req);
+      return { status: res.status, data: await res.json() as Record<string, unknown> };
+    }
+
+    // Create pairing
+    const initBody = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent', 'my-host');
+    const init = await post('/pair/initiate', initBody);
+    await post('/pair/complete', {
+      pairingCode: init.data['pairingCode'],
+      deviceId: 'mobile-1',
+      ed25519PublicKey: 'ed25519-pub-key-mobile',
+      x25519PublicKey: 'x25519-pub-key-mobile',
+    });
+    expect(do2.isPaired('agent-1', 'mobile-1')).toBe(true);
+
+    // DELETE /pairing (simulates worker injecting X-Device-Id from JWT)
+    const delReq = new Request('http://localhost/pairing', {
+      method: 'DELETE',
+      headers: { 'X-Device-Id': 'agent-1' },
+    });
+    const delRes = await do2.fetch(delReq);
+    const delData = await delRes.json() as Record<string, unknown>;
+
+    expect(delRes.status).toBe(200);
+    expect(delData['removed']).toBe(true);
+    expect(do2.isPaired('agent-1', 'mobile-1')).toBe(false);
+  });
+
+  it('notifies connected mobile with device_unpaired reason host_unpaired', async () => {
+    const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
+    const { doInstance: do2, mockState } = await createTestDOFull();
+
+    const keys = await generateEd25519Keypair();
+    const kp = keys.keyPair;
+    const pubBase64 = bytesToBase64(keys.publicKeyRaw);
+
+    async function post(path: string, body: unknown) {
+      const req = new Request(`http://localhost${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const res = await do2.fetch(req);
+      return { status: res.status, data: await res.json() as Record<string, unknown> };
+    }
+
+    // Create pairing
+    const initBody = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent', 'my-host');
+    const init = await post('/pair/initiate', initBody);
+    await post('/pair/complete', {
+      pairingCode: init.data['pairingCode'],
+      deviceId: 'mobile-1',
+      ed25519PublicKey: 'ed25519-pub-key-mobile',
+      x25519PublicKey: 'x25519-pub-key-mobile',
+    });
+
+    // Connect mobile via WebSocket
+    const mobileToken = await createJWT('mobile-1', 'mobile', JWT_SECRET);
+    const mobileWs = new MockWebSocket();
+    mockState.acceptedWebSockets.push(mobileWs as unknown as WebSocket);
+    await do2.webSocketMessage(
+      mobileWs as unknown as WebSocket,
+      JSON.stringify({ type: 'auth', token: mobileToken })
+    );
+    mobileWs.sent.length = 0;
+
+    // DELETE /pairing
+    const delReq = new Request('http://localhost/pairing', {
+      method: 'DELETE',
+      headers: { 'X-Device-Id': 'agent-1' },
+    });
+    await do2.fetch(delReq);
+
+    // Mobile should receive device_unpaired with reason 'host_unpaired'
+    const unpairedMsgs = mobileWs.messagesOfType('device_unpaired');
+    expect(unpairedMsgs).toHaveLength(1);
+    expect(unpairedMsgs[0]!['reason']).toBe('host_unpaired');
+    expect(unpairedMsgs[0]!['hostDeviceId']).toBe('agent-1');
+    expect(unpairedMsgs[0]!['hostName']).toBe('my-host');
+  });
+
+  it('returns removed: false when no pairing exists', async () => {
+    const { doInstance: do2 } = await createTestDOFull();
+
+    // Register a host device but don't pair it
+    const keys = await generateEd25519Keypair();
+    const kp = keys.keyPair;
+    const pubBase64 = bytesToBase64(keys.publicKeyRaw);
+    const initBody = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent');
+    await do2.fetch(new Request('http://localhost/pair/initiate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(initBody),
+    }));
+
+    // DELETE without completing pairing
+    const delReq = new Request('http://localhost/pairing', {
+      method: 'DELETE',
+      headers: { 'X-Device-Id': 'agent-1' },
+    });
+    const delRes = await do2.fetch(delReq);
+    const delData = await delRes.json() as Record<string, unknown>;
+
+    expect(delRes.status).toBe(200);
+    expect(delData['removed']).toBe(false);
+  });
+
+  it('rejects non-DELETE methods with 405', async () => {
+    const req = new Request('http://localhost/pairing', {
+      method: 'GET',
+    });
+    const res = await doInstance.fetch(req);
+
+    expect(res.status).toBe(405);
+    expect(res.headers.get('Allow')).toBe('DELETE');
+  });
+
+  it('returns 400 when X-Device-Id header is missing', async () => {
+    const delReq = new Request('http://localhost/pairing', {
+      method: 'DELETE',
+    });
+    const delRes = await doInstance.fetch(delReq);
+    const delData = await delRes.json() as Record<string, unknown>;
+
+    expect(delRes.status).toBe(400);
+    expect(delData['error']).toContain('Missing device ID');
+  });
+});
