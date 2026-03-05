@@ -38,6 +38,12 @@ export interface PairingSession {
   expiresAt: number;
 }
 
+export interface StoredPairing {
+  hostDeviceId: string;
+  mobileDeviceId: string;
+  createdAt: number;
+}
+
 /** Per-WebSocket metadata, survives DO hibernation via serializeAttachment. */
 export interface WsAttachment {
   deviceId: string;
@@ -166,12 +172,12 @@ export class SignalingDO implements DurableObject {
   getPairedMobile(hostDeviceId: string): string | null {
     this.ensureSchema();
     const rows = this.sql.exec(
-      'SELECT mobile_device_id FROM pairings WHERE host_device_id = ?',
+      'SELECT * FROM pairings WHERE host_device_id = ?',
       hostDeviceId
     );
     const results = [...rows];
     if (results.length === 0) return null;
-    return results[0]!['mobile_device_id'] as string;
+    return rowToPairing(results[0]!).mobileDeviceId;
   }
 
   /**
@@ -218,10 +224,10 @@ export class SignalingDO implements DurableObject {
   getHostsForMobile(mobileDeviceId: string): string[] {
     this.ensureSchema();
     const rows = this.sql.exec(
-      'SELECT host_device_id FROM pairings WHERE mobile_device_id = ?',
+      'SELECT * FROM pairings WHERE mobile_device_id = ?',
       mobileDeviceId
     );
-    return [...rows].map(row => row['host_device_id'] as string);
+    return [...rows].map(row => rowToPairing(row).hostDeviceId);
   }
 
   /**
@@ -245,7 +251,7 @@ export class SignalingDO implements DurableObject {
   removeDevice(deviceId: string): boolean {
     this.ensureSchema();
     const before = this.sql.exec('SELECT COUNT(*) as count FROM devices WHERE id = ?', deviceId);
-    const count = [...before][0]?.['count'] as number;
+    const count = rowToCount([...before][0]!);
     if (count === 0) return false;
 
     this.sql.exec('DELETE FROM devices WHERE id = ?', deviceId);
@@ -313,12 +319,7 @@ export class SignalingDO implements DurableObject {
     const row = rows[0]!;
     this.sql.exec('DELETE FROM pairing_sessions WHERE code = ?', code);
 
-    return {
-      hostDeviceId: row.host_device_id as string,
-      hostX25519PublicKey: row.host_x25519_public_key as string,
-      hostEdPublicKey: row.host_ed_public_key as string,
-      expiresAt: row.expires_at as number,
-    };
+    return rowToPairingSession(row);
   }
 
   private cleanExpiredPairings(): void {
@@ -1086,6 +1087,27 @@ function rowToDevice(row: Record<string, SqlStorageValue>): StoredDevice {
     name: row['name'] as string | null,
     createdAt: row['created_at'] as number,
   };
+}
+
+function rowToPairing(row: Record<string, SqlStorageValue>): StoredPairing {
+  return {
+    hostDeviceId: row['host_device_id'] as string,
+    mobileDeviceId: row['mobile_device_id'] as string,
+    createdAt: row['created_at'] as number,
+  };
+}
+
+function rowToPairingSession(row: Record<string, SqlStorageValue>): PairingSession {
+  return {
+    hostDeviceId: row['host_device_id'] as string,
+    hostX25519PublicKey: row['host_x25519_public_key'] as string,
+    hostEdPublicKey: row['host_ed_public_key'] as string,
+    expiresAt: row['expires_at'] as number,
+  };
+}
+
+function rowToCount(row: Record<string, SqlStorageValue>): number {
+  return row['count'] as number;
 }
 
 function generatePairingCode(): string {
