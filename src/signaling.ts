@@ -172,7 +172,7 @@ export class SignalingDO implements DurableObject {
   getPairedMobile(hostDeviceId: string): string | null {
     this.ensureSchema();
     const rows = this.sql.exec(
-      'SELECT mobile_device_id FROM pairings WHERE host_device_id = ?',
+      'SELECT * FROM pairings WHERE host_device_id = ?',
       hostDeviceId
     );
     const results = [...rows];
@@ -224,7 +224,7 @@ export class SignalingDO implements DurableObject {
   getHostsForMobile(mobileDeviceId: string): string[] {
     this.ensureSchema();
     const rows = this.sql.exec(
-      'SELECT host_device_id FROM pairings WHERE mobile_device_id = ?',
+      'SELECT * FROM pairings WHERE mobile_device_id = ?',
       mobileDeviceId
     );
     return [...rows].map(row => rowToPairing(row).hostDeviceId);
