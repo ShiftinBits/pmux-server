@@ -8,7 +8,7 @@
  */
 
 import type { Env } from './worker';
-import type { DeviceType, SignalingClientMessage, AuthMessage, HostOnlineMessage } from '@pocketmux/shared';
+import type { DeviceType, SignalingClientMessage, HostOnlineMessage } from '@pocketmux/shared';
 import { verifyEd25519Signature, createJWT, verifyJWT } from './auth';
 import { generateTurnCredentials } from './turn';
 import {
@@ -544,7 +544,7 @@ export class SignalingDO implements DurableObject {
 
     // Auth must be handled before any other message type
     if (data.type === 'auth') {
-      await this.handleWsAuth(ws, data.token, (data as AuthMessage).name);
+      await this.handleWsAuth(ws, data.token, data.name);
       return;
     }
 
