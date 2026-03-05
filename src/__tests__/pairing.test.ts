@@ -652,4 +652,15 @@ describe('DELETE /pairing', () => {
     expect(res.status).toBe(405);
     expect(res.headers.get('Allow')).toBe('DELETE');
   });
+
+  it('returns 400 when X-Device-Id header is missing', async () => {
+    const delReq = new Request('http://localhost/pairing', {
+      method: 'DELETE',
+    });
+    const delRes = await doInstance.fetch(delReq);
+    const delData = await delRes.json() as Record<string, unknown>;
+
+    expect(delRes.status).toBe(400);
+    expect(delData['error']).toContain('Missing device ID');
+  });
 });
