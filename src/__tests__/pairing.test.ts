@@ -666,6 +666,29 @@ describe('POST /pair/complete', () => {
     const unpairedMsgs = mobile1Ws.messagesOfType('device_unpaired');
     expect(unpairedMsgs).toHaveLength(0);
   });
+
+  it('returns 409 when a host device attempts to complete pairing as mobile', async () => {
+    // Register agent-1 as a host via /pair/initiate
+    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const initResult = await postJSON('/pair/initiate', body);
+    const pairingCode = initResult.data['pairingCode'] as string;
+
+    // Now try to complete pairing using the same device ID (agent-1) as mobile
+    const { status, data } = await postJSON('/pair/complete', {
+      pairingCode,
+      deviceId: 'agent-1', // already registered as 'host'
+      ed25519PublicKey: ed25519PublicKeyBase64,
+      x25519PublicKey: 'x25519-pub-key-agent',
+    });
+
+    expect(status).toBe(409);
+    expect(data['error']).toContain('Device type conflict');
+
+    // Original device should still be a host
+    const device = doInstance.getDevice('agent-1');
+    expect(device).not.toBeNull();
+    expect(device!.deviceType).toBe('host');
+  });
 });
 
 describe('DELETE /pairing', () => {

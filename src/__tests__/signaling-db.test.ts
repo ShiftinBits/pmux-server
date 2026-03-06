@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createTestDOCompat as createTestDO } from './helpers/mock-do';
 import type { SignalingDO } from '../signaling';
+import { DeviceTypeConflictError } from '../signaling';
 
 let doInstance: SignalingDO;
 
@@ -42,7 +43,7 @@ describe('device registration', () => {
     expect(device!.name).toBe('My Workstation');
   });
 
-  it('re-registering a device replaces the old record (INSERT OR REPLACE)', () => {
+  it('re-registering a device with the same type updates allowed fields', () => {
     doInstance.registerDevice('device-1', 'pub-key-v1', 'host', 'Old Name');
     doInstance.registerDevice('device-1', 'pub-key-v2', 'host', 'New Name');
 
@@ -50,6 +51,38 @@ describe('device registration', () => {
     expect(device).not.toBeNull();
     expect(device!.ed25519PublicKey).toBe('pub-key-v2');
     expect(device!.name).toBe('New Name');
+  });
+
+  it('throws DeviceTypeConflictError when re-registering with a different device_type', () => {
+    doInstance.registerDevice('device-1', 'pub-key-1', 'host', 'My Host');
+
+    expect(() => {
+      doInstance.registerDevice('device-1', 'pub-key-2', 'mobile', 'My Mobile');
+    }).toThrow(DeviceTypeConflictError);
+  });
+
+  it('preserves the original record after a device_type conflict', () => {
+    doInstance.registerDevice('device-1', 'pub-key-1', 'host', 'My Host');
+
+    try {
+      doInstance.registerDevice('device-1', 'pub-key-2', 'mobile', 'My Mobile');
+    } catch {
+      // expected
+    }
+
+    const device = doInstance.getDevice('device-1');
+    expect(device).not.toBeNull();
+    expect(device!.deviceType).toBe('host');
+    expect(device!.ed25519PublicKey).toBe('pub-key-1');
+    expect(device!.name).toBe('My Host');
+  });
+
+  it('throws DeviceTypeConflictError when mobile re-registers as host', () => {
+    doInstance.registerDevice('device-1', 'pub-key-1', 'mobile');
+
+    expect(() => {
+      doInstance.registerDevice('device-1', 'pub-key-2', 'host');
+    }).toThrow(DeviceTypeConflictError);
   });
 });
 
