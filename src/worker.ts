@@ -116,15 +116,13 @@ export default {
 };
 
 /**
- * Extract client IP from Cloudflare headers with fallbacks.
- * CF-Connecting-IP is set by Cloudflare on all requests.
+ * Extract client IP from Cloudflare headers.
+ * CF-Connecting-IP is always set by Cloudflare on production requests.
+ * Falls back to a random UUID so unidentifiable clients each get their
+ * own rate-limit bucket instead of sharing one.
  */
 export function extractClientIp(request: Request): string {
-  return (
-    request.headers.get('CF-Connecting-IP') ??
-    request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ??
-    '127.0.0.1'
-  );
+  return request.headers.get('CF-Connecting-IP') ?? crypto.randomUUID();
 }
 
 /**
