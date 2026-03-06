@@ -756,12 +756,25 @@ export class SignalingDO implements DurableObject {
       this.connections.set(payload.deviceId, ws);
       this.incrementWsCount(payload.deviceId);
 
-      // Update host name if provided in auth message
-      const validName = payload.deviceType === 'host' &&
-        typeof name === 'string' && name.length > 0 && name.length <= 64
+      // Update device name if provided in auth message
+      const validName = typeof name === 'string' && name.length > 0 && name.length <= 64
         ? name
         : undefined;
-      if (validName) {
+
+      if (validName && payload.deviceType === 'mobile') {
+        const nameChanged = device.name !== validName;
+        this.updateDeviceName(payload.deviceId, validName);
+        if (nameChanged) {
+          const pairedHosts = this.getHostsForMobile(payload.deviceId);
+          for (const hostDeviceId of pairedHosts) {
+            this.notifyDevice(hostDeviceId, {
+              type: 'mobile_name_updated',
+              deviceId: payload.deviceId,
+              name: validName,
+            });
+          }
+        }
+      } else if (validName && payload.deviceType === 'host') {
         this.updateDeviceName(payload.deviceId, validName);
       }
 

@@ -239,19 +239,19 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(device?.name).toBe('new-name');
     });
 
-    it('ignores name field from mobile devices', async () => {
+    it('updates mobile device name from auth message', async () => {
       doInstance.registerDevice('mobile-1', 'pubkey-mobile-1', 'mobile');
       const mobileToken = await createJWT('mobile-1', 'mobile', JWT_SECRET);
 
       const mobileWs = new MockWebSocket();
       await doInstance.webSocketMessage(
         mobileWs as unknown as WebSocket,
-        JSON.stringify({ type: 'auth', token: mobileToken, name: 'should-be-ignored' })
+        JSON.stringify({ type: 'auth', token: mobileToken, name: 'My iPhone' })
       );
 
       expect(mobileWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
       const device = doInstance.getDevice('mobile-1');
-      expect(device?.name).toBeFalsy();
+      expect(device?.name).toBe('My iPhone');
     });
 
     it('ignores name longer than 64 characters in auth message', async () => {
@@ -305,6 +305,98 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(onlineMessages[0]!['name']).toBe('new-name');
     });
 
+  });
+
+  describe('mobile name update on auth', () => {
+    it('sends mobile_name_updated to paired host when name changes', async () => {
+      // Register mobile with old name, host, and create pairing
+      doInstance.registerDevice('mobile-1', 'pubkey-mobile-1', 'mobile', 'Old Phone');
+      const mobileToken = await createJWT('mobile-1', 'mobile', JWT_SECRET);
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      // Clear prior messages
+      hostWs.sent.length = 0;
+
+      // Mobile authenticates with a new name
+      const mobileWs = new MockWebSocket();
+      mockState.acceptedWebSockets.push(mobileWs as unknown as WebSocket);
+      doInstance.setConnection('mobile-1', mobileWs as unknown as WebSocket);
+      await doInstance.webSocketMessage(
+        mobileWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: mobileToken, name: 'New Phone' })
+      );
+
+      // Host should receive mobile_name_updated
+      const nameMessages = hostWs.messagesOfType('mobile_name_updated');
+      expect(nameMessages).toHaveLength(1);
+      expect(nameMessages[0]!['deviceId']).toBe('mobile-1');
+      expect(nameMessages[0]!['name']).toBe('New Phone');
+
+      // Verify DB was updated
+      const device = doInstance.getDevice('mobile-1');
+      expect(device?.name).toBe('New Phone');
+    });
+
+    it('does not send mobile_name_updated when name unchanged', async () => {
+      // Register mobile with a name, host, and create pairing
+      doInstance.registerDevice('mobile-1', 'pubkey-mobile-1', 'mobile', 'Same Phone');
+      const mobileToken = await createJWT('mobile-1', 'mobile', JWT_SECRET);
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      // Clear prior messages
+      hostWs.sent.length = 0;
+
+      // Mobile authenticates with same name
+      const mobileWs = new MockWebSocket();
+      mockState.acceptedWebSockets.push(mobileWs as unknown as WebSocket);
+      doInstance.setConnection('mobile-1', mobileWs as unknown as WebSocket);
+      await doInstance.webSocketMessage(
+        mobileWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: mobileToken, name: 'Same Phone' })
+      );
+
+      // Host should NOT receive mobile_name_updated
+      const nameMessages = hostWs.messagesOfType('mobile_name_updated');
+      expect(nameMessages).toHaveLength(0);
+    });
+
+    it('ignores empty or too-long mobile names', async () => {
+      doInstance.registerDevice('mobile-1', 'pubkey-mobile-1', 'mobile', 'Original Name');
+      const mobileToken = await createJWT('mobile-1', 'mobile', JWT_SECRET);
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      // Clear prior messages
+      hostWs.sent.length = 0;
+
+      // Auth with empty name
+      const mobileWs1 = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        mobileWs1 as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: mobileToken, name: '' })
+      );
+
+      // DB unchanged
+      let device = doInstance.getDevice('mobile-1');
+      expect(device?.name).toBe('Original Name');
+
+      // Auth with too-long name
+      const mobileWs2 = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        mobileWs2 as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: mobileToken, name: 'x'.repeat(65) })
+      );
+
+      // DB still unchanged
+      device = doInstance.getDevice('mobile-1');
+      expect(device?.name).toBe('Original Name');
+
+      // No notifications sent to host
+      const nameMessages = hostWs.messagesOfType('mobile_name_updated');
+      expect(nameMessages).toHaveLength(0);
+    });
   });
 
   describe('host_offline', () => {
