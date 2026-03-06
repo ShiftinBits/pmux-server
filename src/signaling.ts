@@ -27,6 +27,16 @@ const MAX_DEVICE_NAME_LENGTH = 64;
 /** Control characters that are not allowed in device names (prevents terminal escape injection). */
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 
+/** Thrown when a device re-registers with a different device_type than stored. */
+export class DeviceTypeConflictError extends Error {
+  constructor(deviceId: string, storedType: string, incomingType: string) {
+    super(
+      `Device ${deviceId} is registered as '${storedType}' but attempted to re-register as '${incomingType}'`
+    );
+    this.name = 'DeviceTypeConflictError';
+  }
+}
+
 /**
  * Validate and sanitize a device name from untrusted input.
  * Returns the name if valid, undefined otherwise.
@@ -152,8 +162,8 @@ export class SignalingDO implements DurableObject {
   // --- Device CRUD ---
 
   /**
-   * Register a device. INSERT OR REPLACE — re-registering updates the record.
-   * Returns the deviceId.
+   * Register a device. New devices are inserted; existing devices are updated
+   * only if the device_type matches. Throws DeviceTypeConflictError on mismatch.
    */
   registerDevice(
     deviceId: string,
@@ -164,14 +174,37 @@ export class SignalingDO implements DurableObject {
     this.ensureSchema();
     const now = Math.floor(Date.now() / 1000);
 
+    // Try to insert — does nothing if device already exists (primary key conflict)
     this.sql.exec(
-      'INSERT OR REPLACE INTO devices (id, ed25519_public_key, device_type, name, created_at) VALUES (?, ?, ?, ?, ?)',
+      'INSERT OR IGNORE INTO devices (id, ed25519_public_key, device_type, name, created_at) VALUES (?, ?, ?, ?, ?)',
       deviceId,
       ed25519PublicKey,
       deviceType,
       name ?? null,
       now
     );
+
+    // Check if the device was just inserted or already existed
+    const existing = this.getDevice(deviceId);
+    if (!existing) {
+      throw new Error(`Failed to register device ${deviceId}`);
+    }
+
+    // If the device existed before our insert, validate device_type matches
+    if (existing.deviceType !== deviceType) {
+      throw new DeviceTypeConflictError(deviceId, existing.deviceType, deviceType);
+    }
+
+    // Update allowed fields for existing devices (key rotation, name change)
+    if (existing.ed25519PublicKey !== ed25519PublicKey || existing.name !== (name ?? null)) {
+      this.sql.exec(
+        'UPDATE devices SET ed25519_public_key = ?, name = ?, created_at = ? WHERE id = ?',
+        ed25519PublicKey,
+        name ?? null,
+        now,
+        deviceId
+      );
+    }
 
     return { deviceId };
   }
@@ -1031,13 +1064,20 @@ export class SignalingDO implements DurableObject {
       this.removePairing(session.hostDeviceId);
     }
 
-    // Register the mobile device
-    this.registerDevice(
-      body.deviceId,
-      body.ed25519PublicKey,
-      'mobile',
-      mobileName
-    );
+    // Register the mobile device (rejects if device already registered as a different type)
+    try {
+      this.registerDevice(
+        body.deviceId,
+        body.ed25519PublicKey,
+        'mobile',
+        mobileName
+      );
+    } catch (err) {
+      if (err instanceof DeviceTypeConflictError) {
+        return jsonResponse({ error: 'Device type conflict: device is registered as a different type' }, 409);
+      }
+      throw err;
+    }
 
     // Create the pairing
     this.createPairing(session.hostDeviceId, body.deviceId);
