@@ -597,6 +597,11 @@ export class SignalingDO implements DurableObject {
 
     // Auth must be handled before any other message type
     if (data.type === 'auth') {
+      if (typeof data.token !== 'string') {
+        wsSend(ws, { type: 'error', error: 'Missing or invalid auth token' });
+        ws.close(4001, 'Missing or invalid auth token');
+        return;
+      }
       await this.handleWsAuth(ws, data.token, data.name);
       return;
     }

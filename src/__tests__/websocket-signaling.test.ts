@@ -78,6 +78,32 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(ws.closeCode).toBe(4001);
     });
 
+    it('rejects auth message with missing token [SB-361]', async () => {
+      const ws = new MockWebSocket();
+
+      await doInstance.webSocketMessage(
+        ws as unknown as WebSocket,
+        JSON.stringify({ type: 'auth' })
+      );
+
+      expect(ws.lastMessage()).toEqual({ type: 'error', error: 'Missing or invalid auth token' });
+      expect(ws.closed).toBe(true);
+      expect(ws.closeCode).toBe(4001);
+    });
+
+    it('rejects auth message with non-string token [SB-361]', async () => {
+      const ws = new MockWebSocket();
+
+      await doInstance.webSocketMessage(
+        ws as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: 12345 })
+      );
+
+      expect(ws.lastMessage()).toEqual({ type: 'error', error: 'Missing or invalid auth token' });
+      expect(ws.closed).toBe(true);
+      expect(ws.closeCode).toBe(4001);
+    });
+
     it('rejects non-auth messages before authentication', async () => {
       const ws = new MockWebSocket();
       ws.serializeAttachment({ authenticated: false });
