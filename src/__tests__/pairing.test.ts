@@ -458,6 +458,133 @@ describe('POST /pair/complete', () => {
     expect(unpairedMsgs[0]!['reason']).toBe('replaced_by_new_pairing');
   });
 
+  it('stores mobile name from /pair/complete', async () => {
+    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const initResult = await postJSON('/pair/initiate', body);
+    const pairingCode = initResult.data['pairingCode'] as string;
+
+    const { status } = await postJSON('/pair/complete', {
+      pairingCode,
+      deviceId: 'mobile-1',
+      ed25519PublicKey: 'ed25519-pub-key-mobile',
+      x25519PublicKey: 'x25519-pub-key-mobile',
+      name: "Ryan's iPhone",
+    });
+
+    expect(status).toBe(200);
+    const device = doInstance.getDevice('mobile-1');
+    expect(device).not.toBeNull();
+    expect(device!.name).toBe("Ryan's iPhone");
+  });
+
+  it('pair_complete WS message includes mobileName', async () => {
+    const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
+    const { doInstance: do2, mockState } = await createTestDOFull();
+
+    const keys = await generateEd25519Keypair();
+    const kp = keys.keyPair;
+    const pubBase64 = bytesToBase64(keys.publicKeyRaw);
+
+    async function post(path: string, body: unknown) {
+      const req = new Request(`http://localhost${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const res = await do2.fetch(req);
+      return { status: res.status, data: await res.json() as Record<string, unknown> };
+    }
+
+    // Initiate pairing
+    const initBody = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent');
+    const initResult = await post('/pair/initiate', initBody);
+    expect(initResult.status).toBe(200);
+    const pairingCode = initResult.data['pairingCode'] as string;
+
+    // Connect host WebSocket
+    const token = await createJWT('agent-1', 'host', JWT_SECRET);
+    const agentWs = new MockWebSocket();
+    mockState.acceptedWebSockets.push(agentWs as unknown as WebSocket);
+    await do2.webSocketMessage(agentWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token }));
+    agentWs.sent.length = 0;
+
+    // Complete pairing with mobile name
+    const completeResult = await post('/pair/complete', {
+      pairingCode,
+      deviceId: 'mobile-1',
+      ed25519PublicKey: 'ed25519-pub-key-mobile',
+      x25519PublicKey: 'x25519-pub-key-mobile',
+      name: "Ryan's iPhone",
+    });
+    expect(completeResult.status).toBe(200);
+
+    const pairMsgs = agentWs.messagesOfType('pair_complete');
+    expect(pairMsgs).toHaveLength(1);
+    expect(pairMsgs[0]['mobileName']).toBe("Ryan's iPhone");
+  });
+
+  it('omits mobileName when not provided', async () => {
+    const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
+    const { doInstance: do2, mockState } = await createTestDOFull();
+
+    const keys = await generateEd25519Keypair();
+    const kp = keys.keyPair;
+    const pubBase64 = bytesToBase64(keys.publicKeyRaw);
+
+    async function post(path: string, body: unknown) {
+      const req = new Request(`http://localhost${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const res = await do2.fetch(req);
+      return { status: res.status, data: await res.json() as Record<string, unknown> };
+    }
+
+    // Initiate pairing
+    const initBody = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent');
+    const initResult = await post('/pair/initiate', initBody);
+    const pairingCode = initResult.data['pairingCode'] as string;
+
+    // Connect host WebSocket
+    const token = await createJWT('agent-1', 'host', JWT_SECRET);
+    const agentWs = new MockWebSocket();
+    mockState.acceptedWebSockets.push(agentWs as unknown as WebSocket);
+    await do2.webSocketMessage(agentWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token }));
+    agentWs.sent.length = 0;
+
+    // Complete pairing WITHOUT name
+    await post('/pair/complete', {
+      pairingCode,
+      deviceId: 'mobile-1',
+      ed25519PublicKey: 'ed25519-pub-key-mobile',
+      x25519PublicKey: 'x25519-pub-key-mobile',
+    });
+
+    const pairMsgs = agentWs.messagesOfType('pair_complete');
+    expect(pairMsgs).toHaveLength(1);
+    expect(pairMsgs[0]['mobileName']).toBeUndefined();
+  });
+
+  it('ignores mobile name over 64 chars', async () => {
+    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const initResult = await postJSON('/pair/initiate', body);
+    const pairingCode = initResult.data['pairingCode'] as string;
+
+    const { status } = await postJSON('/pair/complete', {
+      pairingCode,
+      deviceId: 'mobile-1',
+      ed25519PublicKey: 'ed25519-pub-key-mobile',
+      x25519PublicKey: 'x25519-pub-key-mobile',
+      name: 'x'.repeat(65),
+    });
+
+    expect(status).toBe(200);
+    const device = doInstance.getDevice('mobile-1');
+    expect(device).not.toBeNull();
+    expect(device!.name).toBeNull();
+  });
+
   it('same mobile re-pairing does not send device_unpaired notification', async () => {
     const { doInstance: do2, mockState } = await createTestDOFull();
     const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';

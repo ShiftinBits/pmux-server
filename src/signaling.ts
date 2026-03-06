@@ -954,6 +954,7 @@ export class SignalingDO implements DurableObject {
       deviceId?: string;
       ed25519PublicKey?: string;
       x25519PublicKey?: string;
+      name?: string;
     };
     try {
       body = await request.json() as typeof body;
@@ -967,6 +968,10 @@ export class SignalingDO implements DurableObject {
         400
       );
     }
+
+    const mobileName = typeof body.name === 'string' && body.name.length > 0 && body.name.length <= 64
+      ? body.name
+      : undefined;
 
     // Consume the pairing session (single-use, validates expiry)
     const session = this.consumePairingSession(body.pairingCode);
@@ -1001,7 +1006,8 @@ export class SignalingDO implements DurableObject {
     this.registerDevice(
       body.deviceId,
       body.ed25519PublicKey,
-      'mobile'
+      'mobile',
+      mobileName
     );
 
     // Create the pairing
@@ -1015,6 +1021,7 @@ export class SignalingDO implements DurableObject {
       type: 'pair_complete',
       mobileDeviceId: body.deviceId,
       mobileX25519PublicKey: body.x25519PublicKey,
+      ...(mobileName !== undefined && { mobileName }),
     });
 
     return jsonResponse({
