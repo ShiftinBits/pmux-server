@@ -631,19 +631,28 @@ describe('worker client IP extraction', () => {
     expect(extractClientIp(request)).toBe('1.2.3.4');
   });
 
-  it('extractClientIp falls back to X-Forwarded-For', async () => {
+  it('extractClientIp ignores X-Forwarded-For', async () => {
     const { extractClientIp } = await import('../worker');
     const request = new Request('http://localhost/', {
       headers: {
         'X-Forwarded-For': '5.6.7.8, 9.10.11.12',
       },
     });
-    expect(extractClientIp(request)).toBe('5.6.7.8');
+    // Should NOT use X-Forwarded-For — must return a UUID instead
+    const result = extractClientIp(request);
+    expect(result).not.toBe('5.6.7.8');
+    expect(result).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
   });
 
-  it('extractClientIp defaults to 127.0.0.1', async () => {
+  it('extractClientIp returns unique UUID per call when no CF-Connecting-IP', async () => {
     const { extractClientIp } = await import('../worker');
-    const request = new Request('http://localhost/');
-    expect(extractClientIp(request)).toBe('127.0.0.1');
+    const request1 = new Request('http://localhost/');
+    const request2 = new Request('http://localhost/');
+    const ip1 = extractClientIp(request1);
+    const ip2 = extractClientIp(request2);
+    // Each call gets a unique UUID — no shared rate-limit bucket
+    expect(ip1).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(ip2).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(ip1).not.toBe(ip2);
   });
 });
