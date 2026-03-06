@@ -1074,6 +1074,7 @@ export class SignalingDO implements DurableObject {
       );
     } catch (err) {
       if (err instanceof DeviceTypeConflictError) {
+        // Intentionally generic — avoid leaking stored device state to the caller
         return jsonResponse({ error: 'Device type conflict: device is registered as a different type' }, 409);
       }
       throw err;
