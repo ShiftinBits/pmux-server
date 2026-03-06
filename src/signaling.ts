@@ -21,6 +21,26 @@ import {
 /** Maximum WebSocket message length in characters (16K — generous for SDP/ICE signaling). */
 const MAX_WS_MESSAGE_SIZE = 16_384;
 
+/** Maximum device name length in characters. */
+const MAX_DEVICE_NAME_LENGTH = 64;
+
+/** Control characters that are not allowed in device names (prevents terminal escape injection). */
+const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+
+/**
+ * Validate and sanitize a device name from untrusted input.
+ * Returns the name if valid, undefined otherwise.
+ */
+function validateDeviceName(name: unknown): string | undefined {
+  if (typeof name !== 'string' || name.length === 0 || name.length > MAX_DEVICE_NAME_LENGTH) {
+    return undefined;
+  }
+  if (CONTROL_CHAR_RE.test(name)) {
+    return undefined;
+  }
+  return name;
+}
+
 // --- Types ---
 
 export interface StoredDevice {
@@ -757,9 +777,7 @@ export class SignalingDO implements DurableObject {
       this.incrementWsCount(payload.deviceId);
 
       // Update device name if provided in auth message
-      const validName = typeof name === 'string' && name.length > 0 && name.length <= 64
-        ? name
-        : undefined;
+      const validName = validateDeviceName(name);
 
       if (validName && payload.deviceType === 'mobile') {
         const nameChanged = device.name !== validName;
@@ -910,8 +928,8 @@ export class SignalingDO implements DurableObject {
     }
 
     // Validate name if provided
-    if (body.name !== undefined && (typeof body.name !== 'string' || body.name.length > 64)) {
-      return jsonResponse({ error: 'Name must be a string of 64 characters or fewer' }, 400);
+    if (body.name !== undefined && validateDeviceName(body.name) === undefined) {
+      return jsonResponse({ error: 'Name must be a string of 1-64 characters with no control characters' }, 400);
     }
 
     // Validate timestamp is within 5-minute window
@@ -982,9 +1000,7 @@ export class SignalingDO implements DurableObject {
       );
     }
 
-    const mobileName = typeof body.name === 'string' && body.name.length > 0 && body.name.length <= 64
-      ? body.name
-      : undefined;
+    const mobileName = validateDeviceName(body.name);
 
     // Consume the pairing session (single-use, validates expiry)
     const session = this.consumePairingSession(body.pairingCode);

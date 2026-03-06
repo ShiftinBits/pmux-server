@@ -585,6 +585,25 @@ describe('POST /pair/complete', () => {
     expect(device!.name).toBeNull();
   });
 
+  it('ignores mobile name with control characters', async () => {
+    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const initResult = await postJSON('/pair/initiate', body);
+    const pairingCode = initResult.data['pairingCode'] as string;
+
+    const { status } = await postJSON('/pair/complete', {
+      pairingCode,
+      deviceId: 'mobile-1',
+      ed25519PublicKey: 'ed25519-pub-key-mobile',
+      x25519PublicKey: 'x25519-pub-key-mobile',
+      name: 'Evil\x1b[2JPhone',
+    });
+
+    expect(status).toBe(200);
+    const device = doInstance.getDevice('mobile-1');
+    expect(device).not.toBeNull();
+    expect(device!.name).toBeNull();
+  });
+
   it('same mobile re-pairing does not send device_unpaired notification', async () => {
     const { doInstance: do2, mockState } = await createTestDOFull();
     const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
