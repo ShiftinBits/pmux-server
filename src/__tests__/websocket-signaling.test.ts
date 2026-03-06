@@ -217,7 +217,97 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(onlineMessages[0]!['deviceId']).toBe('agent-1');
       expect(onlineMessages[0]!['name']).toBe('dev-server');
     });
+  });
 
+  describe('host name update on auth [SB-358]', () => {
+    it('updates host name from auth message when name is provided', async () => {
+      // Register host with old name
+      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host', 'old-name');
+      const agentToken = await createJWT('agent-1', 'host', JWT_SECRET);
+
+      // Authenticate with new name
+      const hostWs = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: agentToken, name: 'new-name' })
+      );
+
+      expect(hostWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+
+      // Verify DB was updated
+      const device = doInstance.getDevice('agent-1');
+      expect(device?.name).toBe('new-name');
+    });
+
+    it('ignores name field from mobile devices', async () => {
+      doInstance.registerDevice('mobile-1', 'pubkey-mobile-1', 'mobile');
+      const mobileToken = await createJWT('mobile-1', 'mobile', JWT_SECRET);
+
+      const mobileWs = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        mobileWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: mobileToken, name: 'should-be-ignored' })
+      );
+
+      expect(mobileWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+      const device = doInstance.getDevice('mobile-1');
+      expect(device?.name).toBeFalsy();
+    });
+
+    it('ignores name longer than 64 characters in auth message', async () => {
+      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host', 'good-name');
+      const agentToken = await createJWT('agent-1', 'host', JWT_SECRET);
+
+      const longName = 'x'.repeat(65);
+      const hostWs = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: agentToken, name: longName })
+      );
+
+      expect(hostWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+      const device = doInstance.getDevice('agent-1');
+      expect(device?.name).toBe('good-name');
+    });
+
+    it('ignores empty string name in auth message', async () => {
+      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host', 'existing-name');
+      const agentToken = await createJWT('agent-1', 'host', JWT_SECRET);
+
+      const hostWs = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: agentToken, name: '' })
+      );
+
+      expect(hostWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+      const device = doInstance.getDevice('agent-1');
+      expect(device?.name).toBe('existing-name');
+    });
+
+    it('uses updated name in host_online notification sent to mobile', async () => {
+      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host', 'old-name');
+      const agentToken = await createJWT('agent-1', 'host', JWT_SECRET);
+
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+      mobileWs.sent.length = 0;
+
+      const hostWs = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: agentToken, name: 'new-name' })
+      );
+
+      const onlineMessages = mobileWs.messagesOfType('host_online');
+      expect(onlineMessages).toHaveLength(1);
+      expect(onlineMessages[0]!['deviceId']).toBe('agent-1');
+      expect(onlineMessages[0]!['name']).toBe('new-name');
+    });
+
+  });
+
+  describe('host_offline', () => {
     it('emits host_offline to paired mobile when host disconnects', async () => {
       // Set up host and mobile with pairing
       const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
@@ -261,6 +351,7 @@ describe('WebSocket signaling [T1.8]', () => {
       const offlineMessages = hostWs.messagesOfType('host_offline');
       expect(offlineMessages).toHaveLength(0);
     });
+
   });
 
   describe('connect_request relay', () => {
