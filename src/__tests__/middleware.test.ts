@@ -33,7 +33,7 @@ describe('auth middleware', () => {
 
     expect(result.error).toBeUndefined();
     expect(result.payload?.deviceId).toBe('device-1');
-    expect(result.payload?.deviceId).toBe('device-1');
+    expect(result.payload?.deviceType).toBe('host');
   });
 
   it('rejects missing Authorization header', async () => {
