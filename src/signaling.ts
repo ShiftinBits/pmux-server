@@ -842,11 +842,8 @@ export class SignalingDO implements DurableObject {
         };
         if (validName) {
           hostOnlineMsg.name = validName;
-        } else {
-          const hostDevice = this.getDevice(payload.deviceId);
-          if (hostDevice?.name) {
-            hostOnlineMsg.name = hostDevice.name;
-          }
+        } else if (device.name) {
+          hostOnlineMsg.name = device.name;
         }
         const pairedMobileId = this.getPairedMobile(payload.deviceId);
         if (pairedMobileId) {
