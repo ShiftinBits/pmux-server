@@ -279,6 +279,17 @@ export class SignalingDO implements DurableObject {
   }
 
   /**
+   * Remove a host device and its pairing in one operation.
+   * Used when a host uninstalls pmux — cleans up both the pairing
+   * (including orphaned mobile) and the host device record itself.
+   */
+  removeDeviceAndPairing(hostDeviceId: string): { removedPairing: boolean; removedDevice: boolean } {
+    const removedMobileId = this.removePairing(hostDeviceId);
+    const removedDevice = this.removeDevice(hostDeviceId);
+    return { removedPairing: removedMobileId !== null, removedDevice };
+  }
+
+  /**
    * Get all host device IDs paired with a given mobile device.
    */
   getHostsForMobile(mobileDeviceId: string): string[] {
@@ -477,6 +488,7 @@ export class SignalingDO implements DurableObject {
     '/token': 'POST',
     '/turn/credentials': 'GET',
     '/pairing': 'DELETE',
+    '/device': 'DELETE',
   };
 
   async fetch(request: Request): Promise<Response> {
@@ -521,6 +533,11 @@ export class SignalingDO implements DurableObject {
           const rl = await checkRateLimit(this.rateLimitStorage, deviceId || clientIp, '/pairing');
           if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
           return this.handleDeletePairing(request);
+        }
+        case '/device': {
+          const rl = await checkRateLimit(this.rateLimitStorage, deviceId || clientIp, '/device');
+          if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+          return this.handleDeleteDevice(request);
         }
       }
     }
@@ -1195,6 +1212,35 @@ export class SignalingDO implements DurableObject {
     const removedMobileId = this.removePairing(hostDeviceId);
 
     return jsonResponse({ removed: removedMobileId !== null });
+  }
+
+  /**
+   * DELETE /device
+   * Removes the host device record, its pairing, and notifies the paired mobile.
+   * Called by `pmux uninstall` when a host completely removes PocketMux.
+   */
+  private handleDeleteDevice(request: Request): Response {
+    const hostDeviceId = request.headers.get('X-Device-Id') ?? '';
+    if (!hostDeviceId) {
+      return jsonResponse({ error: 'Missing device ID' }, 400);
+    }
+
+    // Get host device name before removal (for the notification)
+    const hostDevice = this.getDevice(hostDeviceId);
+    const hostName = hostDevice?.name ?? undefined;
+
+    // Notify the paired mobile before removing records
+    this.notifyPairedMobile(hostDeviceId, {
+      type: 'device_unpaired',
+      reason: 'host_uninstalled',
+      hostDeviceId,
+      hostName,
+    });
+
+    // Remove pairing + host device
+    const { removedDevice } = this.removeDeviceAndPairing(hostDeviceId);
+
+    return jsonResponse({ removed: removedDevice });
   }
 
   /**
