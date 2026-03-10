@@ -1,5 +1,6 @@
 import { SignalingDO } from './signaling';
 import { verifyJWT, type JWTPayload } from './auth';
+import { validateClientSignature } from './hmac';
 
 export { SignalingDO };
 
@@ -8,6 +9,7 @@ export interface Env {
   TURN_TOKEN_ID: string;
   TURN_API_TOKEN: string;
   JWT_SECRET: string;
+  PMUX_HMAC_SECRET?: string;  // Optional — enables client signature validation
 }
 
 // Routes that don't require JWT authentication
@@ -58,6 +60,24 @@ export default {
         requestId,
         startTime
       );
+    }
+
+    // Client signature validation (opt-in)
+    if (env.PMUX_HMAC_SECRET) {
+      const sigResult = await validateClientSignature(request, env.PMUX_HMAC_SECRET);
+      if (!sigResult.valid) {
+        return addCorrelationHeaders(
+          new Response(
+            JSON.stringify({ error: sigResult.error, requestId }),
+            {
+              status: 401,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          ),
+          requestId,
+          startTime
+        );
+      }
     }
 
     // Extract client IP for rate limiting (Cloudflare provides CF-Connecting-IP)

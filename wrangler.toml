@@ -30,3 +30,6 @@ new_sqlite_classes = ["SignalingDO"]
 # - TURN_API_TOKEN
 # - TURN_TOKEN_ID
 # - JWT_SECRET
+# - PMUX_HMAC_SECRET  (optional) — enables HMAC-SHA256 client signature validation;
+#                     when set, all requests (except /health and /) must include
+#                     valid `pmux-signature` and `pmux-timestamp` headers
