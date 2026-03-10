@@ -11,7 +11,7 @@
     "test:integration": "vitest run src/__tests__/integration/"
   },
   "dependencies": {
-    "@pocketmux/shared": "github:ShiftinBits/pmux-shared"
+    "@pocketmux/shared": "github:ShiftinBits/pmux-shared#main"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260302.0",
