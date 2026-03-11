@@ -41,7 +41,7 @@ function base64urlDecode(str: string): Uint8Array {
   return bytes;
 }
 
-function textEncode(str: string): Uint8Array {
+export function textEncode(str: string): Uint8Array {
   return new TextEncoder().encode(str);
 }
 

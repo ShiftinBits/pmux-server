@@ -11,11 +11,9 @@
  * Uses Web Crypto API (Cloudflare Workers compatible).
  */
 
-const CLOCK_SKEW_TOLERANCE_S = 60;
+import { textEncode } from './auth';
 
-function textEncode(str: string): Uint8Array {
-  return new TextEncoder().encode(str);
-}
+const CLOCK_SKEW_TOLERANCE_S = 60;
 
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
