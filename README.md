@@ -1,6 +1,8 @@
 # pmux-server
 
-Cloudflare Worker + Durable Object signaling server for [PocketMux](https://github.com/ShiftinBits/pocketmux).
+[![Test Results](https://img.shields.io/github/actions/workflow/status/shiftinbits/pmux-server/test.yml?branch=main&logo=vitest&logoColor=white&label=tests)](https://github.com/shiftinbits/pmux-server/actions/workflows/test.yml?query=branch%3Amain) [![Code Coverage](https://img.shields.io/codecov/c/github/shiftinbits/pmux-server?logo=codecov&logoColor=white)](https://app.codecov.io/gh/shiftinbits/pmux-server/) [![Snyk Security Monitored](https://img.shields.io/badge/security-monitored-8A2BE2?logo=snyk)](https://snyk.io/test/github/shiftinbits/pmux-server) [![License](https://img.shields.io/badge/license-MIT-3DA639?logo=opensourceinitiative&logoColor=white)](LICENSE)
+
+Cloudflare Worker + Durable Object signaling server for [pmux](https://pmux.io).
 
 ## Architecture
 
@@ -37,9 +39,6 @@ Set via `wrangler secret put <NAME>`:
 ```bash
 npm run deploy       # → deploys to Cloudflare
 ```
-
-Worker name: `pmux-signaling`
-Custom domain: `signal.pmux.io` (configured in Cloudflare dashboard)
 
 ## License
 

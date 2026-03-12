@@ -1,14 +1,14 @@
-name: CI
+name: Build
 
 on:
-  pull_request:
-    branches: [main]
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
 
 jobs:
-  build-and-test:
-    name: Build & Test
+  build:
+    name: Build
     runs-on: ubuntu-latest
 
     steps:
@@ -16,7 +16,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - run: npm ci
@@ -26,3 +26,8 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Clean & Build
+        run: |
+          rm -rf dist/
+          npm run build

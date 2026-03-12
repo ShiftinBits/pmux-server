@@ -3,6 +3,8 @@
 .claude/plans/
 .claude/worktrees/
 
+coverage/
+
 node_modules/
 dist/
 .wrangler/
