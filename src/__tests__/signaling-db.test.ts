@@ -282,6 +282,47 @@ describe('getHostsForMobile', () => {
   });
 });
 
+describe('removeDeviceAndPairing', () => {
+  it('removes both device and pairing when both exist', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host', 'host');
+    doInstance.registerDevice('mobile-1', 'pub-key-mobile', 'mobile');
+    doInstance.createPairing('host-1', 'mobile-1');
+
+    const result = doInstance.removeDeviceAndPairing('host-1');
+
+    expect(result).toEqual({ removedPairing: true, removedDevice: true });
+    expect(doInstance.getDevice('host-1')).toBeNull();
+    expect(doInstance.getPairedMobile('host-1')).toBeNull();
+  });
+
+  it('removes device only when no pairing exists', () => {
+    doInstance.registerDevice('host-1', 'pub-key-host', 'host');
+
+    const result = doInstance.removeDeviceAndPairing('host-1');
+
+    expect(result).toEqual({ removedPairing: false, removedDevice: true });
+    expect(doInstance.getDevice('host-1')).toBeNull();
+  });
+
+  it('returns both false for non-existent device', () => {
+    const result = doInstance.removeDeviceAndPairing('nonexistent');
+
+    expect(result).toEqual({ removedPairing: false, removedDevice: false });
+  });
+});
+
+describe('updateDeviceName', () => {
+  it('updates device name and reflects in getDevice', () => {
+    doInstance.registerDevice('agent-1', 'pub-key', 'host', 'Old Name');
+
+    doInstance.updateDeviceName('agent-1', 'New Name');
+
+    const device = doInstance.getDevice('agent-1');
+    expect(device).not.toBeNull();
+    expect(device!.name).toBe('New Name');
+  });
+});
+
 describe('pairing session management', () => {
   it('creates a pairing session with a 6-char code', () => {
     const code = doInstance.createPairingSession(

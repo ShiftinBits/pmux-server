@@ -221,6 +221,84 @@ describe('Signaling server efficiency [T3.10]', () => {
       expect(doInstance.getPairedMobile('test-host')).toBe('test-mobile');
     });
   });
+
+  describe('alarm cleanup details', () => {
+    it('removes idle authenticated WS from connection cache and decrements count', async () => {
+      const { ws } = await connectAndAuth('agent-1', 'host');
+
+      // Verify connection is tracked
+      expect(doInstance.getConnection('agent-1')).toBeDefined();
+      expect(doInstance.getWsConnectionCount('agent-1')).toBe(1);
+
+      // Simulate idle for 6 minutes
+      const att = ws.deserializeAttachment() as Record<string, unknown>;
+      att.lastMessageTime = Date.now() - 6 * 60 * 1000;
+      ws.serializeAttachment(att);
+
+      await doInstance.alarm();
+
+      expect(ws.closed).toBe(true);
+      expect(ws.closeCode).toBe(1000);
+      expect(ws.closeReason).toBe('idle timeout');
+      // WS connection count should be decremented
+      expect(doInstance.getWsConnectionCount('agent-1')).toBe(0);
+
+      // Remove the closed WS from accepted list (simulates runtime cleanup)
+      const idx = mockDOState.acceptedWebSockets.indexOf(ws as unknown as WebSocket);
+      if (idx >= 0) mockDOState.acceptedWebSockets.splice(idx, 1);
+
+      // After runtime cleanup, connection should not be findable
+      expect(doInstance.getConnection('agent-1')).toBeUndefined();
+    });
+
+    it('handles WebSocket with no attachment gracefully during alarm', async () => {
+      // Add a WS with null/no attachment to the accepted list
+      const ws = new MockWebSocket();
+      mockDOState.acceptedWebSockets.push(ws as unknown as WebSocket);
+
+      // Should not throw
+      await doInstance.alarm();
+
+      // WS without attachment should not be closed (no lastMessageTime to compare)
+      expect(ws.closed).toBe(false);
+    });
+  });
+});
+
+describe('Worker root redirect', () => {
+  it('returns 308 redirect to https://pmux.io for GET /', async () => {
+    const worker = (await import('../worker')).default;
+
+    const mockEnv = {
+      SIGNALING: {} as DurableObjectNamespace,
+      TURN_TOKEN_ID: '',
+      TURN_API_TOKEN: '',
+      JWT_SECRET: JWT_SECRET,
+    };
+
+    const request = new Request('http://localhost/');
+    const response = await worker.fetch(request, mockEnv);
+
+    expect(response.status).toBe(308);
+    expect(response.headers.get('Location')).toBe('https://pmux.io');
+  });
+
+  it('root redirect includes correlation headers', async () => {
+    const worker = (await import('../worker')).default;
+
+    const mockEnv = {
+      SIGNALING: {} as DurableObjectNamespace,
+      TURN_TOKEN_ID: '',
+      TURN_API_TOKEN: '',
+      JWT_SECRET: JWT_SECRET,
+    };
+
+    const request = new Request('http://localhost/');
+    const response = await worker.fetch(request, mockEnv);
+
+    expect(response.headers.get('X-Request-Id')).toBeTruthy();
+    expect(response.headers.get('X-Response-Time')).toBeTruthy();
+  });
 });
 
 describe('Health endpoint [T3.10]', () => {

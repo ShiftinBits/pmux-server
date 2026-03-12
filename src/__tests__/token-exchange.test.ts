@@ -97,6 +97,19 @@ describe('POST /token', () => {
     expect(data['error']).toContain('Unknown device');
   });
 
+  it('rejects invalid JSON body', async () => {
+    const request = new Request('http://localhost/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: 'not valid json{{{',
+    });
+    const response = await doInstance.fetch(request);
+    const data = await response.json() as Record<string, unknown>;
+
+    expect(response.status).toBe(400);
+    expect(data['error']).toContain('Invalid JSON');
+  });
+
   it('rejects missing fields', async () => {
     const { status, data } = await postJSON('/token', {
       deviceId: 'agent-1',

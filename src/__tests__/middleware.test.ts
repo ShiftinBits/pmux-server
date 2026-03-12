@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createJWT } from '../auth';
-import { authenticateRequest, PUBLIC_PATHS } from '../worker';
+import { authenticateRequest, PUBLIC_PATHS, extractClientIp } from '../worker';
 import type { Env } from '../worker';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
@@ -73,6 +73,26 @@ describe('auth middleware', () => {
     const token = await createJWT('device-1', 'host', 'different-secret-entirely');
     const result = await authenticateRequest(makeRequest(`Bearer ${token}`), mockEnv);
     expect(result.error).toContain('signature verification failed');
+  });
+
+  describe('extractClientIp', () => {
+    it('returns CF-Connecting-IP when present', () => {
+      const request = new Request('http://localhost/test', {
+        headers: { 'CF-Connecting-IP': '203.0.113.50' },
+      });
+
+      expect(extractClientIp(request)).toBe('203.0.113.50');
+    });
+
+    it('returns a UUID-format string when CF-Connecting-IP is absent', () => {
+      const request = new Request('http://localhost/test');
+
+      const ip = extractClientIp(request);
+      // Should be a valid UUID (fallback is crypto.randomUUID())
+      expect(ip).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+      );
+    });
   });
 
   describe('public routes bypass middleware', () => {

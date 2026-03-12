@@ -311,6 +311,67 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(device?.name).toBe('existing-name');
     });
 
+    it('accepts name exactly 64 characters in auth message', async () => {
+      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host', 'old-name');
+      const agentToken = await createJWT('agent-1', 'host', JWT_SECRET);
+
+      const exactName = 'a'.repeat(64);
+      const hostWs = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: agentToken, name: exactName })
+      );
+
+      expect(hostWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+      const device = doInstance.getDevice('agent-1');
+      expect(device?.name).toBe(exactName);
+    });
+
+    it('ignores name with NUL control character in auth message', async () => {
+      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host', 'good-name');
+      const agentToken = await createJWT('agent-1', 'host', JWT_SECRET);
+
+      const hostWs = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: agentToken, name: 'bad\x00name' })
+      );
+
+      expect(hostWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+      const device = doInstance.getDevice('agent-1');
+      expect(device?.name).toBe('good-name');
+    });
+
+    it('ignores name with DEL control character in auth message', async () => {
+      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host', 'good-name');
+      const agentToken = await createJWT('agent-1', 'host', JWT_SECRET);
+
+      const hostWs = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: agentToken, name: 'bad\x7fname' })
+      );
+
+      expect(hostWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+      const device = doInstance.getDevice('agent-1');
+      expect(device?.name).toBe('good-name');
+    });
+
+    it('ignores non-string name (number) in auth message', async () => {
+      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host', 'good-name');
+      const agentToken = await createJWT('agent-1', 'host', JWT_SECRET);
+
+      const hostWs = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: agentToken, name: 42 })
+      );
+
+      expect(hostWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+      const device = doInstance.getDevice('agent-1');
+      expect(device?.name).toBe('good-name');
+    });
+
     it('uses updated name in host_online notification sent to mobile', async () => {
       doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host', 'old-name');
       const agentToken = await createJWT('agent-1', 'host', JWT_SECRET);
@@ -907,6 +968,107 @@ describe('WebSocket signaling [T1.8]', () => {
       // Mobile should NOT receive the offer
       const offers = mobileWs.messagesOfType('sdp_offer');
       expect(offers).toHaveLength(0);
+    });
+  });
+
+  describe('WebSocket connection limits', () => {
+    it('rejects connection when device exceeds MAX_WS_CONNECTIONS_PER_DEVICE', async () => {
+      const token = await setupDevice('agent-1', 'host');
+
+      // Authenticate 5 WebSockets (the maximum)
+      for (let i = 0; i < 5; i++) {
+        const ws = new MockWebSocket();
+        mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
+        await doInstance.webSocketMessage(
+          ws as unknown as WebSocket,
+          JSON.stringify({ type: 'auth', token })
+        );
+        expect(ws.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+      }
+
+      // 6th connection should be rejected
+      const ws6 = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        ws6 as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token })
+      );
+
+      expect(ws6.lastMessage()).toEqual({ type: 'error', error: 'Too many WebSocket connections' });
+      expect(ws6.closed).toBe(true);
+      expect(ws6.closeCode).toBe(1008);
+    });
+
+    it('returns "Device not found" for deleted device with valid JWT', async () => {
+      // Register device, create JWT, then delete the device
+      const token = await setupDevice('agent-1', 'host');
+      doInstance.removeDevice('agent-1');
+
+      const ws = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        ws as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token })
+      );
+
+      expect(ws.lastMessage()).toEqual({ type: 'error', error: 'Device not found' });
+      expect(ws.closed).toBe(true);
+      expect(ws.closeCode).toBe(4004);
+    });
+  });
+
+  describe('message edge cases', () => {
+    it('silently ignores binary/ArrayBuffer messages', async () => {
+      const { ws } = await connectAndAuth('agent-1', 'host');
+      const beforeCount = ws.sent.length;
+
+      // Send an ArrayBuffer (binary message)
+      await doInstance.webSocketMessage(
+        ws as unknown as WebSocket,
+        new ArrayBuffer(16)
+      );
+
+      // No response should be sent
+      expect(ws.sent.length).toBe(beforeCount);
+      expect(ws.closed).toBe(false);
+    });
+
+    it('returns "Missing message type" for JSON without type field', async () => {
+      const { ws } = await connectAndAuth('agent-1', 'host');
+      ws.sent.length = 0;
+
+      await doInstance.webSocketMessage(
+        ws as unknown as WebSocket,
+        JSON.stringify({ data: 'no type field' })
+      );
+
+      const errors = ws.messagesOfType('error');
+      expect(errors).toHaveLength(1);
+      expect(errors[0]!['error']).toBe('Missing message type');
+    });
+
+    it('returns 426 for non-WebSocket /ws request', async () => {
+      // Send a regular HTTP request to /ws without Upgrade header
+      const request = new Request('http://localhost/ws', {
+        method: 'GET',
+        headers: { 'X-Client-IP': '127.0.0.1' },
+      });
+      const response = await doInstance.fetch(request);
+
+      expect(response.status).toBe(426);
+    });
+
+    it('webSocketClose is a no-op for non-authenticated connection', async () => {
+      const ws = new MockWebSocket();
+      ws.serializeAttachment({ authenticated: false });
+
+      // Should not throw or send any messages
+      await doInstance.webSocketClose(
+        ws as unknown as WebSocket,
+        1000,
+        'normal',
+        true
+      );
+
+      expect(ws.sent.length).toBe(0);
     });
   });
 

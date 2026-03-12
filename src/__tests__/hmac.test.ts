@@ -222,6 +222,23 @@ describe('worker HMAC integration', () => {
     }
   });
 
+  it('HMAC 401 response includes correlation headers and requestId in body', async () => {
+    const env = makeEnv(true);
+    const req = new Request('http://localhost/auth/token', { method: 'POST' });
+
+    const response = await worker.fetch(req, env);
+    expect(response.status).toBe(401);
+
+    // Should have correlation headers
+    expect(response.headers.get('X-Request-Id')).toBeTruthy();
+    expect(response.headers.get('X-Response-Time')).toBeTruthy();
+
+    // Body should include requestId
+    const body = await response.json() as { error: string; requestId?: string };
+    expect(body.requestId).toBeTruthy();
+    expect(body.requestId).toBe(response.headers.get('X-Request-Id'));
+  });
+
   it('/health returns 200 regardless of HMAC config', async () => {
     const envWithHmac = makeEnv(true);
     const envWithoutHmac = makeEnv(false);

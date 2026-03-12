@@ -50,6 +50,19 @@ describe('POST /pair/initiate', () => {
     expect(device!.ed25519PublicKey).toBe(ed25519PublicKeyBase64);
   });
 
+  it('rejects invalid JSON body on initiate', async () => {
+    const request = new Request('http://localhost/pair/initiate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: 'not valid json{{{',
+    });
+    const response = await doInstance.fetch(request);
+    const data = await response.json() as Record<string, unknown>;
+
+    expect(response.status).toBe(400);
+    expect(data['error']).toContain('Invalid JSON');
+  });
+
   it('rejects missing fields', async () => {
     const { status, data } = await postJSON('/pair/initiate', {
       deviceId: 'agent-1',
@@ -96,6 +109,24 @@ describe('POST /pair/initiate', () => {
 
     expect(status).toBe(400);
     expect(data['error']).toContain('64 characters');
+  });
+
+  it('accepts name exactly 64 characters on initiate', async () => {
+    const exactName = 'a'.repeat(64);
+    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', exactName);
+    const { status } = await postJSON('/pair/initiate', body);
+
+    expect(status).toBe(200);
+    const device = doInstance.getDevice('agent-1');
+    expect(device!.name).toBe(exactName);
+  });
+
+  it('rejects name with ESC control character on initiate', async () => {
+    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', 'Evil\x1b[2JName');
+    const { status, data } = await postJSON('/pair/initiate', body);
+
+    expect(status).toBe(400);
+    expect(data['error']).toContain('control characters');
   });
 
   it('rejects initiation with wrong key for existing device', async () => {
