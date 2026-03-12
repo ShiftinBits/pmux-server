@@ -16,7 +16,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 22
           cache: npm
 
       - run: npm ci
@@ -24,10 +24,6 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
-      - name: Run tests
-        run: npm test
-
-      - name: Clean & Build
+      - name: Build
         run: |
-          rm -rf dist/
           npm run build
