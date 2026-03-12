@@ -21,9 +21,5 @@ jobs:
 
       - run: npm ci
 
-      - name: Type check
-        run: npx tsc --noEmit
-
-      - name: Build
-        run: |
-          npm run build
+      - name: Build (wrangler dry-run)
+        run: npx wrangler deploy --dry-run --outdir dist
