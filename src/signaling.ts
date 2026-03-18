@@ -1217,7 +1217,7 @@ export class SignalingDO implements DurableObject {
   /**
    * DELETE /device
    * Removes the host device record, its pairing, and notifies the paired mobile.
-   * Called by `pmux uninstall` when a host completely removes PocketMux.
+   * Called by `pmux uninstall` when a host completely removes Pocketmux.
    */
   private handleDeleteDevice(request: Request): Response {
     const hostDeviceId = request.headers.get('X-Device-Id') ?? '';

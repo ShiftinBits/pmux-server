@@ -43,7 +43,7 @@ We ask that you give us **90 days** to address a reported vulnerability before a
 - Security vulnerabilities in pmux code
 
 **Out of scope:**
-- The PocketMux mobile app (private, not covered by this policy)
+- The Pocketmux mobile app (private, not covered by this policy)
 - Vulnerabilities in third-party dependencies (please report these upstream)
 - The hosted signaling service infrastructure (Cloudflare)
 

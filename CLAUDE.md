@@ -1,6 +1,6 @@
 # CLAUDE.md — pmux-server
 
-Cloudflare Worker + Durable Object signaling server for PocketMux. Zero-knowledge relay — never sees terminal content.
+Cloudflare Worker + Durable Object signaling server for Pocketmux. Zero-knowledge relay — never sees terminal content.
 
 ## Quick Reference
 
