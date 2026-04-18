@@ -632,7 +632,7 @@ export class SignalingDO implements DurableObject {
 
     switch (data.type) {
       case 'presence':
-        // Host heartbeat — acknowledged. DO stays awake due to message receipt.
+        wsSend(ws, { type: 'presence_ack' });
         break;
 
       case 'connect_request':
@@ -882,6 +882,13 @@ export class SignalingDO implements DurableObject {
             wsSend(ws, msg);
           }
         }
+        // Re-assert this WS as the cached connection. The findWebSocket() calls
+        // above may trigger rebuildConnectionCache() after DO hibernation, which
+        // can overwrite this device's cache entry with a stale closing WebSocket
+        // (e.g., a presence WS from HostListScreen that is still in
+        // getWebSockets() but mid-close). Re-setting here guarantees the freshly
+        // authenticated WS is always the routable entry.
+        this.connections.set(payload.deviceId, ws);
       }
 
       wsSend(ws, { type: 'auth', status: 'ok' });
@@ -914,10 +921,16 @@ export class SignalingDO implements DurableObject {
     }
 
     // Relay to target with sender's deviceId as the origin
-    wsSend(targetWs, {
-      type: 'connect_request',
-      targetDeviceId: sender.deviceId,
-    });
+    try {
+      wsSend(targetWs, {
+        type: 'connect_request',
+        targetDeviceId: sender.deviceId,
+      });
+    } catch {
+      if (this.connections.get(targetDeviceId) === targetWs) {
+        this.connections.delete(targetDeviceId);
+      }
+    }
   }
 
   /**
@@ -938,15 +951,21 @@ export class SignalingDO implements DurableObject {
     if (!this.isPaired(hostId, mobileId)) return;
 
     // Relay only known fields — never spread untrusted data
-    wsSend(targetWs, {
-      type: data.type,
-      targetDeviceId: sender.deviceId,
-      ...(data.sdp !== undefined && { sdp: data.sdp }),
-      ...(data.candidate !== undefined && { candidate: data.candidate }),
-      ...(data.sdpMid !== undefined && { sdpMid: data.sdpMid }),
-      ...(data.sdpMLineIndex !== undefined && { sdpMLineIndex: data.sdpMLineIndex }),
-      ...('reason' in data && data.reason !== undefined && { reason: data.reason }),
-    });
+    try {
+      wsSend(targetWs, {
+        type: data.type,
+        targetDeviceId: sender.deviceId,
+        ...(data.sdp !== undefined && { sdp: data.sdp }),
+        ...(data.candidate !== undefined && { candidate: data.candidate }),
+        ...(data.sdpMid !== undefined && { sdpMid: data.sdpMid }),
+        ...(data.sdpMLineIndex !== undefined && { sdpMLineIndex: data.sdpMLineIndex }),
+        ...('reason' in data && data.reason !== undefined && { reason: data.reason }),
+      });
+    } catch {
+      if (this.connections.get(data.targetDeviceId) === targetWs) {
+        this.connections.delete(data.targetDeviceId);
+      }
+    }
   }
 
   // --- Pairing endpoints [T1.5] ---

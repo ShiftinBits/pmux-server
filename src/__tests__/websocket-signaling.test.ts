@@ -129,17 +129,18 @@ describe('WebSocket signaling [T1.8]', () => {
   });
 
   describe('presence', () => {
-    it('accepts presence heartbeat from authenticated agent', async () => {
+    it('responds with presence_ack to authenticated agent', async () => {
       const { ws } = await connectAndAuth('agent-1', 'host');
-      const beforeCount = ws.sent.length;
+      ws.sent.length = 0;
 
       await doInstance.webSocketMessage(
         ws as unknown as WebSocket,
         JSON.stringify({ type: 'presence' })
       );
 
-      // Presence is silently acknowledged — no response sent
-      expect(ws.sent.length).toBe(beforeCount);
+      const acks = ws.messagesOfType('presence_ack');
+      expect(acks).toHaveLength(1);
+      expect(acks[0]).toEqual({ type: 'presence_ack' });
     });
   });
 
@@ -1134,6 +1135,89 @@ describe('WebSocket signaling [T1.8]', () => {
       const errors = ws.messagesOfType('error');
       expect(errors).toHaveLength(1);
       expect(errors[0]!['error']).toContain('Unknown message type');
+    });
+  });
+
+  describe('reconnection robustness', () => {
+    it('mobile auth cache entry survives rebuildConnectionCache', async () => {
+      // Setup: host connected, paired with mobile
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      doInstance.registerDevice('mobile-1', 'pubkey-mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      // Simulate a stale presence WS for the same mobile device still in
+      // getWebSockets() (e.g., closing but not yet removed after blur)
+      const stalePresenceWs = new MockWebSocket();
+      stalePresenceWs.serializeAttachment({
+        deviceId: 'mobile-1',
+        deviceType: 'mobile',
+        authenticated: true,
+        lastMessageTime: Date.now() - 60_000,
+      });
+      mockState.acceptedWebSockets.push(stalePresenceWs as unknown as WebSocket);
+
+      // Mobile authenticates a new signaling WS — this triggers
+      // rebuildConnectionCache() via findWebSocket(hostId) for presence snapshot
+      const mobileToken = await createJWT('mobile-1', 'mobile', JWT_SECRET);
+      const newSignalingWs = new MockWebSocket();
+      mockState.acceptedWebSockets.push(newSignalingWs as unknown as WebSocket);
+      await doInstance.webSocketMessage(
+        newSignalingWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: mobileToken })
+      );
+
+      // The fresh signaling WS must be the cached connection, not the stale one
+      expect(doInstance.getConnection('mobile-1')).toBe(newSignalingWs);
+
+      // Verify SDP offer relay reaches the new WS, not the stale one
+      hostWs.sent.length = 0;
+      newSignalingWs.sent.length = 0;
+
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({
+          type: 'sdp_offer',
+          sdp: 'v=0\r\nreconnect-offer',
+          targetDeviceId: 'mobile-1',
+        })
+      );
+
+      expect(newSignalingWs.messagesOfType('sdp_offer')).toHaveLength(1);
+      expect(stalePresenceWs.messagesOfType('sdp_offer')).toHaveLength(0);
+    });
+
+    it('relay handles stale target WebSocket gracefully', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      // Replace mobile's cache entry with a WS that throws on send
+      const brokenWs = new MockWebSocket();
+      brokenWs.serializeAttachment({
+        deviceId: 'mobile-1',
+        deviceType: 'mobile',
+        authenticated: true,
+      });
+      brokenWs.send = () => { throw new Error('WebSocket closed'); };
+      doInstance.setConnection('mobile-1', brokenWs as unknown as WebSocket);
+
+      // Agent sends SDP offer — relay should not throw
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({
+          type: 'sdp_offer',
+          sdp: 'v=0\r\noffer',
+          targetDeviceId: 'mobile-1',
+        })
+      );
+
+      // Stale entry should be evicted — getConnection rebuilds cache from
+      // acceptedWebSockets, which still has the original mobileWs
+      expect(doInstance.getConnection('mobile-1')).not.toBe(brokenWs);
+
+      // Mobile's actual WS should not have received the failed relay
+      const mobileOffers = mobileWs.messagesOfType('sdp_offer');
+      expect(mobileOffers).toHaveLength(0);
     });
   });
 });
