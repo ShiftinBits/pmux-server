@@ -1,26 +1,25 @@
 /**
  * HMAC-SHA256 client signature validation.
  *
- * Two formula versions are supported, selected by whether the request path
- * starts with /v1/:
+ * Two routing tiers are supported, selected by whether the request path
+ * starts with /v1/. Both tiers use the same signature formula:
  *
- * Legacy (unversioned paths):
- *   Signature: HMAC-SHA256(secret, "{timestamp}:{pathname}") as hex
- *   Headers required: pmux-signature, pmux-timestamp
- *
- * V1 (/v1/ paths):
  *   Signature: HMAC-SHA256(secret, "{timestamp}:{nonce}:{pathname}") as hex
  *   Headers required: pmux-signature, pmux-timestamp, pmux-nonce
  *   Nonce: 32 lowercase hex characters (16 random bytes) — prevents replay
- *   Pathname: the full path including the /v1/ prefix
+ *   V1 pathname: includes the /v1/ prefix
  *
- * Clock skew tolerance: ±60 seconds for both versions.
+ * Clock skew tolerance: ±60 seconds.
  *
- * NOTE: Full replay prevention for v1 (server-side nonce uniqueness enforcement)
- * requires an HMAC_NONCES KV namespace binding to track seen nonces within the
- * tolerance window. Nonce format is validated but uniqueness is not yet enforced.
- * Track as a follow-up: add HMAC_NONCES KV binding to wrangler.toml and implement
- * checkAndRecordNonce() in this file.
+ * The nonce makes each request's signature unique even within the same
+ * second, eliminating the replay window that existed when only a timestamp
+ * was signed.
+ *
+ * NOTE: Full replay prevention (server-side nonce uniqueness enforcement)
+ * requires an HMAC_NONCES KV namespace binding to track seen nonces within
+ * the tolerance window. Nonce format is validated but uniqueness is not yet
+ * enforced. Track as a follow-up: add HMAC_NONCES KV binding to wrangler.toml
+ * and implement checkAndRecordNonce() in this file.
  *
  * Uses Web Crypto API (Cloudflare Workers compatible).
  */
@@ -29,7 +28,7 @@ import { textEncode } from './auth';
 
 const CLOCK_SKEW_TOLERANCE_S = 60;
 
-/** Expected nonce length for v1: 32 hex chars (16 random bytes). */
+/** Expected nonce length: 32 hex chars (16 random bytes). */
 const NONCE_HEX_LENGTH = 32;
 const NONCE_HEX_PATTERN = /^[0-9a-f]{32}$/;
 
@@ -50,16 +49,18 @@ async function importHmacKey(secret: string): Promise<CryptoKey> {
 }
 
 /**
- * Legacy: compute HMAC-SHA256(secret, "{timestamp}:{pathname}") as hex.
- * Used for unversioned API paths.
+ * Compute HMAC-SHA256(secret, "{timestamp}:{nonce}:{pathname}") as hex string.
+ *
+ * NOTE: this formula must match the agent (Go) and mobile implementations.
  */
 export async function computeSignature(
   secret: string,
   timestamp: string,
+  nonce: string,
   pathname: string
 ): Promise<string> {
   const key = await importHmacKey(secret);
-  const message = `${timestamp}:${pathname}`;
+  const message = `${timestamp}:${nonce}:${pathname}`;
   const sig = await crypto.subtle.sign('HMAC', key, textEncode(message));
   return bytesToHex(new Uint8Array(sig));
 }
@@ -98,8 +99,8 @@ async function verifySignatureHex(
 }
 
 /**
- * Validate a legacy (unversioned) client HMAC signature.
- * Formula: HMAC-SHA256(secret, "{timestamp}:{pathname}")
+ * Validate a client HMAC signature.
+ * Formula: HMAC-SHA256(secret, "{timestamp}:{nonce}:{pathname}")
  */
 export async function validateClientSignature(
   request: Request,
@@ -107,8 +108,9 @@ export async function validateClientSignature(
 ): Promise<ValidationResult> {
   const signature = request.headers.get('pmux-signature');
   const timestampHeader = request.headers.get('pmux-timestamp');
+  const nonce = request.headers.get('pmux-nonce');
 
-  if (!signature || !timestampHeader) {
+  if (!signature || !timestampHeader || !nonce) {
     return { valid: false, error: 'missing client signature' };
   }
 
@@ -122,13 +124,17 @@ export async function validateClientSignature(
     return { valid: false, error: 'request expired' };
   }
 
+  if (nonce.length !== NONCE_HEX_LENGTH || !NONCE_HEX_PATTERN.test(nonce)) {
+    return { valid: false, error: 'invalid nonce' };
+  }
+
   if (signature.length !== 64 || !/^[0-9a-f]+$/i.test(signature)) {
     return { valid: false, error: 'invalid client signature' };
   }
 
   const pathname = new URL(request.url).pathname;
   const key = await importHmacKey(secret);
-  const valid = await verifySignatureHex(key, signature, `${timestampHeader}:${pathname}`);
+  const valid = await verifySignatureHex(key, signature, `${timestampHeader}:${nonce}:${pathname}`);
 
   return valid ? { valid: true } : { valid: false, error: 'invalid client signature' };
 }
