@@ -1,0 +1,19 @@
+{
+  "projectId": "proj:6ee4666ad090486386923a8f266fc118",
+  "branch": "main",
+  "languages": {
+    "typescript": {
+      "fileExtensions": [
+        ".ts",
+        ".tsx"
+      ],
+      "lsp": {
+        "command": "typescript-language-server",
+        "args": [
+          "--stdio"
+        ]
+      }
+    }
+  },
+  "lspEnrichment": true
+}
