@@ -1,6 +1,6 @@
 import { SignalingDO } from './signaling';
 import { verifyJWT, type JWTPayload } from './auth';
-import { validateClientSignature } from './hmac';
+import { validateClientSignature, validateClientSignatureV1 } from './hmac';
 
 export { SignalingDO };
 
@@ -31,8 +31,18 @@ export default {
 
     const url = new URL(request.url);
 
+    // Detect and strip /v1 API version prefix.
+    // /v1/foo → normalizedPathname = /foo, apiVersion = 'v1'
+    // /foo    → normalizedPathname = /foo, apiVersion = ''
+    let apiVersion = '';
+    let normalizedPathname = url.pathname;
+    if (url.pathname === '/v1' || url.pathname.startsWith('/v1/')) {
+      apiVersion = 'v1';
+      normalizedPathname = url.pathname === '/v1' ? '/' : url.pathname.slice(3);
+    }
+
     // Health endpoint — fast path, still gets correlation headers
-    if (url.pathname === '/health') {
+    if (normalizedPathname === '/health') {
       return addCorrelationHeaders(
         new Response(
           JSON.stringify({
@@ -51,7 +61,7 @@ export default {
     }
 
     // Root redirect — send to homepage
-    if (url.pathname === '/') {
+    if (normalizedPathname === '/') {
       return addCorrelationHeaders(
         new Response(null, {
           status: 308,
@@ -62,9 +72,14 @@ export default {
       );
     }
 
-    // Client signature validation (opt-in)
+    // Client signature validation (opt-in).
+    // /v1/ paths use the v1 formula (timestamp:nonce:pathname); legacy paths use
+    // the original formula (timestamp:pathname). The signature always covers the
+    // full original pathname including the /v1/ prefix.
     if (env.PMUX_HMAC_SECRET) {
-      const sigResult = await validateClientSignature(request, env.PMUX_HMAC_SECRET);
+      const sigResult = apiVersion === 'v1'
+        ? await validateClientSignatureV1(request, env.PMUX_HMAC_SECRET)
+        : await validateClientSignature(request, env.PMUX_HMAC_SECRET);
       if (!sigResult.valid) {
         return addCorrelationHeaders(
           new Response(
@@ -84,7 +99,7 @@ export default {
     const clientIp = extractClientIp(request);
 
     // Auth middleware: verify JWT for non-public routes
-    if (!PUBLIC_PATHS.has(url.pathname)) {
+    if (!PUBLIC_PATHS.has(normalizedPathname)) {
       const authResult = await authenticateRequest(request, env);
       if (authResult.error) {
         return addCorrelationHeaders(
@@ -119,8 +134,8 @@ export default {
     }
 
     // Routes that dispatch to the Durable Object (including TURN credentials)
-    if (url.pathname.startsWith('/auth/') || url.pathname === '/ws' || url.pathname === '/turn/credentials') {
-      const response = await routeToDO(request, url, env);
+    if (normalizedPathname.startsWith('/auth/') || normalizedPathname === '/ws' || normalizedPathname === '/turn/credentials') {
+      const response = await routeToDO(request, normalizedPathname, url, env);
       return addCorrelationHeaders(response, requestId, startTime);
     }
 
@@ -191,18 +206,20 @@ function addCorrelationHeaders(
 /**
  * Route requests to the SignalingDO.
  * Uses a single DO instance (named "global") for all signaling.
+ * normalizedPathname is the path with any /v1 prefix already stripped.
  */
-async function routeToDO(request: Request, url: URL, env: Env): Promise<Response> {
+async function routeToDO(request: Request, normalizedPathname: string, url: URL, env: Env): Promise<Response> {
   const id = env.SIGNALING.idFromName('global');
   const stub = env.SIGNALING.get(id);
 
-  // Strip /auth prefix for the DO's internal routing
+  // Strip /auth prefix for the DO's internal routing.
+  // The DO sees the same paths regardless of API version.
   // /auth/pair/initiate -> /pair/initiate
   // /auth/pair/complete -> /pair/complete
   // /auth/token -> /token
   // /turn/credentials stays as /turn/credentials
   // /ws stays as /ws
-  let doPath = url.pathname;
+  let doPath = normalizedPathname;
   if (doPath.startsWith('/auth/')) {
     doPath = doPath.slice('/auth'.length);
   }
