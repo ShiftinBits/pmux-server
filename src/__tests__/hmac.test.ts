@@ -36,18 +36,15 @@ function makeRequest(
 }
 
 /**
- * Compute a valid signature matching the production algorithm.
- * Returns both the signature and the nonce used.
+ * Compute a valid legacy signature (no nonce) matching the production algorithm.
  */
 async function computeTestSignature(
   secret: string,
   timestamp: string,
-  path: string,
-  nonce?: string
-): Promise<{ sig: string; nonce: string }> {
-  const n = nonce ?? generateTestNonce();
-  const sig = await computeSignature(secret, timestamp, n, path);
-  return { sig, nonce: n };
+  path: string
+): Promise<{ sig: string }> {
+  const sig = await computeSignature(secret, timestamp, path);
+  return { sig };
 }
 
 function nowSeconds(): string {
@@ -55,11 +52,11 @@ function nowSeconds(): string {
 }
 
 describe('validateClientSignature', () => {
-  it('accepts a valid signature with correct timestamp, nonce, and path', async () => {
+  it('accepts a valid signature with correct timestamp and path', async () => {
     const timestamp = nowSeconds();
     const path = '/auth/token';
-    const { sig, nonce } = await computeTestSignature(TEST_SECRET, timestamp, path);
-    const req = makeRequest(path, { signature: sig, timestamp, nonce });
+    const { sig } = await computeTestSignature(TEST_SECRET, timestamp, path);
+    const req = makeRequest(path, { signature: sig, timestamp });
 
     const result = await validateClientSignature(req, TEST_SECRET);
     expect(result).toEqual({ valid: true });
@@ -67,34 +64,35 @@ describe('validateClientSignature', () => {
 
   it('rejects when pmux-signature header is missing', async () => {
     const timestamp = nowSeconds();
-    const nonce = generateTestNonce();
-    const req = makeRequest('/auth/token', { timestamp, nonce }); // no signature
+    const req = makeRequest('/auth/token', { timestamp }); // no signature
 
     const result = await validateClientSignature(req, TEST_SECRET);
     expect(result).toEqual({ valid: false, error: 'missing client signature' });
   });
 
   it('rejects when pmux-timestamp header is missing', async () => {
-    const { sig, nonce } = await computeTestSignature(TEST_SECRET, nowSeconds(), '/auth/token');
-    const req = makeRequest('/auth/token', { signature: sig, nonce }); // no timestamp
+    const { sig } = await computeTestSignature(TEST_SECRET, nowSeconds(), '/auth/token');
+    const req = makeRequest('/auth/token', { signature: sig }); // no timestamp
 
     const result = await validateClientSignature(req, TEST_SECRET);
     expect(result).toEqual({ valid: false, error: 'missing client signature' });
   });
 
-  it('rejects when pmux-nonce header is missing', async () => {
+  it('accepts a valid request even when pmux-nonce header is present (ignored for legacy paths)', async () => {
     const timestamp = nowSeconds();
-    const { sig } = await computeTestSignature(TEST_SECRET, timestamp, '/auth/token');
-    const req = makeRequest('/auth/token', { signature: sig, timestamp }); // no nonce
+    const path = '/auth/token';
+    const { sig } = await computeTestSignature(TEST_SECRET, timestamp, path);
+    // nonce is present but should be ignored on legacy paths
+    const req = makeRequest(path, { signature: sig, timestamp, nonce: generateTestNonce() });
 
     const result = await validateClientSignature(req, TEST_SECRET);
-    expect(result).toEqual({ valid: false, error: 'missing client signature' });
+    expect(result).toEqual({ valid: true });
   });
 
   it('rejects a timestamp older than 60 seconds', async () => {
     const staleTimestamp = String(Math.floor(Date.now() / 1000) - 61);
-    const { sig, nonce } = await computeTestSignature(TEST_SECRET, staleTimestamp, '/auth/token');
-    const req = makeRequest('/auth/token', { signature: sig, timestamp: staleTimestamp, nonce });
+    const { sig } = await computeTestSignature(TEST_SECRET, staleTimestamp, '/auth/token');
+    const req = makeRequest('/auth/token', { signature: sig, timestamp: staleTimestamp });
 
     const result = await validateClientSignature(req, TEST_SECRET);
     expect(result).toEqual({ valid: false, error: 'request expired' });
@@ -102,8 +100,8 @@ describe('validateClientSignature', () => {
 
   it('rejects a timestamp more than 60 seconds in the future', async () => {
     const futureTimestamp = String(Math.floor(Date.now() / 1000) + 61);
-    const { sig, nonce } = await computeTestSignature(TEST_SECRET, futureTimestamp, '/auth/token');
-    const req = makeRequest('/auth/token', { signature: sig, timestamp: futureTimestamp, nonce });
+    const { sig } = await computeTestSignature(TEST_SECRET, futureTimestamp, '/auth/token');
+    const req = makeRequest('/auth/token', { signature: sig, timestamp: futureTimestamp });
 
     const result = await validateClientSignature(req, TEST_SECRET);
     expect(result).toEqual({ valid: false, error: 'request expired' });
@@ -111,8 +109,8 @@ describe('validateClientSignature', () => {
 
   it('accepts a timestamp exactly at the 60-second boundary', async () => {
     const edgeTimestamp = String(Math.floor(Date.now() / 1000) - 60);
-    const { sig, nonce } = await computeTestSignature(TEST_SECRET, edgeTimestamp, '/ws');
-    const req = makeRequest('/ws', { signature: sig, timestamp: edgeTimestamp, nonce });
+    const { sig } = await computeTestSignature(TEST_SECRET, edgeTimestamp, '/ws');
+    const req = makeRequest('/ws', { signature: sig, timestamp: edgeTimestamp });
 
     const result = await validateClientSignature(req, TEST_SECRET);
     expect(result).toEqual({ valid: true });
@@ -121,8 +119,8 @@ describe('validateClientSignature', () => {
   it('rejects a signature computed with the wrong key', async () => {
     const timestamp = nowSeconds();
     const path = '/auth/token';
-    const { sig, nonce } = await computeTestSignature('wrong-secret-entirely', timestamp, path);
-    const req = makeRequest(path, { signature: sig, timestamp, nonce });
+    const { sig } = await computeTestSignature('wrong-secret-entirely', timestamp, path);
+    const req = makeRequest(path, { signature: sig, timestamp });
 
     const result = await validateClientSignature(req, TEST_SECRET);
     expect(result).toEqual({ valid: false, error: 'invalid client signature' });
@@ -130,8 +128,8 @@ describe('validateClientSignature', () => {
 
   it('rejects a signature computed with the wrong path', async () => {
     const timestamp = nowSeconds();
-    const { sig, nonce } = await computeTestSignature(TEST_SECRET, timestamp, '/other/path');
-    const req = makeRequest('/auth/token', { signature: sig, timestamp, nonce });
+    const { sig } = await computeTestSignature(TEST_SECRET, timestamp, '/other/path');
+    const req = makeRequest('/auth/token', { signature: sig, timestamp });
 
     const result = await validateClientSignature(req, TEST_SECRET);
     expect(result).toEqual({ valid: false, error: 'invalid client signature' });
@@ -139,8 +137,7 @@ describe('validateClientSignature', () => {
 
   it('rejects a malformed signature (not valid hex)', async () => {
     const timestamp = nowSeconds();
-    const nonce = generateTestNonce();
-    const req = makeRequest('/auth/token', { signature: 'not-hex!!', timestamp, nonce });
+    const req = makeRequest('/auth/token', { signature: 'not-hex!!', timestamp });
 
     const result = await validateClientSignature(req, TEST_SECRET);
     expect(result).toEqual({ valid: false, error: 'invalid client signature' });
@@ -148,43 +145,20 @@ describe('validateClientSignature', () => {
 
   it('rejects a signature of wrong length', async () => {
     const timestamp = nowSeconds();
-    const nonce = generateTestNonce();
-    const req = makeRequest('/auth/token', { signature: 'deadbeef', timestamp, nonce });
+    const req = makeRequest('/auth/token', { signature: 'deadbeef', timestamp });
 
     const result = await validateClientSignature(req, TEST_SECRET);
     expect(result).toEqual({ valid: false, error: 'invalid client signature' });
   });
 
-  it('rejects a nonce that is not 32 lowercase hex chars', async () => {
-    const timestamp = nowSeconds();
-    const { sig } = await computeTestSignature(TEST_SECRET, timestamp, '/auth/token');
-
-    const shortNonce = 'abc123'; // too short
-    const req = makeRequest('/auth/token', { signature: sig, timestamp, nonce: shortNonce });
-    const result = await validateClientSignature(req, TEST_SECRET);
-    expect(result).toEqual({ valid: false, error: 'invalid nonce' });
-  });
-
-  it('rejects a nonce with uppercase hex chars', async () => {
-    const timestamp = nowSeconds();
-    const { sig } = await computeTestSignature(TEST_SECRET, timestamp, '/auth/token');
-    const upperNonce = 'ABCDEF1234567890ABCDEF1234567890'; // uppercase — invalid
-
-    const req = makeRequest('/auth/token', { signature: sig, timestamp, nonce: upperNonce });
-    const result = await validateClientSignature(req, TEST_SECRET);
-    expect(result).toEqual({ valid: false, error: 'invalid nonce' });
-  });
-
-  it('matches cross-platform test vector (v2 formula: timestamp:nonce:pathname)', async () => {
-    // Formula v2: HMAC-SHA256(secret, "{timestamp}:{nonce}:{pathname}")
-    // Fixed nonce used to make vector reproducible across platforms.
-    // TODO: verify this vector against Go and mobile implementations once both adopt v2.
+  it('matches cross-platform test vector (legacy formula: timestamp:pathname)', async () => {
+    // Formula: HMAC-SHA256(secret, "{timestamp}:{pathname}")
+    // Verify against the Go agent legacy implementation.
     const secret = 'test-hmac-secret-for-pocketmux';
     const timestamp = '1709654400';
-    const nonce = '00000000000000000000000000000000';
     const path = '/auth/token';
 
-    const computed = await computeSignature(secret, timestamp, nonce, path);
+    const computed = await computeSignature(secret, timestamp, path);
     // Verify it's a 64-char lowercase hex string (SHA-256 output)
     expect(computed).toMatch(/^[0-9a-f]{64}$/);
 
@@ -192,7 +166,7 @@ describe('validateClientSignature', () => {
     const realDateNow = Date.now;
     Date.now = () => parseInt(timestamp, 10) * 1000;
     try {
-      const req = makeRequest(path, { signature: computed, timestamp, nonce });
+      const req = makeRequest(path, { signature: computed, timestamp });
       const result = await validateClientSignature(req, secret);
       expect(result).toEqual({ valid: true });
     } finally {
@@ -201,14 +175,13 @@ describe('validateClientSignature', () => {
   });
 
   it('rejects a non-numeric timestamp with "invalid timestamp" error', async () => {
-    const { sig, nonce } = await computeTestSignature(TEST_SECRET, nowSeconds(), '/auth/token');
-    const req = makeRequest('/auth/token', { signature: sig, timestamp: 'not-a-number', nonce });
+    const { sig } = await computeTestSignature(TEST_SECRET, nowSeconds(), '/auth/token');
+    const req = makeRequest('/auth/token', { signature: sig, timestamp: 'not-a-number' });
 
     const result = await validateClientSignature(req, TEST_SECRET);
     expect(result).toEqual({ valid: false, error: 'invalid timestamp' });
   });
 });
-
 // ---------------------------------------------------------------------------
 // V1 validateClientSignatureV1 — requires pmux-nonce
 // ---------------------------------------------------------------------------
