@@ -670,8 +670,10 @@ export class SignalingDO implements DurableObject {
     // Decrement WebSocket connection count
     this.decrementWsCount(attachment.deviceId);
 
-    // If host disconnected, notify the paired mobile
-    if (attachment.deviceType === 'host') {
+    // If this was the last connection for a host, notify the paired mobile.
+    // Guard against false-offline when a host has multiple concurrent WebSocket
+    // connections (e.g., agent + pair CLI): only notify when no connections remain.
+    if (attachment.deviceType === 'host' && !this.wsConnectionCounts.has(attachment.deviceId)) {
       this.notifyPairedMobile(attachment.deviceId, {
         type: 'host_offline',
         deviceId: attachment.deviceId,
@@ -690,8 +692,10 @@ export class SignalingDO implements DurableObject {
         this.connections.delete(attachment.deviceId);
       }
       this.decrementWsCount(attachment.deviceId);
-      // Notify the paired mobile if host errored out
-      if (attachment.deviceType === 'host') {
+      // If this was the last connection for a host, notify the paired mobile.
+      // Guard against false-offline when a host has multiple concurrent WebSocket
+      // connections (e.g., agent + pair CLI): only notify when no connections remain.
+      if (attachment.deviceType === 'host' && !this.wsConnectionCounts.has(attachment.deviceId)) {
         this.notifyPairedMobile(attachment.deviceId, {
           type: 'host_offline',
           deviceId: attachment.deviceId,
@@ -750,7 +754,9 @@ export class SignalingDO implements DurableObject {
             // Notify the paired mobile that the host is offline.
             // webSocketClose won't fire for connections that died silently
             // (machine sleep/power down), so we must notify here.
-            if (att.deviceType === 'host') {
+            // Guard against false-offline when a host has multiple concurrent
+            // WebSocket connections: only notify when no connections remain.
+            if (att.deviceType === 'host' && !this.wsConnectionCounts.has(att.deviceId)) {
               this.notifyPairedMobile(att.deviceId, {
                 type: 'host_offline',
                 deviceId: att.deviceId,
