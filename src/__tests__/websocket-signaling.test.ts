@@ -532,6 +532,77 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(offlineMessages).toHaveLength(0);
     });
 
+    it('does not emit host_offline when one of multiple host WSs closes', async () => {
+      // Simulate a host that has two concurrent WebSocket connections (e.g., a
+      // stale WS from before a DO hibernation cycle alongside a fresh reconnect).
+      doInstance.registerDevice('agent-multi', 'pubkey-agent-multi', 'host');
+      doInstance.registerDevice('mobile-multi', 'pubkey-mobile-multi', 'mobile');
+      doInstance.createPairing('agent-multi', 'mobile-multi');
+
+      const hostToken1 = await createJWT('agent-multi', 'host', JWT_SECRET);
+      const hostToken2 = await createJWT('agent-multi', 'host', JWT_SECRET);
+      const mobileToken = await createJWT('mobile-multi', 'mobile', JWT_SECRET);
+
+      const hostWs1 = new MockWebSocket();
+      const hostWs2 = new MockWebSocket();
+      const mobileWs = new MockWebSocket();
+
+      mockState.acceptedWebSockets.push(hostWs1 as unknown as WebSocket);
+      mockState.acceptedWebSockets.push(hostWs2 as unknown as WebSocket);
+      mockState.acceptedWebSockets.push(mobileWs as unknown as WebSocket);
+
+      hostWs1.serializeAttachment({ authenticated: false });
+      hostWs2.serializeAttachment({ authenticated: false });
+      mobileWs.serializeAttachment({ authenticated: false });
+
+      await doInstance.webSocketMessage(hostWs1 as unknown as WebSocket, JSON.stringify({ type: 'auth', token: hostToken1 }));
+      await doInstance.webSocketMessage(hostWs2 as unknown as WebSocket, JSON.stringify({ type: 'auth', token: hostToken2 }));
+      await doInstance.webSocketMessage(mobileWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token: mobileToken }));
+
+      mobileWs.sent.length = 0;
+
+      // One host WS closes (e.g., stale WS from before DO hibernation)
+      await doInstance.webSocketClose(hostWs1 as unknown as WebSocket, 1000, 'stale close', true);
+
+      // Mobile should NOT see host_offline — the other WS is still active
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(0);
+    });
+
+    it('emits host_offline when the last host WS closes (post-hibernation stale count)', async () => {
+      // After DO hibernation, wsConnectionCounts is reset to empty. This test
+      // verifies that host_offline is still sent correctly even when the in-memory
+      // count is stale (0), because we rely on getWebSockets() as the source of truth.
+      doInstance.registerDevice('agent-stale', 'pubkey-agent-stale', 'host');
+      doInstance.registerDevice('mobile-stale', 'pubkey-mobile-stale', 'mobile');
+      doInstance.createPairing('agent-stale', 'mobile-stale');
+
+      const hostToken = await createJWT('agent-stale', 'host', JWT_SECRET);
+      const mobileToken = await createJWT('mobile-stale', 'mobile', JWT_SECRET);
+
+      const hostWs = new MockWebSocket();
+      const mobileWs = new MockWebSocket();
+
+      mockState.acceptedWebSockets.push(hostWs as unknown as WebSocket);
+      mockState.acceptedWebSockets.push(mobileWs as unknown as WebSocket);
+
+      hostWs.serializeAttachment({ authenticated: false });
+      mobileWs.serializeAttachment({ authenticated: false });
+
+      await doInstance.webSocketMessage(hostWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token: hostToken }));
+      await doInstance.webSocketMessage(mobileWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token: mobileToken }));
+
+      mobileWs.sent.length = 0;
+
+      // Simulate DO hibernation: clear in-memory wsConnectionCounts (counts reset to 0)
+      doInstance.clearWsConnectionCounts();
+
+      // Host WS closes (e.g., fires after DO wakes from hibernation)
+      await doInstance.webSocketClose(hostWs as unknown as WebSocket, 1000, 'connection lost', true);
+
+      // Mobile SHOULD see host_offline even with stale (zeroed) in-memory count
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+    });
+
   });
 
   describe('connect_request relay', () => {

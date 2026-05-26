@@ -479,6 +479,11 @@ export class SignalingDO implements DurableObject {
     return this.wsConnectionCounts.get(deviceId) ?? 0;
   }
 
+  /** Simulate DO hibernation by clearing in-memory connection counts (for testing). */
+  clearWsConnectionCounts(): void {
+    this.wsConnectionCounts.clear();
+  }
+
   // --- HTTP routing ---
 
   /** Allowed HTTP methods per path (excluding /ws which has no method restriction). */
@@ -667,13 +672,18 @@ export class SignalingDO implements DurableObject {
       this.connections.delete(attachment.deviceId);
     }
 
-    // Decrement WebSocket connection count
+    // Decrement WebSocket connection count (used by alarm-path guard)
     this.decrementWsCount(attachment.deviceId);
 
     // If this was the last connection for a host, notify the paired mobile.
-    // Guard against false-offline when a host has multiple concurrent WebSocket
-    // connections (e.g., agent + pair CLI): only notify when no connections remain.
-    if (attachment.deviceType === 'host' && !this.wsConnectionCounts.has(attachment.deviceId)) {
+    // Use getWebSockets() (runtime source of truth) rather than the in-memory
+    // wsConnectionCounts, which can be stale after DO hibernation. Exclude the
+    // closing WS from the count regardless of whether Cloudflare has already
+    // removed it from getWebSockets() by the time this handler fires.
+    if (
+      attachment.deviceType === 'host' &&
+      this.countOtherActiveWsForDevice(attachment.deviceId, ws) === 0
+    ) {
       this.notifyPairedMobile(attachment.deviceId, {
         type: 'host_offline',
         deviceId: attachment.deviceId,
@@ -693,9 +703,12 @@ export class SignalingDO implements DurableObject {
       }
       this.decrementWsCount(attachment.deviceId);
       // If this was the last connection for a host, notify the paired mobile.
-      // Guard against false-offline when a host has multiple concurrent WebSocket
-      // connections (e.g., agent + pair CLI): only notify when no connections remain.
-      if (attachment.deviceType === 'host' && !this.wsConnectionCounts.has(attachment.deviceId)) {
+      // Use getWebSockets() via countOtherActiveWsForDevice for the same
+      // reason as webSocketClose: in-memory counts are unreliable post-hibernation.
+      if (
+        attachment.deviceType === 'host' &&
+        this.countOtherActiveWsForDevice(attachment.deviceId, ws) === 0
+      ) {
         this.notifyPairedMobile(attachment.deviceId, {
           type: 'host_offline',
           deviceId: attachment.deviceId,
@@ -803,6 +816,24 @@ export class SignalingDO implements DurableObject {
     } else {
       this.wsConnectionCounts.set(deviceId, current - 1);
     }
+  }
+
+  /**
+   * Count authenticated WebSocket connections for a device, excluding a
+   * specific WebSocket (typically the one that is closing or erroring).
+   * Reads directly from the runtime's getWebSockets() — the source of truth
+   * for open connections — so it is not affected by stale in-memory counts
+   * that can occur after DO hibernation.
+   */
+  private countOtherActiveWsForDevice(deviceId: string, excludeWs: WebSocket): number {
+    if (!this.state.getWebSockets) return 0;
+    let count = 0;
+    for (const ws of this.state.getWebSockets()) {
+      if (ws === excludeWs) continue;
+      const att = ws.deserializeAttachment() as WsAttachment | null;
+      if (att?.authenticated && att.deviceId === deviceId) count++;
+    }
+    return count;
   }
 
   // --- WebSocket message handlers ---
