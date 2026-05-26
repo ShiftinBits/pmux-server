@@ -747,6 +747,15 @@ export class SignalingDO implements DurableObject {
               this.connections.delete(att.deviceId);
             }
             this.decrementWsCount(att.deviceId);
+            // Notify the paired mobile that the host is offline.
+            // webSocketClose won't fire for connections that died silently
+            // (machine sleep/power down), so we must notify here.
+            if (att.deviceType === 'host') {
+              this.notifyPairedMobile(att.deviceId, {
+                type: 'host_offline',
+                deviceId: att.deviceId,
+              });
+            }
           }
         } else {
           activeCount++;
