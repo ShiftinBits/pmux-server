@@ -223,6 +223,148 @@ describe('Signaling server efficiency [T3.10]', () => {
   });
 
   describe('alarm cleanup details', () => {
+    it('sends host_offline to paired mobile when idle host WS is closed by alarm', async () => {
+      // Pair a host and mobile
+      doInstance.registerDevice('alarm-host', 'pubkey-alarm-host', 'host');
+      doInstance.registerDevice('alarm-mobile', 'pubkey-alarm-mobile', 'mobile');
+      doInstance.createPairing('alarm-host', 'alarm-mobile');
+
+      const hostToken = await createJWT('alarm-host', 'host', JWT_SECRET);
+      const mobileToken = await createJWT('alarm-mobile', 'mobile', JWT_SECRET);
+
+      const hostWs = new MockWebSocket();
+      const mobileWs = new MockWebSocket();
+
+      mockDOState.acceptedWebSockets.push(hostWs as unknown as WebSocket);
+      mockDOState.acceptedWebSockets.push(mobileWs as unknown as WebSocket);
+
+      hostWs.serializeAttachment({ authenticated: false, lastMessageTime: Date.now() });
+      mobileWs.serializeAttachment({ authenticated: false, lastMessageTime: Date.now() });
+
+      await doInstance.webSocketMessage(hostWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token: hostToken }));
+      await doInstance.webSocketMessage(mobileWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token: mobileToken }));
+
+      // Simulate host WS idle for 6 minutes (machine went offline silently)
+      const att = hostWs.deserializeAttachment() as Record<string, unknown>;
+      att.lastMessageTime = Date.now() - 6 * 60 * 1000;
+      hostWs.serializeAttachment(att);
+
+      await doInstance.alarm();
+
+      expect(hostWs.closed).toBe(true);
+
+      // Mobile should receive exactly one host_offline
+      const offlineMessages = mobileWs.messagesOfType('host_offline');
+      expect(offlineMessages.length).toBe(1);
+      expect(offlineMessages[0]?.['deviceId']).toBe('alarm-host');
+    });
+
+    it('does not send host_offline for idle mobile WS closed by alarm', async () => {
+      doInstance.registerDevice('alarm-host2', 'pubkey-alarm-host2', 'host');
+      doInstance.registerDevice('alarm-mobile2', 'pubkey-alarm-mobile2', 'mobile');
+      doInstance.createPairing('alarm-host2', 'alarm-mobile2');
+
+      const hostToken = await createJWT('alarm-host2', 'host', JWT_SECRET);
+      const mobileToken = await createJWT('alarm-mobile2', 'mobile', JWT_SECRET);
+
+      const hostWs = new MockWebSocket();
+      const mobileWs = new MockWebSocket();
+
+      mockDOState.acceptedWebSockets.push(hostWs as unknown as WebSocket);
+      mockDOState.acceptedWebSockets.push(mobileWs as unknown as WebSocket);
+
+      hostWs.serializeAttachment({ authenticated: false, lastMessageTime: Date.now() });
+      mobileWs.serializeAttachment({ authenticated: false, lastMessageTime: Date.now() });
+
+      await doInstance.webSocketMessage(hostWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token: hostToken }));
+      await doInstance.webSocketMessage(mobileWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token: mobileToken }));
+
+      // Keep host active, make mobile idle
+      const mobileAtt = mobileWs.deserializeAttachment() as Record<string, unknown>;
+      mobileAtt.lastMessageTime = Date.now() - 6 * 60 * 1000;
+      mobileWs.serializeAttachment(mobileAtt);
+
+      // Keep host active
+      const hostAtt = hostWs.deserializeAttachment() as Record<string, unknown>;
+      hostAtt.lastMessageTime = Date.now();
+      hostWs.serializeAttachment(hostAtt);
+
+      await doInstance.alarm();
+
+      expect(mobileWs.closed).toBe(true);
+      expect(hostWs.closed).toBe(false);
+
+      // Host should NOT receive host_offline (mobile disconnected, not host)
+      const offlineToHost = hostWs.messagesOfType('host_offline');
+      expect(offlineToHost.length).toBe(0);
+    });
+
+    it('does not send host_offline when an idle host WS closes but other connections remain', async () => {
+      doInstance.registerDevice('multi-host', 'pubkey-multi-host', 'host');
+      doInstance.registerDevice('multi-mobile', 'pubkey-multi-mobile', 'mobile');
+      doInstance.createPairing('multi-host', 'multi-mobile');
+
+      const hostToken = await createJWT('multi-host', 'host', JWT_SECRET);
+      const mobileToken = await createJWT('multi-mobile', 'mobile', JWT_SECRET);
+
+      // Simulate two host connections (e.g., agent + pair CLI)
+      const hostWs1 = new MockWebSocket();
+      const hostWs2 = new MockWebSocket();
+      const mobileWs = new MockWebSocket();
+
+      mockDOState.acceptedWebSockets.push(hostWs1 as unknown as WebSocket);
+      mockDOState.acceptedWebSockets.push(hostWs2 as unknown as WebSocket);
+      mockDOState.acceptedWebSockets.push(mobileWs as unknown as WebSocket);
+
+      hostWs1.serializeAttachment({ authenticated: false, lastMessageTime: Date.now() });
+      hostWs2.serializeAttachment({ authenticated: false, lastMessageTime: Date.now() });
+      mobileWs.serializeAttachment({ authenticated: false, lastMessageTime: Date.now() });
+
+      // Authenticate both host connections (two JWTs for same device)
+      const hostToken2 = await createJWT('multi-host', 'host', JWT_SECRET);
+      await doInstance.webSocketMessage(hostWs1 as unknown as WebSocket, JSON.stringify({ type: 'auth', token: hostToken }));
+      await doInstance.webSocketMessage(hostWs2 as unknown as WebSocket, JSON.stringify({ type: 'auth', token: hostToken2 }));
+      await doInstance.webSocketMessage(mobileWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token: mobileToken }));
+
+      expect(doInstance.getWsConnectionCount('multi-host')).toBe(2);
+
+      // Let one host connection go idle
+      const att1 = hostWs1.deserializeAttachment() as Record<string, unknown>;
+      att1.lastMessageTime = Date.now() - 6 * 60 * 1000;
+      hostWs1.serializeAttachment(att1);
+
+      await doInstance.alarm();
+
+      expect(hostWs1.closed).toBe(true);
+      expect(hostWs2.closed).toBe(false);
+      expect(doInstance.getWsConnectionCount('multi-host')).toBe(1);
+
+      // Mobile should NOT receive host_offline — one connection is still active
+      const offlineMessages = mobileWs.messagesOfType('host_offline');
+      expect(offlineMessages.length).toBe(0);
+    });
+
+    it('does not send host_offline for an unpaired host closed by alarm', async () => {
+      // Register a host with no pairing
+      doInstance.registerDevice('unpaired-host', 'pubkey-unpaired-host', 'host');
+      const hostToken = await createJWT('unpaired-host', 'host', JWT_SECRET);
+
+      const hostWs = new MockWebSocket();
+      mockDOState.acceptedWebSockets.push(hostWs as unknown as WebSocket);
+      hostWs.serializeAttachment({ authenticated: false, lastMessageTime: Date.now() });
+
+      await doInstance.webSocketMessage(hostWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token: hostToken }));
+
+      // Make it idle
+      const att = hostWs.deserializeAttachment() as Record<string, unknown>;
+      att.lastMessageTime = Date.now() - 6 * 60 * 1000;
+      hostWs.serializeAttachment(att);
+
+      // Should not throw even though there is no paired mobile
+      await expect(doInstance.alarm()).resolves.toBeUndefined();
+      expect(hostWs.closed).toBe(true);
+    });
+
     it('removes idle authenticated WS from connection cache and decrements count', async () => {
       const { ws } = await connectAndAuth('agent-1', 'host');
 
