@@ -680,14 +680,14 @@ export class SignalingDO implements DurableObject {
     // wsConnectionCounts, which can be stale after DO hibernation. Exclude the
     // closing WS from the count regardless of whether Cloudflare has already
     // removed it from getWebSockets() by the time this handler fires.
-    if (
-      attachment.deviceType === 'host' &&
-      this.countOtherActiveWsForDevice(attachment.deviceId, ws) === 0
-    ) {
-      this.notifyPairedMobile(attachment.deviceId, {
-        type: 'host_offline',
-        deviceId: attachment.deviceId,
-      });
+    if (attachment.deviceType === 'host') {
+      const otherCount = this.countOtherActiveWsForDevice(attachment.deviceId, ws);
+      if (otherCount === 0) {
+        this.notifyPairedMobile(attachment.deviceId, {
+          type: 'host_offline',
+          deviceId: attachment.deviceId,
+        });
+      }
     }
   }
 
@@ -764,12 +764,14 @@ export class SignalingDO implements DurableObject {
               this.connections.delete(att.deviceId);
             }
             this.decrementWsCount(att.deviceId);
-            // Notify the paired mobile that the host is offline.
-            // webSocketClose won't fire for connections that died silently
-            // (machine sleep/power down), so we must notify here.
-            // Guard against false-offline when a host has multiple concurrent
-            // WebSocket connections: only notify when no connections remain.
-            if (att.deviceType === 'host' && !this.wsConnectionCounts.has(att.deviceId)) {
+            // Notify the paired mobile that the host is offline only when this
+            // is the last connection for the device. Use countOtherActiveWsForDevice
+            // (reads from getWebSockets(), not stale in-memory counts) so that
+            // multi-WS devices are handled correctly even after DO hibernation.
+            if (
+              att.deviceType === 'host' &&
+              this.countOtherActiveWsForDevice(att.deviceId, ws) === 0
+            ) {
               this.notifyPairedMobile(att.deviceId, {
                 type: 'host_offline',
                 deviceId: att.deviceId,
