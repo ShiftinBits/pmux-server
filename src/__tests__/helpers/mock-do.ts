@@ -27,6 +27,24 @@ export function createMockKVStorage(): {
   };
 }
 
+/**
+ * Counting mock for a native Workers Rate Limiting binding.
+ * Blocks after `limit` calls per key. No time window — the platform binding
+ * owns the window and isn't fake-timer controllable, so counting is the
+ * honest testable surface (exhaust → blocked; distinct keys independent).
+ */
+export function createMockRateLimit(limit: number): RateLimit & { counts: Map<string, number> } {
+  const counts = new Map<string, number>();
+  return {
+    counts,
+    async limit({ key }: { key: string }): Promise<{ success: boolean }> {
+      const n = (counts.get(key) ?? 0) + 1;
+      counts.set(key, n);
+      return { success: n <= limit };
+    },
+  } as RateLimit & { counts: Map<string, number> };
+}
+
 export interface MockDOState {
   acceptedWebSockets: WebSocket[];
   scheduledAlarm: number | null;
@@ -77,6 +95,10 @@ export async function createTestDO(): Promise<{ doInstance: SignalingDO; mockSta
     TURN_TOKEN_ID: 'test-turn-token-id',
     TURN_API_TOKEN: 'test-turn-api-token',
     JWT_SECRET: 'test-jwt-secret-at-least-32-chars-long',
+    TOKEN_LIMITER: createMockRateLimit(30),
+    PAIR_LIMITER: createMockRateLimit(10),
+    TURN_LIMITER: createMockRateLimit(20),
+    WS_LIMITER: createMockRateLimit(8),
   };
 
   const doInstance = new SignalingDO(

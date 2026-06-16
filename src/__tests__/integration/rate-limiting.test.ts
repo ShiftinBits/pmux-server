@@ -9,26 +9,20 @@
  * 5. Different endpoints have independent rate limits
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { createTestDO } from '../helpers/mock-do';
-import { ENDPOINT_LIMITS } from '../../middleware/ratelimit';
 import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBody } from '../helpers/crypto';
 import type { SignalingDO } from '../../signaling';
-import type { MockDOState } from '../helpers/mock-do';
+
+// Limits mirror the native Workers Rate Limiting bindings (wrangler.toml).
+const PAIR_LIMIT = 10;
+const TOKEN_LIMIT = 30;
 
 let doInstance: SignalingDO;
-let mockState: MockDOState;
-let realDateNow: () => number;
 
 beforeEach(async () => {
   const result = await createTestDO();
   doInstance = result.doInstance;
-  mockState = result.mockState;
-  realDateNow = Date.now;
-});
-
-afterEach(() => {
-  Date.now = realDateNow;
 });
 
 async function postJSON(
@@ -59,7 +53,7 @@ async function signedInitiateBody(deviceId: string, x25519Key: string) {
 describe('Rate limiting integration [T3.11]', () => {
   describe('/pair/initiate rate limit', () => {
     it('allows 10 requests and blocks the 11th with 429', async () => {
-      const limit = ENDPOINT_LIMITS['/pair/initiate']!.maxRequests;
+      const limit = PAIR_LIMIT;
       expect(limit).toBe(10);
 
       // Send requests up to the limit
@@ -86,7 +80,7 @@ describe('Rate limiting integration [T3.11]', () => {
     });
 
     it('rate limit state persists within the same DO', async () => {
-      const limit = ENDPOINT_LIMITS['/pair/initiate']!.maxRequests;
+      const limit = PAIR_LIMIT;
 
       // Send 5 requests
       for (let i = 0; i < 5; i++) {
@@ -114,7 +108,7 @@ describe('Rate limiting integration [T3.11]', () => {
 
   describe('independent IP limits', () => {
     it('different IPs have independent rate limits', async () => {
-      const limit = ENDPOINT_LIMITS['/pair/initiate']!.maxRequests;
+      const limit = PAIR_LIMIT;
 
       // Exhaust limit for IP A
       for (let i = 0; i < limit; i++) {
@@ -149,7 +143,7 @@ describe('Rate limiting integration [T3.11]', () => {
 
   describe('independent endpoint limits', () => {
     it('/pair/initiate and /pair/complete have separate counters', async () => {
-      const limit = ENDPOINT_LIMITS['/pair/initiate']!.maxRequests;
+      const limit = PAIR_LIMIT;
 
       // Exhaust /pair/initiate limit
       for (let i = 0; i < limit; i++) {
@@ -175,8 +169,32 @@ describe('Rate limiting integration [T3.11]', () => {
       expect(complete.status).toBe(404); // Bad code, but NOT rate limited
     });
 
+    it('/pairing has its own counter, independent of /pair/initiate', async () => {
+      // Exhaust /pair/initiate for this IP
+      for (let i = 0; i < PAIR_LIMIT; i++) {
+        const body = await signedInitiateBody(`agent-pg-${i}`, `x25519-key-pg-${i}`);
+        await postJSON('/pair/initiate', body);
+      }
+      const blockedInitiate = await postJSON('/pair/initiate', {
+        deviceId: 'agent-pg-overflow',
+        ed25519PublicKey: 'pub',
+        x25519PublicKey: 'x25519',
+      });
+      expect(blockedInitiate.status).toBe(429);
+
+      // /pairing (DELETE) shares PAIR_LIMITER but is keyed separately, so it is
+      // NOT rate limited — it returns its handler's status, not 429.
+      const request = new Request('http://localhost/pairing', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', 'X-Client-IP': '192.168.1.1' },
+        body: JSON.stringify({ hostDeviceId: 'nonexistent' }),
+      });
+      const response = await doInstance.fetch(request);
+      expect(response.status).not.toBe(429);
+    });
+
     it('/token has its own limit (30/min)', async () => {
-      const tokenLimit = ENDPOINT_LIMITS['/token']!.maxRequests;
+      const tokenLimit = TOKEN_LIMIT;
       expect(tokenLimit).toBe(30);
 
       // Send 30 token requests (all fail with 401 but should not be rate limited)
@@ -199,38 +217,13 @@ describe('Rate limiting integration [T3.11]', () => {
     });
   });
 
-  describe('rate limit window reset', () => {
-    it('allows requests again after window expires', async () => {
-      const limit = ENDPOINT_LIMITS['/pair/initiate']!.maxRequests;
-      const windowMs = ENDPOINT_LIMITS['/pair/initiate']!.windowMs;
-
-      // Fill the limit
-      for (let i = 0; i < limit; i++) {
-        const body = await signedInitiateBody(`agent-reset-${i}`, `x25519-key-reset-${i}`);
-        await postJSON('/pair/initiate', body);
-      }
-
-      // Blocked
-      const blocked = await postJSON('/pair/initiate', {
-        deviceId: 'agent-reset-blocked',
-        ed25519PublicKey: 'pub-key-blocked',
-        x25519PublicKey: 'x25519-key-blocked',
-      });
-      expect(blocked.status).toBe(429);
-
-      // Advance time past the window
-      Date.now = () => realDateNow() + windowMs + 1;
-
-      // Should be allowed again
-      const body = await signedInitiateBody('agent-reset-allowed', 'x25519-key-reset-allowed');
-      const allowed = await postJSON('/pair/initiate', body);
-      expect(allowed.status).toBe(200);
-    });
-  });
+  // Window reset is owned by the native Workers Rate Limiting binding (the
+  // platform's time window), not unit-testable via fake timers — covered by
+  // the binding's own configured `period`, not asserted here.
 
   describe('429 response format', () => {
     it('includes proper error body and Retry-After header', async () => {
-      const limit = ENDPOINT_LIMITS['/pair/initiate']!.maxRequests;
+      const limit = PAIR_LIMIT;
 
       // Fill the limit
       for (let i = 0; i < limit; i++) {

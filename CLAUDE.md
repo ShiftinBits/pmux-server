@@ -26,14 +26,14 @@ Single global Durable Object instance — `env.SIGNALING.idFromName('global')` i
 | `src/auth.ts` | Ed25519 verification (Web Crypto), JWT create/verify (HS256) |
 | `src/turn.ts` | TURN credential generation via Cloudflare Realtime API |
 | `src/types.ts` | Re-exports from `@pocketmux/shared` (type-only, no runtime dep) |
-| `src/middleware/ratelimit.ts` | Fixed-window rate limiting via DO KV storage |
+| `src/middleware/ratelimit.ts` | 429 response helper + WS connection-count constant (request rate limiting is the native Workers Rate Limiting binding) |
 
 ### Storage Model
 
 | Layer | What | Backing |
 |-------|------|---------|
 | SQLite (persistent) | devices, pairings, pairing_sessions | `state.storage.sql` |
-| DO KV (ephemeral) | Rate limit counters (`ratelimit:{endpoint}:{key}`) | `state.storage.get/put` |
+| Rate Limiting binding | Per-endpoint request limits | native Workers Rate Limiting (`env.*_LIMITER`) |
 | In-memory maps | WebSocket connection cache, per-device WS counts | `Map<string, WebSocket>` |
 | WS Attachments | Per-socket metadata (survives hibernation) | `serializeAttachment()` |
 
@@ -57,15 +57,17 @@ All endpoints must match spec Section 5.1.
 
 ## Rate Limiting
 
-Fixed-window per-endpoint, stored in DO KV (`checkRateLimit()` in `ratelimit.ts`):
+Per-endpoint via native Cloudflare Workers Rate Limiting bindings (`wrangler.toml`, called as `env.*_LIMITER.limit({ key })` in `signaling.ts`). Keys are namespaced by endpoint so endpoints sharing a binding keep independent counters:
 
-| Endpoint | Limit | Window | Key |
-|----------|-------|--------|-----|
-| `/pair/initiate` | 10 | 60s | IP |
-| `/pair/complete` | 10 | 60s | IP |
-| `/token` | 30 | 60s | **IP** (body untrusted pre-auth) |
-| `/turn/credentials` | 20 | 60s | device ID or IP |
-| `/ws` | 8 | 10s | IP |
+| Endpoint | Limit | Window | Binding | Key |
+|----------|-------|--------|---------|-----|
+| `/pair/initiate` | 10 | 60s | `PAIR_LIMITER` | IP |
+| `/pair/complete` | 10 | 60s | `PAIR_LIMITER` | IP |
+| `/pairing` | 10 | 60s | `PAIR_LIMITER` | device ID or IP |
+| `/device` | 10 | 60s | `PAIR_LIMITER` | device ID or IP |
+| `/token` | 30 | 60s | `TOKEN_LIMITER` | **IP** (body untrusted pre-auth) |
+| `/turn/credentials` | 20 | 60s | `TURN_LIMITER` | device ID or IP |
+| `/ws` | 8 | 10s | `WS_LIMITER` | IP |
 
 Max 5 concurrent WebSocket connections per device (`MAX_WS_CONNECTIONS_PER_DEVICE`).
 

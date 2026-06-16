@@ -1,15 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
-  checkRateLimit,
   rateLimitResponse,
-  ENDPOINT_LIMITS,
   MAX_WS_CONNECTIONS_PER_DEVICE,
-  type RateLimitStorage,
 } from '../middleware/ratelimit';
 import {
   createTestDOCompat as createTestDO,
   createTestDO as createTestDOFull,
-  createMockKVStorage,
   type MockDOState,
 } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
@@ -19,145 +15,9 @@ import type { SignalingDO } from '../signaling';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
-// --- Unit tests: checkRateLimit ---
-
-describe('checkRateLimit', () => {
-  let storage: RateLimitStorage;
-
-  beforeEach(() => {
-    const kv = createMockKVStorage();
-    storage = kv;
-  });
-
-  it('allows requests under the limit', async () => {
-    const result = await checkRateLimit(storage, '192.168.1.1', '/pair/initiate');
-    expect(result.allowed).toBe(true);
-    expect(result.current).toBe(1);
-    expect(result.limit).toBe(10);
-  });
-
-  it('allows requests up to the limit', async () => {
-    const limit = ENDPOINT_LIMITS['/pair/initiate']!.maxRequests;
-
-    for (let i = 0; i < limit; i++) {
-      const result = await checkRateLimit(storage, '192.168.1.1', '/pair/initiate');
-      expect(result.allowed).toBe(true);
-      expect(result.current).toBe(i + 1);
-    }
-  });
-
-  it('blocks requests over the limit with retryAfter', async () => {
-    const limit = ENDPOINT_LIMITS['/pair/initiate']!.maxRequests;
-
-    // Fill up the limit
-    for (let i = 0; i < limit; i++) {
-      await checkRateLimit(storage, '192.168.1.1', '/pair/initiate');
-    }
-
-    // Next request should be blocked
-    const result = await checkRateLimit(storage, '192.168.1.1', '/pair/initiate');
-    expect(result.allowed).toBe(false);
-    expect(result.retryAfter).toBeGreaterThan(0);
-    expect(result.retryAfter).toBeLessThanOrEqual(60);
-    expect(result.current).toBe(limit); // current stays at limit, not incremented
-    expect(result.limit).toBe(limit);
-  });
-
-  it('resets after window expires', async () => {
-    const limit = ENDPOINT_LIMITS['/pair/initiate']!.maxRequests;
-    const windowMs = ENDPOINT_LIMITS['/pair/initiate']!.windowMs;
-
-    // Fill the limit
-    for (let i = 0; i < limit; i++) {
-      await checkRateLimit(storage, '192.168.1.1', '/pair/initiate');
-    }
-
-    // Verify blocked
-    const blocked = await checkRateLimit(storage, '192.168.1.1', '/pair/initiate');
-    expect(blocked.allowed).toBe(false);
-
-    // Advance time past the window
-    const realDateNow = Date.now;
-    Date.now = () => realDateNow() + windowMs + 1;
-
-    try {
-      // Should be allowed again
-      const result = await checkRateLimit(storage, '192.168.1.1', '/pair/initiate');
-      expect(result.allowed).toBe(true);
-      expect(result.current).toBe(1);
-    } finally {
-      Date.now = realDateNow;
-    }
-  });
-
-  it('isolates rate limits per IP', async () => {
-    const limit = ENDPOINT_LIMITS['/pair/initiate']!.maxRequests;
-
-    // Fill limit for IP 1
-    for (let i = 0; i < limit; i++) {
-      await checkRateLimit(storage, '10.0.0.1', '/pair/initiate');
-    }
-
-    // IP 1 is blocked
-    const blocked = await checkRateLimit(storage, '10.0.0.1', '/pair/initiate');
-    expect(blocked.allowed).toBe(false);
-
-    // IP 2 should still be allowed
-    const allowed = await checkRateLimit(storage, '10.0.0.2', '/pair/initiate');
-    expect(allowed.allowed).toBe(true);
-    expect(allowed.current).toBe(1);
-  });
-
-  it('isolates rate limits per endpoint', async () => {
-    const limit = ENDPOINT_LIMITS['/pair/initiate']!.maxRequests;
-
-    // Fill limit for /pair/initiate
-    for (let i = 0; i < limit; i++) {
-      await checkRateLimit(storage, '192.168.1.1', '/pair/initiate');
-    }
-
-    // /pair/initiate is blocked
-    const blocked = await checkRateLimit(storage, '192.168.1.1', '/pair/initiate');
-    expect(blocked.allowed).toBe(false);
-
-    // /pair/complete should still be allowed (separate counter)
-    const allowed = await checkRateLimit(storage, '192.168.1.1', '/pair/complete');
-    expect(allowed.allowed).toBe(true);
-  });
-
-  it('allows unknown endpoints (no limit configured)', async () => {
-    const result = await checkRateLimit(storage, '192.168.1.1', '/unknown');
-    expect(result.allowed).toBe(true);
-    expect(result.limit).toBe(0);
-  });
-
-  describe('per-endpoint limits', () => {
-    it('/pair/initiate allows 10 per minute', () => {
-      expect(ENDPOINT_LIMITS['/pair/initiate']!.maxRequests).toBe(10);
-      expect(ENDPOINT_LIMITS['/pair/initiate']!.windowMs).toBe(60_000);
-    });
-
-    it('/pair/complete allows 10 per minute', () => {
-      expect(ENDPOINT_LIMITS['/pair/complete']!.maxRequests).toBe(10);
-      expect(ENDPOINT_LIMITS['/pair/complete']!.windowMs).toBe(60_000);
-    });
-
-    it('/token allows 30 per minute', () => {
-      expect(ENDPOINT_LIMITS['/token']!.maxRequests).toBe(30);
-      expect(ENDPOINT_LIMITS['/token']!.windowMs).toBe(60_000);
-    });
-
-    it('/turn/credentials allows 20 per minute', () => {
-      expect(ENDPOINT_LIMITS['/turn/credentials']!.maxRequests).toBe(20);
-      expect(ENDPOINT_LIMITS['/turn/credentials']!.windowMs).toBe(60_000);
-    });
-
-    it('/ws allows 8 per 10 seconds', () => {
-      expect(ENDPOINT_LIMITS['/ws']!.maxRequests).toBe(8);
-      expect(ENDPOINT_LIMITS['/ws']!.windowMs).toBe(10_000);
-    });
-  });
-});
+// Per-endpoint request limiting is now the native Workers Rate Limiting
+// binding (see mock-do.ts `createMockRateLimit`); enforcement is exercised
+// end-to-end through the DO in "DO rate limiting integration" below.
 
 describe('rateLimitResponse', () => {
   it('returns 429 with Retry-After header', async () => {
