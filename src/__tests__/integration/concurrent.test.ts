@@ -211,10 +211,12 @@ describe('Concurrent connections integration [T3.11]', () => {
 
       const token = await setupDevice('agent-ws-limit', 'host');
 
-      // Open connections up to the limit
+      // Open connections up to the limit. Register each in getWebSockets()
+      // (as the real runtime does on upgrade) so the cap check counts them.
       const sockets: MockWebSocket[] = [];
       for (let i = 0; i < MAX_WS_CONNECTIONS_PER_DEVICE; i++) {
         const ws = new MockWebSocket();
+        mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
         await doInstance.webSocketMessage(
           ws as unknown as WebSocket,
           JSON.stringify({ type: 'auth', token })
@@ -343,9 +345,11 @@ describe('Concurrent connections integration [T3.11]', () => {
       // After rebuild, wsConnectionCounts should reflect the 3 hibernated sockets
       expect(freshDO.getWsConnectionCount('agent-ws-hibernate')).toBe(3);
 
-      // Verify the limit is still enforced: open 2 more (to reach 5), then the 6th fails
+      // Verify the limit is still enforced: open 2 more (to reach 5), then the 6th fails.
+      // Register each in getWebSockets() so the source-of-truth cap check counts them.
       for (let i = 0; i < 2; i++) {
         const ws = new MockWebSocket();
+        mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
         await freshDO.webSocketMessage(
           ws as unknown as WebSocket,
           JSON.stringify({ type: 'auth', token })
