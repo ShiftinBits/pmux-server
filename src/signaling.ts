@@ -12,10 +12,8 @@ import type { DeviceType, SignalingClientMessage, HostOnlineMessage } from '@poc
 import { verifyEd25519Signature, createJWT, verifyJWT } from './auth';
 import { generateTurnCredentials } from './turn';
 import {
-  checkRateLimit,
   rateLimitResponse,
   MAX_WS_CONNECTIONS_PER_DEVICE,
-  type RateLimitStorage,
 } from './middleware/ratelimit';
 
 /** Maximum WebSocket message length in characters (16K — generous for SDP/ICE signaling). */
@@ -111,9 +109,17 @@ export class SignalingDO implements DurableObject {
     return this.state.storage.sql;
   }
 
-  /** Access DO storage as a RateLimitStorage for the rate limiter. */
-  private get rateLimitStorage(): RateLimitStorage {
-    return this.state.storage as unknown as RateLimitStorage;
+  /**
+   * Apply a native Workers Rate Limiting binding for the given key.
+   * Returns a 429 Response when over the limit, or null when allowed.
+   */
+  private async checkLimit(
+    limiter: RateLimit,
+    key: string,
+    retryAfter: number
+  ): Promise<Response | null> {
+    const { success } = await limiter.limit({ key });
+    return success ? null : rateLimitResponse(retryAfter);
   }
 
   // --- Schema initialization ---
@@ -511,37 +517,39 @@ export class SignalingDO implements DurableObject {
         });
       }
 
-      // Method matches — apply rate limiting and dispatch to handler
+      // Method matches — apply rate limiting and dispatch to handler.
+      // Keys are namespaced by endpoint so endpoints sharing a limiter
+      // binding (PAIR_LIMITER) keep independent counters.
       switch (url.pathname) {
         case '/pair/initiate': {
-          const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/pair/initiate');
-          if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+          const limited = await this.checkLimit(this.env.PAIR_LIMITER, `pair/initiate:${clientIp}`, 60);
+          if (limited) return limited;
           return this.handlePairInitiate(request);
         }
         case '/pair/complete': {
-          const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/pair/complete');
-          if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+          const limited = await this.checkLimit(this.env.PAIR_LIMITER, `pair/complete:${clientIp}`, 60);
+          if (limited) return limited;
           return this.handlePairComplete(request);
         }
         case '/token': {
           // Token uses IP as key since device ID comes from the request body (pre-auth)
-          const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/token');
-          if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+          const limited = await this.checkLimit(this.env.TOKEN_LIMITER, `token:${clientIp}`, 60);
+          if (limited) return limited;
           return this.handleTokenExchange(request);
         }
         case '/turn/credentials': {
-          const rl = await checkRateLimit(this.rateLimitStorage, deviceId || clientIp, '/turn/credentials');
-          if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+          const limited = await this.checkLimit(this.env.TURN_LIMITER, `turn:${deviceId || clientIp}`, 60);
+          if (limited) return limited;
           return this.handleTurnCredentials();
         }
         case '/pairing': {
-          const rl = await checkRateLimit(this.rateLimitStorage, deviceId || clientIp, '/pairing');
-          if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+          const limited = await this.checkLimit(this.env.PAIR_LIMITER, `pairing:${deviceId || clientIp}`, 60);
+          if (limited) return limited;
           return this.handleDeletePairing(request);
         }
         case '/device': {
-          const rl = await checkRateLimit(this.rateLimitStorage, deviceId || clientIp, '/device');
-          if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+          const limited = await this.checkLimit(this.env.PAIR_LIMITER, `device:${deviceId || clientIp}`, 60);
+          if (limited) return limited;
           return this.handleDeleteDevice(request);
         }
       }
@@ -549,8 +557,8 @@ export class SignalingDO implements DurableObject {
 
     // /ws has no method restriction (upgrade check is inside the handler)
     if (url.pathname === '/ws') {
-      const rl = await checkRateLimit(this.rateLimitStorage, clientIp, '/ws');
-      if (!rl.allowed) return rateLimitResponse(rl.retryAfter!);
+      const limited = await this.checkLimit(this.env.WS_LIMITER, `ws:${clientIp}`, 10);
+      if (limited) return limited;
       return this.handleWebSocketUpgrade(request);
     }
 

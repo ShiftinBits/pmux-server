@@ -26,6 +26,28 @@ bindings = [
 tag = "v1"
 new_sqlite_classes = ["SignalingDO"]
 
+# Native Workers Rate Limiting bindings (period must be 10 or 60).
+# Replaces the former custom DO-KV fixed-window limiter [SB-995].
+[[ratelimits]]
+name = "TOKEN_LIMITER"
+namespace_id = "1001"
+simple = { limit = 30, period = 60 }
+
+[[ratelimits]]
+name = "PAIR_LIMITER"
+namespace_id = "1002"
+simple = { limit = 10, period = 60 }
+
+[[ratelimits]]
+name = "TURN_LIMITER"
+namespace_id = "1003"
+simple = { limit = 20, period = 60 }
+
+[[ratelimits]]
+name = "WS_LIMITER"
+namespace_id = "1004"
+simple = { limit = 8, period = 10 }
+
 # Environment secrets (set via `wrangler secret put`):
 # - TURN_API_TOKEN
 # - TURN_TOKEN_ID

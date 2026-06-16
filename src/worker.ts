@@ -10,6 +10,11 @@ export interface Env {
   TURN_API_TOKEN: string;
   JWT_SECRET: string;
   PMUX_HMAC_SECRET?: string;  // Optional — enables client signature validation
+  // Native Workers Rate Limiting bindings (see wrangler.toml) [SB-995].
+  TOKEN_LIMITER: RateLimit;
+  PAIR_LIMITER: RateLimit;
+  TURN_LIMITER: RateLimit;
+  WS_LIMITER: RateLimit;
 }
 
 // Routes that don't require JWT authentication
