@@ -6,7 +6,12 @@ import {
   MAX_WS_CONNECTIONS_PER_DEVICE,
   type RateLimitStorage,
 } from '../middleware/ratelimit';
-import { createTestDOCompat as createTestDO, createMockKVStorage } from './helpers/mock-do';
+import {
+  createTestDOCompat as createTestDO,
+  createTestDO as createTestDOFull,
+  createMockKVStorage,
+  type MockDOState,
+} from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
 import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBody } from './helpers/crypto';
@@ -317,9 +322,12 @@ describe('DO rate limiting integration', () => {
 
 describe('WebSocket connection limits', () => {
   let doInstance: SignalingDO;
+  let mockState: MockDOState;
 
   beforeEach(async () => {
-    doInstance = await createTestDO();
+    const result = await createTestDOFull();
+    doInstance = result.doInstance;
+    mockState = result.mockState;
   });
 
   async function setupDevice(
@@ -369,9 +377,11 @@ describe('WebSocket connection limits', () => {
   it('rejects 6th WebSocket from same device with code 1008', async () => {
     const token = await setupDevice('agent-1', 'host');
 
-    // Open 5 connections
+    // Open 5 connections, registering each in getWebSockets() as the real
+    // runtime does on upgrade, so the source-of-truth cap check counts them.
     for (let i = 0; i < MAX_WS_CONNECTIONS_PER_DEVICE; i++) {
       const ws = new MockWebSocket();
+      mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
       await doInstance.webSocketMessage(
         ws as unknown as WebSocket,
         JSON.stringify({ type: 'auth', token })
@@ -449,9 +459,10 @@ describe('WebSocket connection limits', () => {
     const token1 = await setupDevice('agent-1', 'host');
     const token2 = await setupDevice('agent-2', 'host');
 
-    // Fill limit for device 1
+    // Fill limit for device 1, registering each socket in getWebSockets().
     for (let i = 0; i < MAX_WS_CONNECTIONS_PER_DEVICE; i++) {
       const ws = new MockWebSocket();
+      mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
       await doInstance.webSocketMessage(
         ws as unknown as WebSocket,
         JSON.stringify({ type: 'auth', token: token1 })

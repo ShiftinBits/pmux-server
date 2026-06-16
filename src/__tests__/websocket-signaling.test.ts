@@ -1070,6 +1070,36 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(ws6.closeCode).toBe(1008);
     });
 
+    it('enforces the limit from getWebSockets() after DO hibernation [SB-993]', async () => {
+      const token = await setupDevice('agent-1', 'host');
+
+      // Authenticate 5 WebSockets (the maximum), each registered with the runtime
+      for (let i = 0; i < 5; i++) {
+        const ws = new MockWebSocket();
+        mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
+        await doInstance.webSocketMessage(
+          ws as unknown as WebSocket,
+          JSON.stringify({ type: 'auth', token })
+        );
+        expect(ws.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+      }
+
+      // Simulate DO hibernation: the in-memory count map is wiped, but the 5
+      // sockets remain live in getWebSockets(). The stale map would read 0.
+      doInstance.clearWsConnectionCounts();
+
+      // 6th connection must STILL be rejected (count read from source of truth)
+      const ws6 = new MockWebSocket();
+      await doInstance.webSocketMessage(
+        ws6 as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token })
+      );
+
+      expect(ws6.lastMessage()).toEqual({ type: 'error', error: 'Too many WebSocket connections' });
+      expect(ws6.closed).toBe(true);
+      expect(ws6.closeCode).toBe(1008);
+    });
+
     it('returns "Device not found" for deleted device with valid JWT', async () => {
       // Register device, create JWT, then delete the device
       const token = await setupDevice('agent-1', 'host');

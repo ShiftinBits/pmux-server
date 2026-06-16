@@ -848,8 +848,11 @@ export class SignalingDO implements DurableObject {
     try {
       const payload = await verifyJWT(token, this.env.JWT_SECRET);
 
-      // Check WebSocket connection limit per device
-      const currentCount = this.wsConnectionCounts.get(payload.deviceId) ?? 0;
+      // Check WebSocket connection limit per device. Count from getWebSockets()
+      // (the runtime source of truth) rather than the in-memory wsConnectionCounts
+      // map, which is empty after DO hibernation and would let a device bypass the
+      // cap by timing connections to hit a hibernated DO [SB-993].
+      const currentCount = this.countOtherActiveWsForDevice(payload.deviceId, ws);
       if (currentCount >= MAX_WS_CONNECTIONS_PER_DEVICE) {
         console.warn(
           `[ws-limit] Rejected: deviceId=${payload.deviceId} connections=${currentCount} limit=${MAX_WS_CONNECTIONS_PER_DEVICE}`
