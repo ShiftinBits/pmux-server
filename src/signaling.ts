@@ -826,6 +826,11 @@ export class SignalingDO implements DurableObject {
    * Reads directly from the runtime's getWebSockets() — the source of truth
    * for open connections — so it is not affected by stale in-memory counts
    * that can occur after DO hibernation.
+   *
+   * Safe to use for the auth-time cap check (excludeWs = the socket being
+   * authenticated): the filter requires authenticated === true, so the
+   * not-yet-authenticated current socket is never counted, regardless of
+   * whether it already appears in getWebSockets().
    */
   private countOtherActiveWsForDevice(deviceId: string, excludeWs: WebSocket): number {
     if (!this.state.getWebSockets) return 0;
