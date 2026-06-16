@@ -169,6 +169,30 @@ describe('Rate limiting integration [T3.11]', () => {
       expect(complete.status).toBe(404); // Bad code, but NOT rate limited
     });
 
+    it('/pairing has its own counter, independent of /pair/initiate', async () => {
+      // Exhaust /pair/initiate for this IP
+      for (let i = 0; i < PAIR_LIMIT; i++) {
+        const body = await signedInitiateBody(`agent-pg-${i}`, `x25519-key-pg-${i}`);
+        await postJSON('/pair/initiate', body);
+      }
+      const blockedInitiate = await postJSON('/pair/initiate', {
+        deviceId: 'agent-pg-overflow',
+        ed25519PublicKey: 'pub',
+        x25519PublicKey: 'x25519',
+      });
+      expect(blockedInitiate.status).toBe(429);
+
+      // /pairing (DELETE) shares PAIR_LIMITER but is keyed separately, so it is
+      // NOT rate limited — it returns its handler's status, not 429.
+      const request = new Request('http://localhost/pairing', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', 'X-Client-IP': '192.168.1.1' },
+        body: JSON.stringify({ hostDeviceId: 'nonexistent' }),
+      });
+      const response = await doInstance.fetch(request);
+      expect(response.status).not.toBe(429);
+    });
+
     it('/token has its own limit (30/min)', async () => {
       const tokenLimit = TOKEN_LIMIT;
       expect(tokenLimit).toBe(30);

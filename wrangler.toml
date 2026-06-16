@@ -33,6 +33,9 @@ name = "TOKEN_LIMITER"
 namespace_id = "1001"
 simple = { limit = 30, period = 60 }
 
+# Shared by /pair/initiate, /pair/complete, /pairing, /device. Keys are
+# namespaced by endpoint in signaling.ts, so the 10/60s limit is per-endpoint
+# (independent counters), not a single shared bucket.
 [[ratelimits]]
 name = "PAIR_LIMITER"
 namespace_id = "1002"

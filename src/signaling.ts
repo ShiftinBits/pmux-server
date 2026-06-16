@@ -112,6 +112,11 @@ export class SignalingDO implements DurableObject {
   /**
    * Apply a native Workers Rate Limiting binding for the given key.
    * Returns a 429 Response when over the limit, or null when allowed.
+   *
+   * The limiter is a standard `env` binding (this.env), available inside the
+   * DO just as in the Worker. `retryAfter` is the binding's full window in
+   * seconds — the binding does not expose the exact reset time, so this is an
+   * upper bound, not the precise remaining time the old limiter computed.
    */
   private async checkLimit(
     limiter: RateLimit,

@@ -37,10 +37,9 @@ export function createMockRateLimit(limit: number): RateLimit & { counts: Map<st
   const counts = new Map<string, number>();
   return {
     counts,
-    async limit({ key }: { key?: string } = {}): Promise<{ success: boolean }> {
-      const k = key ?? '';
-      const n = (counts.get(k) ?? 0) + 1;
-      counts.set(k, n);
+    async limit({ key }: { key: string }): Promise<{ success: boolean }> {
+      const n = (counts.get(key) ?? 0) + 1;
+      counts.set(key, n);
       return { success: n <= limit };
     },
   } as RateLimit & { counts: Map<string, number> };
