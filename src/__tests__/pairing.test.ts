@@ -2,8 +2,11 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { createTestDOCompat as createTestDO, createTestDO as createTestDOFull } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
-import { generateEd25519Keypair, bytesToBase64, signEd25519, signedPairInitiateBody } from './helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, signEd25519, signedPairInitiateBodyWithChallenge } from './helpers/crypto';
 import type { SignalingDO } from '../signaling';
+
+// Valid 32-hex device ID for agent (format: hex(SHA-256(publicKey)[0:16]))
+const AGENT_1 = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
 
 let doInstance: SignalingDO;
 let keyPair: CryptoKeyPair;
@@ -32,7 +35,7 @@ async function postJSON(
 
 describe('POST /pair/initiate', () => {
   it('returns a pairing code', async () => {
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
     const { status, data } = await postJSON('/pair/initiate', body);
 
     expect(status).toBe(200);
@@ -41,10 +44,10 @@ describe('POST /pair/initiate', () => {
   });
 
   it('registers the agent device', async () => {
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
     await postJSON('/pair/initiate', body);
 
-    const device = doInstance.getDevice('agent-1');
+    const device = doInstance.getDevice(AGENT_1);
     expect(device).not.toBeNull();
     expect(device!.deviceType).toBe('host');
     expect(device!.ed25519PublicKey).toBe(ed25519PublicKeyBase64);
@@ -65,7 +68,7 @@ describe('POST /pair/initiate', () => {
 
   it('rejects missing fields', async () => {
     const { status, data } = await postJSON('/pair/initiate', {
-      deviceId: 'agent-1',
+      deviceId: AGENT_1,
       // missing publicKey, x25519PublicKey, timestamp, signature
     });
 
@@ -74,37 +77,37 @@ describe('POST /pair/initiate', () => {
   });
 
   it('stores host name when provided', async () => {
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', 'my-workstation');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', 'my-workstation');
     await postJSON('/pair/initiate', body);
 
-    const device = doInstance.getDevice('agent-1');
+    const device = doInstance.getDevice(AGENT_1);
     expect(device).not.toBeNull();
     expect(device!.name).toBe('my-workstation');
   });
 
   it('updates name on re-initiation', async () => {
     // First initiation with name
-    const body1 = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', 'old-name');
+    const body1 = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', 'old-name');
     await postJSON('/pair/initiate', body1);
 
     // Second initiation with a new name (device already exists)
-    const body2 = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', 'new-name');
+    const body2 = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', 'new-name');
     await postJSON('/pair/initiate', body2);
 
-    const device = doInstance.getDevice('agent-1');
+    const device = doInstance.getDevice(AGENT_1);
     expect(device!.name).toBe('new-name');
   });
 
   it('stores null name when not provided', async () => {
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
     await postJSON('/pair/initiate', body);
 
-    const device = doInstance.getDevice('agent-1');
+    const device = doInstance.getDevice(AGENT_1);
     expect(device!.name).toBeNull();
   });
 
   it('rejects name longer than 64 characters', async () => {
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', 'x'.repeat(65));
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', 'x'.repeat(65));
     const { status, data } = await postJSON('/pair/initiate', body);
 
     expect(status).toBe(400);
@@ -113,16 +116,16 @@ describe('POST /pair/initiate', () => {
 
   it('accepts name exactly 64 characters on initiate', async () => {
     const exactName = 'a'.repeat(64);
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', exactName);
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', exactName);
     const { status } = await postJSON('/pair/initiate', body);
 
     expect(status).toBe(200);
-    const device = doInstance.getDevice('agent-1');
+    const device = doInstance.getDevice(AGENT_1);
     expect(device!.name).toBe(exactName);
   });
 
   it('rejects name with ESC control character on initiate', async () => {
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', 'Evil\x1b[2JName');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', 'Evil\x1b[2JName');
     const { status, data } = await postJSON('/pair/initiate', body);
 
     expect(status).toBe(400);
@@ -131,7 +134,7 @@ describe('POST /pair/initiate', () => {
 
   it('rejects initiation with wrong key for existing device', async () => {
     // First initiation registers the device with keyPair (keyA)
-    const body1 = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', 'original-name');
+    const body1 = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent', 'original-name');
     await postJSON('/pair/initiate', body1);
 
     // Generate a second keypair (keyB)
@@ -140,7 +143,7 @@ describe('POST /pair/initiate', () => {
 
     // Second initiation uses keyB's public key and signature — should fail
     // because signature from keyB won't verify against stored keyA
-    const body2 = await signedPairInitiateBody('agent-1', keysB.keyPair, pubB, 'x25519-pub-key-agent', 'spoofed-name');
+    const body2 = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keysB.keyPair, pubB, 'x25519-pub-key-agent', 'spoofed-name');
     const { status, data } = await postJSON('/pair/initiate', body2);
 
     expect(status).toBe(401);
@@ -149,13 +152,13 @@ describe('POST /pair/initiate', () => {
 
   it('invalidates previous pairing code when re-initiating', async () => {
     // First initiation — get a pairing code
-    const body1 = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const body1 = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
     const first = await postJSON('/pair/initiate', body1);
     expect(first.status).toBe(200);
     const firstCode = first.data['pairingCode'] as string;
 
     // Second initiation — same host, new code replaces the old one
-    const body2 = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const body2 = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
     const second = await postJSON('/pair/initiate', body2);
     expect(second.status).toBe(200);
     const secondCode = second.data['pairingCode'] as string;
@@ -178,12 +181,12 @@ describe('POST /pair/initiate', () => {
       x25519PublicKey: 'x25519-pub-key-mobile',
     });
     expect(completeSecond.status).toBe(200);
-    expect(completeSecond.data['hostDeviceId']).toBe('agent-1');
+    expect(completeSecond.data['hostDeviceId']).toBe(AGENT_1);
   });
 
-  it('rejects missing timestamp and signature', async () => {
+  it('rejects missing nonce and signature', async () => {
     const { status, data } = await postJSON('/pair/initiate', {
-      deviceId: 'agent-1',
+      deviceId: AGENT_1,
       ed25519PublicKey: ed25519PublicKeyBase64,
       x25519PublicKey: 'x25519-pub-key-agent',
     });
@@ -193,12 +196,14 @@ describe('POST /pair/initiate', () => {
   });
 
   it('rejects invalid signature', async () => {
+    const { fetchChallenge: fc } = await import('./helpers/crypto');
+    const nonce = await fc(doInstance, AGENT_1);
     const badSig = bytesToBase64(new Uint8Array(64));
     const { status, data } = await postJSON('/pair/initiate', {
-      deviceId: 'agent-1',
+      deviceId: AGENT_1,
       ed25519PublicKey: ed25519PublicKeyBase64,
       x25519PublicKey: 'x25519-pub-key-agent',
-      timestamp: String(Math.floor(Date.now() / 1000)),
+      nonce,
       signature: badSig,
     });
 
@@ -206,45 +211,50 @@ describe('POST /pair/initiate', () => {
     expect(data['error']).toContain('Signature verification failed');
   });
 
-  it('rejects stale timestamp', async () => {
-    const staleTimestamp = String(Math.floor(Date.now() / 1000) - 600);
-    const message = new TextEncoder().encode('agent-1' + staleTimestamp);
-    const sig = await signEd25519(keyPair.privateKey, message);
+  it('rejects an expired nonce', async () => {
+    const { fetchChallenge: fc } = await import('./helpers/crypto');
+    const nonce = await fc(doInstance, AGENT_1);
 
-    const { status, data } = await postJSON('/pair/initiate', {
-      deviceId: 'agent-1',
-      ed25519PublicKey: ed25519PublicKeyBase64,
-      x25519PublicKey: 'x25519-pub-key-agent',
-      timestamp: staleTimestamp,
-      signature: bytesToBase64(sig),
-    });
+    // Advance time past 60s challenge TTL
+    const realDateNow = Date.now;
+    Date.now = () => realDateNow() + 70_000;
 
-    expect(status).toBe(401);
-    expect(data['error']).toContain('Timestamp out of range');
+    try {
+      const message = new TextEncoder().encode(AGENT_1 + '|' + nonce);
+      const sig = await signEd25519(keyPair.privateKey, message);
+
+      const { status, data } = await postJSON('/pair/initiate', {
+        deviceId: AGENT_1,
+        ed25519PublicKey: ed25519PublicKeyBase64,
+        x25519PublicKey: 'x25519-pub-key-agent',
+        nonce,
+        signature: bytesToBase64(sig),
+      });
+
+      expect(status).toBe(401);
+      expect(data['error']).toContain('Invalid or expired challenge');
+    } finally {
+      Date.now = realDateNow;
+    }
   });
 
-  it('rejects future timestamp', async () => {
-    const futureTimestamp = String(Math.floor(Date.now() / 1000) + 600);
-    const message = new TextEncoder().encode('agent-1' + futureTimestamp);
-    const sig = await signEd25519(keyPair.privateKey, message);
+  it('rejects a replayed nonce at pair/initiate', async () => {
+    // Use the nonce once successfully
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const first = await postJSON('/pair/initiate', body);
+    expect(first.status).toBe(200);
 
-    const { status, data } = await postJSON('/pair/initiate', {
-      deviceId: 'agent-1',
-      ed25519PublicKey: ed25519PublicKeyBase64,
-      x25519PublicKey: 'x25519-pub-key-agent',
-      timestamp: futureTimestamp,
-      signature: bytesToBase64(sig),
-    });
-
+    // Try to reuse the same nonce (it's already been consumed)
+    const { status, data } = await postJSON('/pair/initiate', body);
     expect(status).toBe(401);
-    expect(data['error']).toContain('Timestamp out of range');
+    expect(data['error']).toContain('Invalid or expired challenge');
   });
 });
 
 describe('POST /pair/complete', () => {
   it('completes pairing flow successfully', async () => {
     // Step 1: Agent initiates pairing
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
     const initResult = await postJSON('/pair/initiate', body);
     const pairingCode = initResult.data['pairingCode'] as string;
 
@@ -258,14 +268,14 @@ describe('POST /pair/complete', () => {
 
     expect(status).toBe(200);
     expect(data['hostX25519PublicKey']).toBe('x25519-pub-key-agent');
-    expect(data['hostDeviceId']).toBe('agent-1');
+    expect(data['hostDeviceId']).toBe(AGENT_1);
     // userId should NOT be in the response
     expect(data['userId']).toBeUndefined();
   });
 
   it('creates a pairing between host and mobile', async () => {
     // Initiate
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
     const initResult = await postJSON('/pair/initiate', body);
 
     // Complete
@@ -277,8 +287,8 @@ describe('POST /pair/complete', () => {
     });
 
     // Verify pairing exists
-    expect(doInstance.isPaired('agent-1', 'mobile-1')).toBe(true);
-    expect(doInstance.getPairedMobile('agent-1')).toBe('mobile-1');
+    expect(doInstance.isPaired(AGENT_1, 'mobile-1')).toBe(true);
+    expect(doInstance.getPairedMobile(AGENT_1)).toBe('mobile-1');
   });
 
   it('rejects invalid pairing code', async () => {
@@ -295,7 +305,7 @@ describe('POST /pair/complete', () => {
 
   it('rejects reused pairing code', async () => {
     // Initiate
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
     const initResult = await postJSON('/pair/initiate', body);
     const code = initResult.data['pairingCode'] as string;
 
@@ -321,7 +331,7 @@ describe('POST /pair/complete', () => {
 
   it('rejects expired pairing code', async () => {
     // Initiate
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
     const initResult = await postJSON('/pair/initiate', body);
     const code = initResult.data['pairingCode'] as string;
 
@@ -375,13 +385,13 @@ describe('POST /pair/complete', () => {
     }
 
     // Initiate pairing (registers the host device)
-    const initBody = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent');
+    const initBody = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, kp, pubBase64, 'x25519-pub-key-agent');
     const initResult = await post('/pair/initiate', initBody);
     expect(initResult.status).toBe(200);
     const pairingCode = initResult.data['pairingCode'] as string;
 
     // Create two WebSockets for the same host device (background agent + pair CLI)
-    const token = await createJWT('agent-1', 'host', JWT_SECRET);
+    const token = await createJWT(AGENT_1, 'host', JWT_SECRET);
 
     const agentWs = new MockWebSocket();
     const pairCliWs = new MockWebSocket();
@@ -438,7 +448,7 @@ describe('POST /pair/complete', () => {
     }
 
     // First pairing: agent-1 + mobile-1
-    const initBody1 = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent');
+    const initBody1 = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, kp, pubBase64, 'x25519-pub-key-agent');
     const init1 = await post('/pair/initiate', initBody1);
     const code1 = init1.data['pairingCode'] as string;
 
@@ -451,7 +461,7 @@ describe('POST /pair/complete', () => {
     expect(complete1.status).toBe(200);
 
     // Verify initial pairing
-    expect(do2.isPaired('agent-1', 'mobile-1')).toBe(true);
+    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(true);
 
     // Connect mobile-1 via WebSocket so it can receive notifications
     const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
@@ -466,7 +476,7 @@ describe('POST /pair/complete', () => {
     mobile1Ws.sent.length = 0;
 
     // Second pairing: agent-1 + mobile-2 (replaces mobile-1)
-    const initBody2 = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent');
+    const initBody2 = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, kp, pubBase64, 'x25519-pub-key-agent');
     const init2 = await post('/pair/initiate', initBody2);
     const code2 = init2.data['pairingCode'] as string;
 
@@ -479,18 +489,18 @@ describe('POST /pair/complete', () => {
     expect(complete2.status).toBe(200);
 
     // Verify new pairing replaced old one
-    expect(do2.isPaired('agent-1', 'mobile-2')).toBe(true);
-    expect(do2.isPaired('agent-1', 'mobile-1')).toBe(false);
+    expect(do2.isPaired(AGENT_1, 'mobile-2')).toBe(true);
+    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(false);
 
     // Old mobile should have received device_unpaired notification
     const unpairedMsgs = mobile1Ws.messagesOfType('device_unpaired');
     expect(unpairedMsgs).toHaveLength(1);
-    expect(unpairedMsgs[0]!['hostDeviceId']).toBe('agent-1');
+    expect(unpairedMsgs[0]!['hostDeviceId']).toBe(AGENT_1);
     expect(unpairedMsgs[0]!['reason']).toBe('replaced_by_new_pairing');
   });
 
   it('stores mobile name from /pair/complete', async () => {
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
     const initResult = await postJSON('/pair/initiate', body);
     const pairingCode = initResult.data['pairingCode'] as string;
 
@@ -527,13 +537,13 @@ describe('POST /pair/complete', () => {
     }
 
     // Initiate pairing
-    const initBody = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent');
+    const initBody = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, kp, pubBase64, 'x25519-pub-key-agent');
     const initResult = await post('/pair/initiate', initBody);
     expect(initResult.status).toBe(200);
     const pairingCode = initResult.data['pairingCode'] as string;
 
     // Connect host WebSocket
-    const token = await createJWT('agent-1', 'host', JWT_SECRET);
+    const token = await createJWT(AGENT_1, 'host', JWT_SECRET);
     const agentWs = new MockWebSocket();
     mockState.acceptedWebSockets.push(agentWs as unknown as WebSocket);
     await do2.webSocketMessage(agentWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token }));
@@ -573,12 +583,12 @@ describe('POST /pair/complete', () => {
     }
 
     // Initiate pairing
-    const initBody = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent');
+    const initBody = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, kp, pubBase64, 'x25519-pub-key-agent');
     const initResult = await post('/pair/initiate', initBody);
     const pairingCode = initResult.data['pairingCode'] as string;
 
     // Connect host WebSocket
-    const token = await createJWT('agent-1', 'host', JWT_SECRET);
+    const token = await createJWT(AGENT_1, 'host', JWT_SECRET);
     const agentWs = new MockWebSocket();
     mockState.acceptedWebSockets.push(agentWs as unknown as WebSocket);
     await do2.webSocketMessage(agentWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token }));
@@ -598,7 +608,7 @@ describe('POST /pair/complete', () => {
   });
 
   it('ignores mobile name over 64 chars', async () => {
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
     const initResult = await postJSON('/pair/initiate', body);
     const pairingCode = initResult.data['pairingCode'] as string;
 
@@ -617,7 +627,7 @@ describe('POST /pair/complete', () => {
   });
 
   it('ignores mobile name with control characters', async () => {
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
     const initResult = await postJSON('/pair/initiate', body);
     const pairingCode = initResult.data['pairingCode'] as string;
 
@@ -655,7 +665,7 @@ describe('POST /pair/complete', () => {
     }
 
     // First pairing: agent-1 + mobile-1
-    const initBody1 = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent');
+    const initBody1 = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, kp, pubBase64, 'x25519-pub-key-agent');
     const init1 = await post('/pair/initiate', initBody1);
     const code1 = init1.data['pairingCode'] as string;
 
@@ -665,7 +675,7 @@ describe('POST /pair/complete', () => {
       ed25519PublicKey: 'ed25519-pub-key-mobile-1',
       x25519PublicKey: 'x25519-pub-key-mobile-1',
     });
-    expect(do2.isPaired('agent-1', 'mobile-1')).toBe(true);
+    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(true);
 
     // Connect mobile-1 via WebSocket
     const mobile1Token = await createJWT('mobile-1', 'mobile', JWT_SECRET);
@@ -679,7 +689,7 @@ describe('POST /pair/complete', () => {
     mobile1Ws.sent.length = 0;
 
     // Same mobile re-pairs with same host
-    const initBody2 = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent-2');
+    const initBody2 = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, kp, pubBase64, 'x25519-pub-key-agent-2');
     const init2 = await post('/pair/initiate', initBody2);
     const code2 = init2.data['pairingCode'] as string;
 
@@ -691,7 +701,7 @@ describe('POST /pair/complete', () => {
     });
 
     // Pairing should still exist
-    expect(do2.isPaired('agent-1', 'mobile-1')).toBe(true);
+    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(true);
 
     // NO device_unpaired notification should have been sent
     const unpairedMsgs = mobile1Ws.messagesOfType('device_unpaired');
@@ -700,14 +710,14 @@ describe('POST /pair/complete', () => {
 
   it('returns 409 when a host device attempts to complete pairing as mobile', async () => {
     // Register agent-1 as a host via /pair/initiate
-    const body = await signedPairInitiateBody('agent-1', keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
     const initResult = await postJSON('/pair/initiate', body);
     const pairingCode = initResult.data['pairingCode'] as string;
 
     // Now try to complete pairing using the same device ID (agent-1) as mobile
     const { status, data } = await postJSON('/pair/complete', {
       pairingCode,
-      deviceId: 'agent-1', // already registered as 'host'
+      deviceId: AGENT_1, // already registered as 'host'
       ed25519PublicKey: ed25519PublicKeyBase64,
       x25519PublicKey: 'x25519-pub-key-agent',
     });
@@ -716,7 +726,7 @@ describe('POST /pair/complete', () => {
     expect(data['error']).toContain('Device type conflict');
 
     // Original device should still be a host
-    const device = doInstance.getDevice('agent-1');
+    const device = doInstance.getDevice(AGENT_1);
     expect(device).not.toBeNull();
     expect(device!.deviceType).toBe('host');
   });
@@ -741,7 +751,7 @@ describe('DELETE /pairing', () => {
     }
 
     // Create pairing
-    const initBody = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent', 'my-host');
+    const initBody = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, kp, pubBase64, 'x25519-pub-key-agent', 'my-host');
     const init = await post('/pair/initiate', initBody);
     await post('/pair/complete', {
       pairingCode: init.data['pairingCode'],
@@ -749,19 +759,19 @@ describe('DELETE /pairing', () => {
       ed25519PublicKey: 'ed25519-pub-key-mobile',
       x25519PublicKey: 'x25519-pub-key-mobile',
     });
-    expect(do2.isPaired('agent-1', 'mobile-1')).toBe(true);
+    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(true);
 
     // DELETE /pairing (simulates worker injecting X-Device-Id from JWT)
     const delReq = new Request('http://localhost/pairing', {
       method: 'DELETE',
-      headers: { 'X-Device-Id': 'agent-1' },
+      headers: { 'X-Device-Id': AGENT_1 },
     });
     const delRes = await do2.fetch(delReq);
     const delData = await delRes.json() as Record<string, unknown>;
 
     expect(delRes.status).toBe(200);
     expect(delData['removed']).toBe(true);
-    expect(do2.isPaired('agent-1', 'mobile-1')).toBe(false);
+    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(false);
   });
 
   it('notifies connected mobile with device_unpaired reason host_unpaired', async () => {
@@ -783,7 +793,7 @@ describe('DELETE /pairing', () => {
     }
 
     // Create pairing
-    const initBody = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent', 'my-host');
+    const initBody = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, kp, pubBase64, 'x25519-pub-key-agent', 'my-host');
     const init = await post('/pair/initiate', initBody);
     await post('/pair/complete', {
       pairingCode: init.data['pairingCode'],
@@ -805,7 +815,7 @@ describe('DELETE /pairing', () => {
     // DELETE /pairing
     const delReq = new Request('http://localhost/pairing', {
       method: 'DELETE',
-      headers: { 'X-Device-Id': 'agent-1' },
+      headers: { 'X-Device-Id': AGENT_1 },
     });
     await do2.fetch(delReq);
 
@@ -813,7 +823,7 @@ describe('DELETE /pairing', () => {
     const unpairedMsgs = mobileWs.messagesOfType('device_unpaired');
     expect(unpairedMsgs).toHaveLength(1);
     expect(unpairedMsgs[0]!['reason']).toBe('host_unpaired');
-    expect(unpairedMsgs[0]!['hostDeviceId']).toBe('agent-1');
+    expect(unpairedMsgs[0]!['hostDeviceId']).toBe(AGENT_1);
     expect(unpairedMsgs[0]!['hostName']).toBe('my-host');
   });
 
@@ -824,7 +834,7 @@ describe('DELETE /pairing', () => {
     const keys = await generateEd25519Keypair();
     const kp = keys.keyPair;
     const pubBase64 = bytesToBase64(keys.publicKeyRaw);
-    const initBody = await signedPairInitiateBody('agent-1', kp, pubBase64, 'x25519-pub-key-agent');
+    const initBody = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, kp, pubBase64, 'x25519-pub-key-agent');
     await do2.fetch(new Request('http://localhost/pair/initiate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -834,7 +844,7 @@ describe('DELETE /pairing', () => {
     // DELETE without completing pairing
     const delReq = new Request('http://localhost/pairing', {
       method: 'DELETE',
-      headers: { 'X-Device-Id': 'agent-1' },
+      headers: { 'X-Device-Id': AGENT_1 },
     });
     const delRes = await do2.fetch(delReq);
     const delData = await delRes.json() as Record<string, unknown>;

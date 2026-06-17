@@ -2,10 +2,13 @@ import { describe, it, expect } from 'vitest';
 import { createTestDO as createTestDOFull } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
-import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBody } from './helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge, fetchChallenge, signEd25519 } from './helpers/crypto';
 import type { SignalingDO } from '../signaling';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
+
+// Valid 32-hex device IDs (format: hex(SHA-256(publicKey)[0:16]))
+const HOST_1 = 'c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1';
 
 /** Helper: POST JSON to a DO instance. */
 async function postJSON(
@@ -42,8 +45,9 @@ async function setupPairedDevices(doInstance: SignalingDO, hostName?: string) {
   const hostKeys = await generateEd25519Keypair();
   const hostPubBase64 = bytesToBase64(hostKeys.publicKeyRaw);
 
-  const initBody = await signedPairInitiateBody(
-    'host-1',
+  const initBody = await signedPairInitiateBodyWithChallenge(
+    doInstance,
+    HOST_1,
     hostKeys.keyPair,
     hostPubBase64,
     'x25519-pub-key-host',
@@ -68,19 +72,19 @@ describe('DELETE /device', () => {
     await setupPairedDevices(doInstance, 'my-workstation');
 
     // Verify pairing exists before deletion
-    expect(doInstance.isPaired('host-1', 'mobile-1')).toBe(true);
-    expect(doInstance.getDevice('host-1')).not.toBeNull();
+    expect(doInstance.isPaired(HOST_1, 'mobile-1')).toBe(true);
+    expect(doInstance.getDevice(HOST_1)).not.toBeNull();
 
-    const { status, data } = await deleteDevice(doInstance, 'host-1');
+    const { status, data } = await deleteDevice(doInstance, HOST_1);
 
     expect(status).toBe(200);
     expect(data['removed']).toBe(true);
 
     // Pairing should be gone
-    expect(doInstance.isPaired('host-1', 'mobile-1')).toBe(false);
+    expect(doInstance.isPaired(HOST_1, 'mobile-1')).toBe(false);
 
     // Host device should be gone
-    expect(doInstance.getDevice('host-1')).toBeNull();
+    expect(doInstance.getDevice(HOST_1)).toBeNull();
   });
 
   it('returns { removed: false } for non-existent device', async () => {
@@ -98,20 +102,21 @@ describe('DELETE /device', () => {
     // Register host but don't complete pairing
     const hostKeys = await generateEd25519Keypair();
     const hostPubBase64 = bytesToBase64(hostKeys.publicKeyRaw);
-    const initBody = await signedPairInitiateBody(
-      'host-1',
+    const initBody = await signedPairInitiateBodyWithChallenge(
+      doInstance,
+      HOST_1,
       hostKeys.keyPair,
       hostPubBase64,
       'x25519-pub-key-host'
     );
     await postJSON(doInstance, '/pair/initiate', initBody);
-    expect(doInstance.getDevice('host-1')).not.toBeNull();
+    expect(doInstance.getDevice(HOST_1)).not.toBeNull();
 
-    const { status, data } = await deleteDevice(doInstance, 'host-1');
+    const { status, data } = await deleteDevice(doInstance, HOST_1);
 
     expect(status).toBe(200);
     expect(data['removed']).toBe(true);
-    expect(doInstance.getDevice('host-1')).toBeNull();
+    expect(doInstance.getDevice(HOST_1)).toBeNull();
   });
 
   it('notifies paired mobile with device_unpaired reason host_uninstalled', async () => {
@@ -128,12 +133,12 @@ describe('DELETE /device', () => {
     );
     mobileWs.sent.length = 0;
 
-    await deleteDevice(doInstance, 'host-1');
+    await deleteDevice(doInstance, HOST_1);
 
     const unpairedMsgs = mobileWs.messagesOfType('device_unpaired');
     expect(unpairedMsgs).toHaveLength(1);
     expect(unpairedMsgs[0]!['reason']).toBe('host_uninstalled');
-    expect(unpairedMsgs[0]!['hostDeviceId']).toBe('host-1');
+    expect(unpairedMsgs[0]!['hostDeviceId']).toBe(HOST_1);
     expect(unpairedMsgs[0]!['hostName']).toBe('my-workstation');
   });
 
@@ -144,7 +149,7 @@ describe('DELETE /device', () => {
     // Mobile device should exist before deletion
     expect(doInstance.getDevice('mobile-1')).not.toBeNull();
 
-    await deleteDevice(doInstance, 'host-1');
+    await deleteDevice(doInstance, HOST_1);
 
     // Mobile device should be removed (orphaned — no remaining pairings)
     expect(doInstance.getDevice('mobile-1')).toBeNull();
@@ -154,17 +159,18 @@ describe('DELETE /device', () => {
     const { doInstance } = await createTestDOFull();
     const { hostKeys, hostPubBase64 } = await setupPairedDevices(doInstance);
 
-    await deleteDevice(doInstance, 'host-1');
+    await deleteDevice(doInstance, HOST_1);
 
     // Try to exchange a token for the deleted host — should fail
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const message = new TextEncoder().encode('host-1' + timestamp);
-    const sig = await crypto.subtle.sign('Ed25519', hostKeys.keyPair.privateKey, message);
-    const sigBase64 = bytesToBase64(new Uint8Array(sig));
+    // Nonce fetch succeeds (device need not exist for challenge), but /token rejects unknown device
+    const nonce = await fetchChallenge(doInstance, HOST_1);
+    const message = new TextEncoder().encode(HOST_1 + '|' + nonce);
+    const sig = await signEd25519(hostKeys.keyPair.privateKey, message);
+    const sigBase64 = bytesToBase64(sig);
 
     const { status, data } = await postJSON(doInstance, '/token', {
-      deviceId: 'host-1',
-      timestamp,
+      deviceId: HOST_1,
+      nonce,
       signature: sigBase64,
     });
 
