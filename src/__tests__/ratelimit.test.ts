@@ -10,7 +10,13 @@ import {
 } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
-import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBody } from './helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge } from './helpers/crypto';
+
+/** Pad an arbitrary string to a 32-hex device ID (test-only helper). */
+function toHex32(s: string): string {
+  const hex = Array.from(s).map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+  return hex.slice(0, 32).padEnd(32, '0');
+}
 import type { SignalingDO } from '../signaling';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
@@ -63,8 +69,8 @@ describe('DO rate limiting integration', () => {
     it('allows pairing requests under the limit', async () => {
       for (let i = 0; i < 10; i++) {
         const keys = await generateEd25519Keypair();
-        const body = await signedPairInitiateBody(
-          `agent-${i}`, keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
+        const body = await signedPairInitiateBodyWithChallenge(
+          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
         );
         const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
@@ -75,8 +81,8 @@ describe('DO rate limiting integration', () => {
       // Send 10 requests (the limit)
       for (let i = 0; i < 10; i++) {
         const keys = await generateEd25519Keypair();
-        const body = await signedPairInitiateBody(
-          `agent-${i}`, keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
+        const body = await signedPairInitiateBodyWithChallenge(
+          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
         );
         const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
@@ -97,8 +103,8 @@ describe('DO rate limiting integration', () => {
       // Exhaust /pair/initiate limit
       for (let i = 0; i < 10; i++) {
         const keys = await generateEd25519Keypair();
-        const body = await signedPairInitiateBody(
-          `agent-${i}`, keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
+        const body = await signedPairInitiateBodyWithChallenge(
+          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
         );
         await postJSON('/pair/initiate', body);
       }
@@ -118,8 +124,8 @@ describe('DO rate limiting integration', () => {
       // Fill limit for IP 1
       for (let i = 0; i < 10; i++) {
         const keys = await generateEd25519Keypair();
-        const body = await signedPairInitiateBody(
-          `agent-${i}`, keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
+        const body = await signedPairInitiateBodyWithChallenge(
+          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
         );
         await postJSON('/pair/initiate', body, { 'X-Client-IP': '10.0.0.1' });
       }
@@ -134,8 +140,8 @@ describe('DO rate limiting integration', () => {
 
       // IP 2 is still allowed
       const keys = await generateEd25519Keypair();
-      const body = await signedPairInitiateBody(
-        'agent-allowed', keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-allowed'
+      const body = await signedPairInitiateBodyWithChallenge(
+        doInstance, toHex32('agent-allowed'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-allowed'
       );
       const allowed = await postJSON('/pair/initiate', body, { 'X-Client-IP': '10.0.0.2' });
       expect(allowed.status).toBe(200);
@@ -143,15 +149,17 @@ describe('DO rate limiting integration', () => {
   });
 
   describe('token rate limits', () => {
+    const fakeId = 'ee' + '0'.repeat(30); // valid 32-hex, no device registered
+
     it('allows token requests under the limit', async () => {
-      // Send 30 token requests (the limit) — they'll fail (unknown device) but should not be rate limited
+      // Send 30 token requests (the limit) — they'll fail (invalid challenge) but should not be rate limited
       for (let i = 0; i < 30; i++) {
         const { status } = await postJSON('/token', {
-          deviceId: 'nonexistent-device',
-          timestamp: String(Math.floor(Date.now() / 1000)),
+          deviceId: fakeId,
+          nonce: 'fake-nonce',
           signature: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
         });
-        // 401 because device is unknown, but NOT 429
+        // 401 because nonce is invalid, but NOT 429
         expect(status).toBe(401);
       }
     });
@@ -160,16 +168,16 @@ describe('DO rate limiting integration', () => {
       // Send 30 requests (the limit)
       for (let i = 0; i < 30; i++) {
         await postJSON('/token', {
-          deviceId: 'nonexistent-device',
-          timestamp: String(Math.floor(Date.now() / 1000)),
+          deviceId: fakeId,
+          nonce: 'fake-nonce',
           signature: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
         });
       }
 
       // 31st should be rate limited
       const { status, data } = await postJSON('/token', {
-        deviceId: 'nonexistent-device',
-        timestamp: String(Math.floor(Date.now() / 1000)),
+        deviceId: fakeId,
+        nonce: 'fake-nonce',
         signature: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
       });
       expect(status).toBe(429);
@@ -383,8 +391,8 @@ describe('pairing code expiry enforcement', () => {
   it('rejects pairing code after 5-minute expiry', async () => {
     // Create pairing session
     const keys = await generateEd25519Keypair();
-    const body = await signedPairInitiateBody(
-      'agent-1', keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-agent'
+    const body = await signedPairInitiateBodyWithChallenge(
+      doInstance, toHex32('agent-1'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-agent'
     );
     const initResult = await postJSON('/pair/initiate', body);
     const code = initResult.data['pairingCode'] as string;
@@ -405,8 +413,8 @@ describe('pairing code expiry enforcement', () => {
 
   it('accepts pairing code within 5-minute window', async () => {
     const keys = await generateEd25519Keypair();
-    const body = await signedPairInitiateBody(
-      'agent-1', keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-agent'
+    const body = await signedPairInitiateBodyWithChallenge(
+      doInstance, toHex32('agent-1'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-agent'
     );
     const initResult = await postJSON('/pair/initiate', body);
     const code = initResult.data['pairingCode'] as string;
@@ -457,8 +465,8 @@ describe('legitimate usage patterns', () => {
   it('normal pairing flow stays under limits', async () => {
     // A normal user: 1 pair/initiate + 1 pair/complete
     const keys = await generateEd25519Keypair();
-    const body = await signedPairInitiateBody(
-      'agent-1', keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-agent'
+    const body = await signedPairInitiateBodyWithChallenge(
+      doInstance, toHex32('agent-1'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-agent'
     );
     const initResult = await postJSON('/pair/initiate', body);
     expect(initResult.status).toBe(200);
@@ -474,14 +482,15 @@ describe('legitimate usage patterns', () => {
 
   it('multiple token refreshes from different IPs stay under limits', async () => {
     // 5 token requests from each of 3 different IPs = 15 total, all under the 30/min per IP
+    const fakeId = 'dd' + '0'.repeat(30); // valid 32-hex
     for (let ip = 1; ip <= 3; ip++) {
       for (let i = 0; i < 5; i++) {
         const { status } = await postJSON('/token', {
-          deviceId: 'device-1',
-          timestamp: String(Math.floor(Date.now() / 1000)),
+          deviceId: fakeId,
+          nonce: 'fake-nonce',
           signature: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
         }, { 'X-Client-IP': `10.0.0.${ip}` });
-        // Expect 401 (bad sig) not 429 (rate limited)
+        // Expect 401 (invalid challenge) not 429 (rate limited)
         expect(status).toBe(401);
       }
     }

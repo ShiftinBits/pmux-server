@@ -14,11 +14,16 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDO } from '../helpers/mock-do';
 import { MockWebSocket } from '../helpers/mock-websocket';
 import { verifyJWT, createJWT } from '../../auth';
-import { generateEd25519Keypair, bytesToBase64, signEd25519, signedPairInitiateBody } from '../helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, signEd25519, fetchChallenge, signedPairInitiateBodyWithChallenge } from '../helpers/crypto';
 import type { SignalingDO } from '../../signaling';
 import type { MockDOState } from '../helpers/mock-do';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
+
+// Valid 32-hex device IDs (format: hex(SHA-256(publicKey)[0:16]))
+const AGENT_INTEG = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
+const MOBILE_INTEG = 'b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1';
+const AGENT_WRONG_KEY = 'cccccccccccccccccccccccccccccccc';
 
 let doInstance: SignalingDO;
 let mockState: MockDOState;
@@ -90,7 +95,7 @@ describe('Full auth flow integration [T3.11]', () => {
     const mobilePubBase64 = bytesToBase64(mobileKeys.publicKeyRaw);
 
     // 2. Agent initiates pairing
-    const initBody = await signedPairInitiateBody('agent-integ', agentKeys.keyPair, agentPubBase64, 'agent-x25519-pub');
+    const initBody = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_INTEG, agentKeys.keyPair, agentPubBase64, 'agent-x25519-pub');
     const initResult = await postJSON('/pair/initiate', initBody);
     expect(initResult.status).toBe(200);
     const pairingCode = initResult.data['pairingCode'] as string;
@@ -99,28 +104,28 @@ describe('Full auth flow integration [T3.11]', () => {
     // 3. Mobile completes pairing
     const completeResult = await postJSON('/pair/complete', {
       pairingCode,
-      deviceId: 'mobile-integ',
+      deviceId: MOBILE_INTEG,
       ed25519PublicKey: mobilePubBase64,
       x25519PublicKey: 'mobile-x25519-pub',
     });
     expect(completeResult.status).toBe(200);
-    expect(completeResult.data['hostDeviceId']).toBe('agent-integ');
+    expect(completeResult.data['hostDeviceId']).toBe(AGENT_INTEG);
     expect(completeResult.data['hostX25519PublicKey']).toBe('agent-x25519-pub');
     // No userId in response
     expect(completeResult.data['userId']).toBeUndefined();
 
     // Verify pairing was created
-    expect(doInstance.isPaired('agent-integ', 'mobile-integ')).toBe(true);
+    expect(doInstance.isPaired(AGENT_INTEG, MOBILE_INTEG)).toBe(true);
 
     // 4. Agent exchanges signature for JWT
-    const agentTimestamp = String(Math.floor(Date.now() / 1000));
-    const agentMessage = new TextEncoder().encode('agent-integ' + agentTimestamp);
+    const agentNonce = await fetchChallenge(doInstance, AGENT_INTEG);
+    const agentMessage = new TextEncoder().encode(AGENT_INTEG + '|' + agentNonce);
     const agentSig = await signEd25519(agentKeys.keyPair.privateKey, agentMessage);
     const agentSigBase64 = bytesToBase64(agentSig);
 
     const agentTokenResult = await postJSON('/token', {
-      deviceId: 'agent-integ',
-      timestamp: agentTimestamp,
+      deviceId: AGENT_INTEG,
+      nonce: agentNonce,
       signature: agentSigBase64,
     });
     expect(agentTokenResult.status).toBe(200);
@@ -128,20 +133,20 @@ describe('Full auth flow integration [T3.11]', () => {
 
     // Verify the agent JWT has correct claims
     const agentPayload = await verifyJWT(agentJWT, JWT_SECRET);
-    expect(agentPayload.deviceId).toBe('agent-integ');
-    expect(agentPayload.sub).toBe('agent-integ');
+    expect(agentPayload.deviceId).toBe(AGENT_INTEG);
+    expect(agentPayload.sub).toBe(AGENT_INTEG);
     expect(agentPayload.aud).toBe('pocketmux');
     expect(agentPayload.deviceType).toBe('host');
 
     // 5. Mobile exchanges signature for JWT
-    const mobileTimestamp = String(Math.floor(Date.now() / 1000));
-    const mobileMessage = new TextEncoder().encode('mobile-integ' + mobileTimestamp);
+    const mobileNonce = await fetchChallenge(doInstance, MOBILE_INTEG);
+    const mobileMessage = new TextEncoder().encode(MOBILE_INTEG + '|' + mobileNonce);
     const mobileSig = await signEd25519(mobileKeys.keyPair.privateKey, mobileMessage);
     const mobileSigBase64 = bytesToBase64(mobileSig);
 
     const mobileTokenResult = await postJSON('/token', {
-      deviceId: 'mobile-integ',
-      timestamp: mobileTimestamp,
+      deviceId: MOBILE_INTEG,
+      nonce: mobileNonce,
       signature: mobileSigBase64,
     });
     expect(mobileTokenResult.status).toBe(200);
@@ -149,12 +154,12 @@ describe('Full auth flow integration [T3.11]', () => {
 
     // Verify the mobile JWT
     const mobilePayload = await verifyJWT(mobileJWT, JWT_SECRET);
-    expect(mobilePayload.deviceId).toBe('mobile-integ');
+    expect(mobilePayload.deviceId).toBe(MOBILE_INTEG);
     expect(mobilePayload.deviceType).toBe('mobile');
 
     // 6. Both connect via WebSocket and authenticate
     const hostWs = new MockWebSocket();
-    doInstance.setConnection('agent-integ', hostWs as unknown as WebSocket);
+    doInstance.setConnection(AGENT_INTEG, hostWs as unknown as WebSocket);
     await doInstance.webSocketMessage(
       hostWs as unknown as WebSocket,
       JSON.stringify({ type: 'auth', token: agentJWT })
@@ -162,7 +167,7 @@ describe('Full auth flow integration [T3.11]', () => {
     expect(hostWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
 
     const mobileWs = new MockWebSocket();
-    doInstance.setConnection('mobile-integ', mobileWs as unknown as WebSocket);
+    doInstance.setConnection(MOBILE_INTEG, mobileWs as unknown as WebSocket);
     await doInstance.webSocketMessage(
       mobileWs as unknown as WebSocket,
       JSON.stringify({ type: 'auth', token: mobileJWT })
@@ -173,12 +178,12 @@ describe('Full auth flow integration [T3.11]', () => {
     hostWs.sent.length = 0;
     await doInstance.webSocketMessage(
       mobileWs as unknown as WebSocket,
-      JSON.stringify({ type: 'connect_request', targetDeviceId: 'agent-integ' })
+      JSON.stringify({ type: 'connect_request', targetDeviceId: AGENT_INTEG })
     );
 
     const hostRequests = hostWs.messagesOfType('connect_request');
     expect(hostRequests).toHaveLength(1);
-    expect(hostRequests[0]!['targetDeviceId']).toBe('mobile-integ');
+    expect(hostRequests[0]!['targetDeviceId']).toBe(MOBILE_INTEG);
 
     // 8. SDP/ICE exchange
     mobileWs.sent.length = 0;
@@ -187,14 +192,14 @@ describe('Full auth flow integration [T3.11]', () => {
       JSON.stringify({
         type: 'sdp_offer',
         sdp: 'v=0\r\no=- 123 IN IP4 127.0.0.1\r\n',
-        targetDeviceId: 'mobile-integ',
+        targetDeviceId: MOBILE_INTEG,
       })
     );
 
     const offers = mobileWs.messagesOfType('sdp_offer');
     expect(offers).toHaveLength(1);
     expect(offers[0]!['sdp']).toContain('v=0');
-    expect(offers[0]!['targetDeviceId']).toBe('agent-integ');
+    expect(offers[0]!['targetDeviceId']).toBe(AGENT_INTEG);
 
     hostWs.sent.length = 0;
     await doInstance.webSocketMessage(
@@ -202,13 +207,13 @@ describe('Full auth flow integration [T3.11]', () => {
       JSON.stringify({
         type: 'sdp_answer',
         sdp: 'v=0\r\no=- 456 IN IP4 127.0.0.1\r\n',
-        targetDeviceId: 'agent-integ',
+        targetDeviceId: AGENT_INTEG,
       })
     );
 
     const answers = hostWs.messagesOfType('sdp_answer');
     expect(answers).toHaveLength(1);
-    expect(answers[0]!['targetDeviceId']).toBe('mobile-integ');
+    expect(answers[0]!['targetDeviceId']).toBe(MOBILE_INTEG);
 
     // ICE candidates
     mobileWs.sent.length = 0;
@@ -219,7 +224,7 @@ describe('Full auth flow integration [T3.11]', () => {
       JSON.stringify({
         type: 'ice_candidate',
         candidate: 'candidate:1 1 udp 2130706431 192.168.1.1 12345 typ host',
-        targetDeviceId: 'mobile-integ',
+        targetDeviceId: MOBILE_INTEG,
       })
     );
 
@@ -228,7 +233,7 @@ describe('Full auth flow integration [T3.11]', () => {
       JSON.stringify({
         type: 'ice_candidate',
         candidate: 'candidate:2 1 udp 2130706431 10.0.0.1 54321 typ host',
-        targetDeviceId: 'agent-integ',
+        targetDeviceId: AGENT_INTEG,
       })
     );
 
@@ -242,19 +247,19 @@ describe('Full auth flow integration [T3.11]', () => {
     const wrongKeys = await generateEd25519Keypair();
 
     // Register with the real public key via signed pair/initiate
-    const initBody = await signedPairInitiateBody(
-      'agent-wrong-key', realKeys.keyPair, bytesToBase64(realKeys.publicKeyRaw), 'x25519-key'
+    const initBody = await signedPairInitiateBodyWithChallenge(
+      doInstance, AGENT_WRONG_KEY, realKeys.keyPair, bytesToBase64(realKeys.publicKeyRaw), 'x25519-key'
     );
     await postJSON('/pair/initiate', initBody);
 
-    // Sign with the wrong private key
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const message = new TextEncoder().encode('agent-wrong-key' + timestamp);
+    // Fetch a nonce then sign with the wrong private key
+    const nonce = await fetchChallenge(doInstance, AGENT_WRONG_KEY);
+    const message = new TextEncoder().encode(AGENT_WRONG_KEY + '|' + nonce);
     const wrongSig = await signEd25519(wrongKeys.keyPair.privateKey, message);
 
     const result = await postJSON('/token', {
-      deviceId: 'agent-wrong-key',
-      timestamp,
+      deviceId: AGENT_WRONG_KEY,
+      nonce,
       signature: bytesToBase64(wrongSig),
     });
 

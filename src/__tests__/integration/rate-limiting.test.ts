@@ -11,7 +11,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createTestDO } from '../helpers/mock-do';
-import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBody } from '../helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge } from '../helpers/crypto';
 import type { SignalingDO } from '../../signaling';
 
 // Limits mirror the native Workers Rate Limiting bindings (wrangler.toml).
@@ -45,9 +45,16 @@ async function postJSON(
   return { status: response.status, data, response };
 }
 
+/** Pad an arbitrary string to a 32-hex device ID for testing (ponytail: test-only, not real derivation). */
+function toTestDeviceId(s: string): string {
+  const hex = Array.from(s).map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+  return hex.slice(0, 32).padEnd(32, '0');
+}
+
 async function signedInitiateBody(deviceId: string, x25519Key: string) {
   const keys = await generateEd25519Keypair();
-  return signedPairInitiateBody(deviceId, keys.keyPair, bytesToBase64(keys.publicKeyRaw), x25519Key);
+  const hexId = toTestDeviceId(deviceId);
+  return signedPairInitiateBodyWithChallenge(doInstance, hexId, keys.keyPair, bytesToBase64(keys.publicKeyRaw), x25519Key);
 }
 
 describe('Rate limiting integration [T3.11]', () => {
@@ -197,11 +204,12 @@ describe('Rate limiting integration [T3.11]', () => {
       const tokenLimit = TOKEN_LIMIT;
       expect(tokenLimit).toBe(30);
 
-      // Send 30 token requests (all fail with 401 but should not be rate limited)
+      // Send 30 token requests (all fail with 401/missing-nonce but should not be rate limited)
+      const fakeDeviceId = 'ee' + '0'.repeat(30); // valid 32-hex
       for (let i = 0; i < tokenLimit; i++) {
         const { status } = await postJSON('/token', {
-          deviceId: 'nonexistent',
-          timestamp: String(Math.floor(Date.now() / 1000)),
+          deviceId: fakeDeviceId,
+          nonce: 'fake-nonce',
           signature: bytesToBase64(new Uint8Array(64)),
         });
         expect(status).toBe(401);
@@ -209,8 +217,8 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // 31st should be rate limited
       const { status } = await postJSON('/token', {
-        deviceId: 'nonexistent',
-        timestamp: String(Math.floor(Date.now() / 1000)),
+        deviceId: fakeDeviceId,
+        nonce: 'fake-nonce',
         signature: bytesToBase64(new Uint8Array(64)),
       });
       expect(status).toBe(429);

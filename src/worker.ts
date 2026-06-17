@@ -20,6 +20,7 @@ export interface Env {
 // Routes that don't require JWT authentication
 export const PUBLIC_PATHS = new Set([
   '/health',
+  '/auth/challenge',
   '/auth/pair/initiate',
   '/auth/pair/complete',
   '/auth/token',
