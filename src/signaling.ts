@@ -448,7 +448,10 @@ export class SignalingDO implements DurableObject {
    */
   consumeChallenge(nonce: string, deviceId: string): boolean {
     this.ensureSchema();
-    this.cleanExpiredChallenges();
+    // No expiry sweep here: the unconditional DELETE below removes this nonce,
+    // and the `expires_at > Date.now()` check rejects an expired one. Sweeping
+    // first would race a nonce expiring at the exact TTL boundary into a
+    // spurious failure. Storage hygiene is handled by createChallenge's sweep.
 
     const rows = this.sql.exec(
       'SELECT device_id, expires_at FROM challenges WHERE nonce = ?',

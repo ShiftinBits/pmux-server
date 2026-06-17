@@ -151,11 +151,8 @@ describe('POST /token', () => {
     const first = await postJSON('/token', { deviceId: AGENT_1, nonce, signature: signatureBase64 });
     expect(first.status).toBe(200);
 
-    // Second use with the same nonce — must be rejected
-    // Need a fresh registration since the first call consumed the device's pairing session
-    const { keyPair: kp2, publicKeyRaw: pkr2 } = await generateEd25519Keypair();
-    await registerAgentDevice(AGENT_2, bytesToBase64(pkr2), kp2);
-    // For agent-1, re-use the exact same nonce (which was already consumed)
+    // Second use with the same nonce — must be rejected. The first call deleted
+    // the nonce (single-use); the device itself is unaffected.
     const replayResult = await postJSON('/token', {
       deviceId: AGENT_1,
       nonce,

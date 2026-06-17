@@ -56,17 +56,19 @@ export async function signedPairInitiateBody(
   name?: string,
   nonce?: string
 ): Promise<Record<string, string>> {
-  // nonce must be provided; callers that pre-fetched it pass it in.
-  // If omitted, fall back to a dummy value (legacy callers that haven't migrated yet
-  // will fail at the server — this keeps the signature intact for those tests).
-  const resolvedNonce = nonce ?? 'LEGACY_PLACEHOLDER';
-  const message = new TextEncoder().encode(deviceId + '|' + resolvedNonce);
+  // nonce must be provided; callers pre-fetch it via fetchChallenge (or use
+  // signedPairInitiateBodyWithChallenge). Fail loudly rather than signing a
+  // placeholder that mysteriously 401s at the server.
+  if (nonce === undefined) {
+    throw new Error('signedPairInitiateBody: nonce is required; use signedPairInitiateBodyWithChallenge');
+  }
+  const message = new TextEncoder().encode(deviceId + '|' + nonce);
   const signature = await signEd25519(keyPair.privateKey, message);
   return {
     deviceId,
     ed25519PublicKey: ed25519PublicKeyBase64,
     x25519PublicKey,
-    nonce: resolvedNonce,
+    nonce,
     signature: bytesToBase64(signature),
     ...(name !== undefined ? { name } : {}),
   };
