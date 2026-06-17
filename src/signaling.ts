@@ -167,6 +167,14 @@ export class SignalingDO implements DurableObject {
       )
     `);
 
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS challenges (
+        nonce TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+      )
+    `);
+
     this.initialized = true;
   }
 
@@ -409,6 +417,56 @@ export class SignalingDO implements DurableObject {
     this.sql.exec('DELETE FROM pairing_sessions WHERE expires_at <= ?', Date.now());
   }
 
+  // --- Challenge management ---
+
+  /**
+   * Create a single-use nonce challenge for a device. Nonce is 32 random bytes
+   * base64-encoded, with a 60-second TTL.
+   */
+  createChallenge(deviceId: string): string {
+    this.ensureSchema();
+    this.cleanExpiredChallenges();
+
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    const nonce = btoa(String.fromCharCode(...bytes));
+
+    this.sql.exec(
+      'INSERT INTO challenges (nonce, device_id, expires_at) VALUES (?, ?, ?)',
+      nonce,
+      deviceId,
+      Date.now() + 60_000
+    );
+
+    return nonce;
+  }
+
+  /**
+   * Consume a nonce challenge: deletes the nonce unconditionally (single-use)
+   * and returns true only if a matching row existed, device_id matched, and it
+   * was not expired.
+   */
+  consumeChallenge(nonce: string, deviceId: string): boolean {
+    this.ensureSchema();
+    this.cleanExpiredChallenges();
+
+    const rows = this.sql.exec(
+      'SELECT device_id, expires_at FROM challenges WHERE nonce = ?',
+      nonce
+    ).toArray();
+
+    // Delete unconditionally — single-use regardless of validity
+    this.sql.exec('DELETE FROM challenges WHERE nonce = ?', nonce);
+
+    if (rows.length === 0) return false;
+    const row = rows[0]!;
+    return (row['device_id'] as string) === deviceId && (row['expires_at'] as number) > Date.now();
+  }
+
+  private cleanExpiredChallenges(): void {
+    this.sql.exec('DELETE FROM challenges WHERE expires_at <= ?', Date.now());
+  }
+
   // --- WebSocket connection management ---
 
   /**
@@ -499,6 +557,7 @@ export class SignalingDO implements DurableObject {
 
   /** Allowed HTTP methods per path (excluding /ws which has no method restriction). */
   private static readonly ROUTE_METHODS: Record<string, string> = {
+    '/challenge': 'POST',
     '/pair/initiate': 'POST',
     '/pair/complete': 'POST',
     '/token': 'POST',
@@ -526,6 +585,12 @@ export class SignalingDO implements DurableObject {
       // Keys are namespaced by endpoint so endpoints sharing a limiter
       // binding (PAIR_LIMITER) keep independent counters.
       switch (url.pathname) {
+        case '/challenge': {
+          // ponytail: reuse TOKEN_LIMITER w/ namespaced key — no new wrangler binding; independent counter
+          const limited = await this.checkLimit(this.env.TOKEN_LIMITER, `challenge:${clientIp}`, 60);
+          if (limited) return limited;
+          return this.handleChallenge(request);
+        }
         case '/pair/initiate': {
           const limited = await this.checkLimit(this.env.PAIR_LIMITER, `pair/initiate:${clientIp}`, 60);
           if (limited) return limited;
@@ -1037,12 +1102,37 @@ export class SignalingDO implements DurableObject {
     }
   }
 
+  // --- Challenge endpoint [SB-996] ---
+
+  /**
+   * POST /challenge
+   * Issues a single-use nonce for a device to sign as part of Ed25519 auth.
+   * Body: { deviceId } (device need not exist yet — used at pair/initiate time too)
+   * Returns: { nonce } (base64, 32 random bytes, 60s TTL)
+   */
+  private async handleChallenge(request: Request): Promise<Response> {
+    let body: { deviceId?: unknown };
+    try {
+      body = await request.json() as typeof body;
+    } catch {
+      return jsonResponse({ error: 'Invalid JSON' }, 400);
+    }
+
+    const { deviceId } = body;
+    if (typeof deviceId !== 'string' || !/^[0-9a-f]{32}$/.test(deviceId)) {
+      return jsonResponse({ error: 'Missing or invalid deviceId (must be 32 lowercase hex chars)' }, 400);
+    }
+
+    const nonce = this.createChallenge(deviceId);
+    return jsonResponse({ nonce });
+  }
+
   // --- Pairing endpoints [T1.5] ---
 
   /**
    * POST /pair/initiate
    * Host calls this to start pairing. Creates a pairing session.
-   * Body: { deviceId, ed25519PublicKey, x25519PublicKey, timestamp, signature, name? }
+   * Body: { deviceId, ed25519PublicKey, x25519PublicKey, nonce, signature, name? }
    * Returns: { pairingCode }
    */
   private async handlePairInitiate(request: Request): Promise<Response> {
@@ -1050,7 +1140,7 @@ export class SignalingDO implements DurableObject {
       deviceId?: string;
       ed25519PublicKey?: string;
       x25519PublicKey?: string;
-      timestamp?: string;
+      nonce?: string;
       signature?: string;
       name?: string;
     };
@@ -1060,9 +1150,9 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Invalid JSON' }, 400);
     }
 
-    if (!body.deviceId || !body.ed25519PublicKey || !body.x25519PublicKey || !body.timestamp || !body.signature) {
+    if (!body.deviceId || !body.ed25519PublicKey || !body.x25519PublicKey || !body.nonce || !body.signature) {
       return jsonResponse(
-        { error: 'Missing required fields: deviceId, ed25519PublicKey, x25519PublicKey, timestamp, signature' },
+        { error: 'Missing required fields: deviceId, ed25519PublicKey, x25519PublicKey, nonce, signature' },
         400
       );
     }
@@ -1072,17 +1162,15 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Name must be a string of 1-64 characters with no control characters' }, 400);
     }
 
-    // Validate timestamp is within 5-minute window
-    const ts = parseInt(body.timestamp, 10);
-    const now = Math.floor(Date.now() / 1000);
-    if (isNaN(ts) || Math.abs(now - ts) > 300) {
-      return jsonResponse({ error: 'Timestamp out of range' }, 401);
+    // Consume the nonce challenge (single-use, validates expiry and device binding)
+    if (!this.consumeChallenge(body.nonce, body.deviceId)) {
+      return jsonResponse({ error: 'Invalid or expired challenge' }, 401);
     }
 
     // Verify signature against stored key (if device exists) or request body key
     const existing = this.getDevice(body.deviceId);
     const verifyKey = existing ? existing.ed25519PublicKey : body.ed25519PublicKey;
-    const message = new TextEncoder().encode(body.deviceId + body.timestamp);
+    const message = new TextEncoder().encode(body.deviceId + '|' + body.nonce);
     const publicKeyBytes = base64ToBytes(verifyKey);
     const signatureBytes = base64ToBytes(body.signature);
 
@@ -1213,30 +1301,28 @@ export class SignalingDO implements DurableObject {
   /**
    * POST /token
    * Device exchanges a signed challenge for a JWT.
-   * Body: { deviceId, timestamp, signature }
-   * signature = Ed25519.sign(privateKey, deviceId + timestamp)
+   * Body: { deviceId, nonce, signature }
+   * signature = Ed25519.sign(privateKey, deviceId + "|" + nonce)
    * Returns: { token }
    */
   private async handleTokenExchange(request: Request): Promise<Response> {
-    let body: { deviceId?: string; timestamp?: string; signature?: string };
+    let body: { deviceId?: string; nonce?: string; signature?: string };
     try {
       body = await request.json() as typeof body;
     } catch {
       return jsonResponse({ error: 'Invalid JSON' }, 400);
     }
 
-    if (!body.deviceId || !body.timestamp || !body.signature) {
+    if (!body.deviceId || !body.nonce || !body.signature) {
       return jsonResponse(
-        { error: 'Missing required fields: deviceId, timestamp, signature' },
+        { error: 'Missing required fields: deviceId, nonce, signature' },
         400
       );
     }
 
-    // Validate timestamp is recent (within 5 minutes) to prevent replay attacks
-    const ts = parseInt(body.timestamp, 10);
-    const now = Math.floor(Date.now() / 1000);
-    if (isNaN(ts) || Math.abs(now - ts) > 300) {
-      return jsonResponse({ error: 'Timestamp out of range' }, 401);
+    // Consume the nonce challenge first (single-use, validates expiry and device binding)
+    if (!this.consumeChallenge(body.nonce, body.deviceId)) {
+      return jsonResponse({ error: 'Invalid or expired challenge' }, 401);
     }
 
     // Look up the device to get its public key
@@ -1245,8 +1331,8 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Unknown device' }, 401);
     }
 
-    // Verify the signature: sign(privateKey, deviceId + timestamp)
-    const message = new TextEncoder().encode(body.deviceId + body.timestamp);
+    // Verify the signature: sign(privateKey, deviceId + "|" + nonce)
+    const message = new TextEncoder().encode(body.deviceId + '|' + body.nonce);
     const publicKeyBytes = base64ToBytes(device.ed25519PublicKey);
     const signatureBytes = base64ToBytes(body.signature);
 
