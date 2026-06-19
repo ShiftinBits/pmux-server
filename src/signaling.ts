@@ -93,6 +93,9 @@ const ALARM_INTERVAL_MS = 30_000; // 30 seconds
  * "host online" status goes stale within ~90-120s of the machine sleeping,
  * not the ~5min a laxer timeout allowed. Must stay >= 2× the presence
  * interval or a single dropped heartbeat would flap the host offline.
+ * Note: 3× assumes the agent's 30s default; at its 45s keepalive clamp cap
+ * this is exactly 2× (zero dropped-heartbeat margin) — don't raise that cap
+ * without revisiting this window.
  */
 const WS_IDLE_TIMEOUT_MS = 90_000; // 90 seconds
 
