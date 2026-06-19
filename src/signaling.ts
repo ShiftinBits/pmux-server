@@ -826,6 +826,21 @@ export class SignalingDO implements DurableObject {
     }
   }
 
+  /**
+   * A WebSocket is "fresh" if its last received message is within the idle
+   * timeout. A sleeping/frozen host stops sending heartbeats, but its socket
+   * lingers until the idle sweep reaps it (up to WS_IDLE_TIMEOUT_MS + one alarm
+   * interval later). Treating a stale socket as offline keeps presence accurate
+   * during that window — a mobile listing hosts or trying to connect sees the
+   * host as offline immediately, instead of being told it is online while it is
+   * actually asleep and unreachable.
+   */
+  private isWebSocketFresh(ws: WebSocket): boolean {
+    const att = ws.deserializeAttachment() as WsAttachment | null;
+    const last = att?.lastMessageTime ?? 0;
+    return last > 0 && Date.now() - last <= WS_IDLE_TIMEOUT_MS;
+  }
+
   // --- DO alarm handler (idle WS cleanup + expired pairing purge) ---
 
   /**
@@ -1019,7 +1034,7 @@ export class SignalingDO implements DurableObject {
         const pairedHosts = this.getHostsForMobile(payload.deviceId);
         for (const hostDeviceId of pairedHosts) {
           const hostWs = this.findWebSocket(hostDeviceId);
-          if (hostWs) {
+          if (hostWs && this.isWebSocketFresh(hostWs)) {
             const device = this.getDevice(hostDeviceId);
             const msg: HostOnlineMessage = { type: 'host_online', deviceId: hostDeviceId };
             if (device?.name) {
@@ -1058,9 +1073,12 @@ export class SignalingDO implements DurableObject {
       return;
     }
 
-    // Paired — check if target is online
+    // Paired — check if target is online. A stale socket (host asleep but not
+    // yet reaped by the idle sweep) is treated as offline so the mobile gets an
+    // immediate host_offline instead of a connect_request that never reaches a
+    // frozen host.
     const targetWs = this.findWebSocket(targetDeviceId);
-    if (!targetWs) {
+    if (!targetWs || !this.isWebSocketFresh(targetWs)) {
       // Paired but offline → send host_offline so mobile can schedule reconnect
       wsSend(ws, { type: 'host_offline', deviceId: targetDeviceId });
       return;

@@ -244,6 +244,29 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(onlineMessages[0]!['deviceId']).toBe('agent-1');
       expect(onlineMessages[0]!['name']).toBe('dev-server');
     });
+
+    it('omits a stale (asleep) host from the presence snapshot', async () => {
+      // Host connects and authenticates (fresh), then goes stale: its last
+      // heartbeat is older than the idle window (asleep, not yet reaped).
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const att = hostWs.deserializeAttachment() as Record<string, unknown>;
+      att.lastMessageTime = Date.now() - 100 * 1000; // 100s ago — past the 90s window
+      hostWs.serializeAttachment(att);
+
+      doInstance.registerDevice('mobile-1', 'pubkey-mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      // Mobile connects — the stale host must NOT be reported as online.
+      const mobileToken = await createJWT('mobile-1', 'mobile', JWT_SECRET);
+      const mobileWs = new MockWebSocket();
+      doInstance.setConnection('mobile-1', mobileWs as unknown as WebSocket);
+      await doInstance.webSocketMessage(
+        mobileWs as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: mobileToken })
+      );
+
+      expect(mobileWs.messagesOfType('host_online')).toHaveLength(0);
+    });
   });
 
   describe('host name update on auth [SB-358]', () => {
@@ -664,6 +687,29 @@ describe('WebSocket signaling [T1.8]', () => {
       // Should NOT receive a generic error
       const errors = mobileWs.messagesOfType('error');
       expect(errors).toHaveLength(0);
+    });
+
+    it('sends host_offline when the target host is stale (asleep, not yet reaped)', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      // Host's socket lingers but its last heartbeat is past the idle window.
+      const att = hostWs.deserializeAttachment() as Record<string, unknown>;
+      att.lastMessageTime = Date.now() - 100 * 1000;
+      hostWs.serializeAttachment(att);
+
+      hostWs.sent.length = 0;
+      mobileWs.sent.length = 0;
+
+      await doInstance.webSocketMessage(
+        mobileWs as unknown as WebSocket,
+        JSON.stringify({ type: 'connect_request', targetDeviceId: 'agent-1' })
+      );
+
+      // Mobile is told the host is offline; the frozen host is NOT relayed a request.
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+      expect(hostWs.messagesOfType('connect_request')).toHaveLength(0);
     });
 
     it('returns connection_rejected for connect_request to unpaired device', async () => {
