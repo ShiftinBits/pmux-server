@@ -82,10 +82,22 @@ export interface WsAttachment {
 }
 
 /** Interval (ms) between alarm-based cleanup sweeps. */
-const ALARM_INTERVAL_MS = 60_000; // 60 seconds
+const ALARM_INTERVAL_MS = 30_000; // 30 seconds
 
-/** Maximum idle time (ms) before a WebSocket is closed. */
-const WS_IDLE_TIMEOUT_MS = 5 * 60_000; // 5 minutes
+/**
+ * Maximum idle time (ms) before a WebSocket is closed.
+ *
+ * A sleeping/hibernated host is frozen, not disconnected — the OS sends no
+ * TCP FIN, so the only way the server learns the host is gone is this idle
+ * sweep. Kept tight (3× the agent's 30s presence heartbeat + grace) so a
+ * "host online" status goes stale within ~90-120s of the machine sleeping,
+ * not the ~5min a laxer timeout allowed. Must stay >= 2× the presence
+ * interval or a single dropped heartbeat would flap the host offline.
+ * Note: 3× assumes the agent's 30s default; at its 45s keepalive clamp cap
+ * this is exactly 2× (zero dropped-heartbeat margin) — don't raise that cap
+ * without revisiting this window.
+ */
+const WS_IDLE_TIMEOUT_MS = 90_000; // 90 seconds
 
 // --- Durable Object ---
 
@@ -817,6 +829,21 @@ export class SignalingDO implements DurableObject {
     }
   }
 
+  /**
+   * A WebSocket is "fresh" if its last received message is within the idle
+   * timeout. A sleeping/frozen host stops sending heartbeats, but its socket
+   * lingers until the idle sweep reaps it (up to WS_IDLE_TIMEOUT_MS + one alarm
+   * interval later). Treating a stale socket as offline keeps presence accurate
+   * during that window — a mobile listing hosts or trying to connect sees the
+   * host as offline immediately, instead of being told it is online while it is
+   * actually asleep and unreachable.
+   */
+  private isWebSocketFresh(ws: WebSocket): boolean {
+    const att = ws.deserializeAttachment() as WsAttachment | null;
+    const last = att?.lastMessageTime ?? 0;
+    return last > 0 && Date.now() - last <= WS_IDLE_TIMEOUT_MS;
+  }
+
   // --- DO alarm handler (idle WS cleanup + expired pairing purge) ---
 
   /**
@@ -1010,7 +1037,7 @@ export class SignalingDO implements DurableObject {
         const pairedHosts = this.getHostsForMobile(payload.deviceId);
         for (const hostDeviceId of pairedHosts) {
           const hostWs = this.findWebSocket(hostDeviceId);
-          if (hostWs) {
+          if (hostWs && this.isWebSocketFresh(hostWs)) {
             const device = this.getDevice(hostDeviceId);
             const msg: HostOnlineMessage = { type: 'host_online', deviceId: hostDeviceId };
             if (device?.name) {
@@ -1049,9 +1076,12 @@ export class SignalingDO implements DurableObject {
       return;
     }
 
-    // Paired — check if target is online
+    // Paired — check if target is online. A stale socket (host asleep but not
+    // yet reaped by the idle sweep) is treated as offline so the mobile gets an
+    // immediate host_offline instead of a connect_request that never reaches a
+    // frozen host.
     const targetWs = this.findWebSocket(targetDeviceId);
-    if (!targetWs) {
+    if (!targetWs || !this.isWebSocketFresh(targetWs)) {
       // Paired but offline → send host_offline so mobile can schedule reconnect
       wsSend(ws, { type: 'host_offline', deviceId: targetDeviceId });
       return;
