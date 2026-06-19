@@ -82,10 +82,19 @@ export interface WsAttachment {
 }
 
 /** Interval (ms) between alarm-based cleanup sweeps. */
-const ALARM_INTERVAL_MS = 60_000; // 60 seconds
+const ALARM_INTERVAL_MS = 30_000; // 30 seconds
 
-/** Maximum idle time (ms) before a WebSocket is closed. */
-const WS_IDLE_TIMEOUT_MS = 5 * 60_000; // 5 minutes
+/**
+ * Maximum idle time (ms) before a WebSocket is closed.
+ *
+ * A sleeping/hibernated host is frozen, not disconnected — the OS sends no
+ * TCP FIN, so the only way the server learns the host is gone is this idle
+ * sweep. Kept tight (3× the agent's 30s presence heartbeat + grace) so a
+ * "host online" status goes stale within ~90-120s of the machine sleeping,
+ * not the ~5min a laxer timeout allowed. Must stay >= 2× the presence
+ * interval or a single dropped heartbeat would flap the host offline.
+ */
+const WS_IDLE_TIMEOUT_MS = 90_000; // 90 seconds
 
 // --- Durable Object ---
 

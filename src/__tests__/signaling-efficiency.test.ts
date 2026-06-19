@@ -62,7 +62,7 @@ async function connectAndAuth(
 
 describe('Signaling server efficiency [T3.10]', () => {
   describe('idle WebSocket cleanup', () => {
-    it('closes WebSocket idle for more than 5 minutes', async () => {
+    it('closes WebSocket idle past the timeout', async () => {
       const { ws } = await connectAndAuth('agent-1', 'host');
 
       // Simulate that the WS has been idle for 6 minutes
@@ -78,15 +78,42 @@ describe('Signaling server efficiency [T3.10]', () => {
       expect(ws.closeReason).toBe('idle timeout');
     });
 
-    it('keeps active WebSocket alive (message within 5 minutes)', async () => {
+    it('keeps active WebSocket alive (message within idle timeout)', async () => {
       const { ws } = await connectAndAuth('agent-1', 'host');
 
-      // Simulate recent activity (2 minutes ago)
+      // Simulate recent activity (30 seconds ago — within the 90s idle window)
       const att = ws.deserializeAttachment() as Record<string, unknown>;
-      att.lastMessageTime = Date.now() - 2 * 60 * 1000; // 2 minutes ago
+      att.lastMessageTime = Date.now() - 30 * 1000; // 30 seconds ago
       ws.serializeAttachment(att);
 
       // Trigger alarm
+      await doInstance.alarm();
+
+      expect(ws.closed).toBe(false);
+    });
+
+    // Boundary tests pin the 90s timeout so a regression back to the old 5min
+    // window (or any value above ~2x the 30s presence heartbeat) is caught.
+    it('closes WebSocket just past the 90s threshold (91s idle)', async () => {
+      const { ws } = await connectAndAuth('agent-1', 'host');
+
+      const att = ws.deserializeAttachment() as Record<string, unknown>;
+      att.lastMessageTime = Date.now() - 91 * 1000; // 91s ago — just over 90s
+      ws.serializeAttachment(att);
+
+      await doInstance.alarm();
+
+      expect(ws.closed).toBe(true);
+      expect(ws.closeReason).toBe('idle timeout');
+    });
+
+    it('keeps WebSocket alive just under the 90s threshold (89s idle)', async () => {
+      const { ws } = await connectAndAuth('agent-1', 'host');
+
+      const att = ws.deserializeAttachment() as Record<string, unknown>;
+      att.lastMessageTime = Date.now() - 89 * 1000; // 89s ago — just under 90s
+      ws.serializeAttachment(att);
+
       await doInstance.alarm();
 
       expect(ws.closed).toBe(false);
