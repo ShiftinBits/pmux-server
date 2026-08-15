@@ -837,10 +837,34 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(hostCandidates[0]!['sdpMLineIndex']).toBe(0);
     });
 
-    it('silently drops relay to disconnected target', async () => {
+    it('sends peer_unavailable to sender when paired target is disconnected [SB-1000]', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      hostWs.sent.length = 0;
+
+      // Agent sends SDP offer to a paired mobile that never connected
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({
+          type: 'sdp_offer',
+          sdp: 'v=0\r\n...',
+          targetDeviceId: 'mobile-1',
+        })
+      );
+
+      // Sender is told the peer is unavailable so it can fail fast or retry
+      const unavailable = hostWs.messagesOfType('peer_unavailable');
+      expect(unavailable).toHaveLength(1);
+      expect(unavailable[0]!['deviceId']).toBe('mobile-1');
+    });
+
+    it('stays silent when unpaired sender targets a disconnected device [SB-1000]', async () => {
       const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
 
-      // Agent sends SDP offer to a mobile that never connected
+      hostWs.sent.length = 0;
+
+      // Agent sends SDP offer to an unpaired, disconnected device
       await doInstance.webSocketMessage(
         hostWs as unknown as WebSocket,
         JSON.stringify({
@@ -850,8 +874,9 @@ describe('WebSocket signaling [T1.8]', () => {
         })
       );
 
-      // Should not crash — message is silently dropped
-      // No error sent back for SDP/ICE relay (only connect_request gets error)
+      // No peer_unavailable — unpaired senders learn nothing about presence
+      expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+      expect(hostWs.messagesOfType('error')).toHaveLength(0);
     });
 
     it('strips unknown fields from relayed messages', async () => {
@@ -1086,6 +1111,9 @@ describe('WebSocket signaling [T1.8]', () => {
       // Mobile should NOT receive the offer
       const offers = mobileWs.messagesOfType('sdp_offer');
       expect(offers).toHaveLength(0);
+
+      // Sender gets no feedback either — no presence leak to unpaired devices
+      expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(0);
     });
   });
 
@@ -1365,6 +1393,11 @@ describe('WebSocket signaling [T1.8]', () => {
       // Mobile's actual WS should not have received the failed relay
       const mobileOffers = mobileWs.messagesOfType('sdp_offer');
       expect(mobileOffers).toHaveLength(0);
+
+      // Sender is notified the relay failed [SB-1000]
+      const unavailable = hostWs.messagesOfType('peer_unavailable');
+      expect(unavailable).toHaveLength(1);
+      expect(unavailable[0]!['deviceId']).toBe('mobile-1');
     });
   });
 });
