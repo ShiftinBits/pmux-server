@@ -1158,7 +1158,7 @@ export class SignalingDO implements DurableObject {
     if (!targetWs) {
       // Target disconnected mid-negotiation [SB-1000] — tell the sender so it
       // can fail fast or retry instead of stalling until its watchdog fires.
-      wsSend(ws, { type: 'peer_unavailable', deviceId: data.targetDeviceId });
+      this.sendPeerUnavailable(ws, data.targetDeviceId);
       return;
     }
 
@@ -1178,7 +1178,20 @@ export class SignalingDO implements DurableObject {
         this.connections.delete(data.targetDeviceId);
       }
       // Send to target failed — same failure mode as target-not-found [SB-1000]
-      wsSend(ws, { type: 'peer_unavailable', deviceId: data.targetDeviceId });
+      this.sendPeerUnavailable(ws, data.targetDeviceId);
+    }
+  }
+
+  /**
+   * Best-effort peer_unavailable notification to a relay sender [SB-1000].
+   * Guarded: if the sender's own socket is also dead, there is nothing left
+   * to notify — never let that propagate out of the message handler.
+   */
+  private sendPeerUnavailable(ws: WebSocket, deviceId: string): void {
+    try {
+      wsSend(ws, { type: 'peer_unavailable', deviceId });
+    } catch {
+      // Sender gone too — nothing to do
     }
   }
 
