@@ -755,7 +755,7 @@ export class SignalingDO implements DurableObject {
       case 'sdp_answer':
       case 'ice_candidate':
       case 'connection_rejected':
-        this.relaySignalingMessage(attachment, data);
+        this.relaySignalingMessage(ws, attachment, data);
         break;
 
       default:
@@ -1143,16 +1143,24 @@ export class SignalingDO implements DurableObject {
    * Only allows signaling between paired devices.
    */
   private relaySignalingMessage(
+    ws: WebSocket,
     sender: WsAttachment,
     data: { type: string; targetDeviceId: string; [key: string]: unknown }
   ): void {
-    const targetWs = this.findWebSocket(data.targetDeviceId);
-    if (!targetWs) return;
-
-    // Verify sender and target are paired (prevents cross-pairing signaling)
+    // Verify sender and target are paired (prevents cross-pairing signaling).
+    // Checked BEFORE the WS lookup so unpaired senders learn nothing about
+    // whether the target device exists or is online.
     const hostId = sender.deviceType === 'host' ? sender.deviceId : data.targetDeviceId;
     const mobileId = sender.deviceType === 'mobile' ? sender.deviceId : data.targetDeviceId;
     if (!this.isPaired(hostId, mobileId)) return;
+
+    const targetWs = this.findWebSocket(data.targetDeviceId);
+    if (!targetWs) {
+      // Target disconnected mid-negotiation [SB-1000] — tell the sender so it
+      // can fail fast or retry instead of stalling until its watchdog fires.
+      this.sendPeerUnavailable(ws, data.targetDeviceId);
+      return;
+    }
 
     // Relay only known fields — never spread untrusted data
     try {
@@ -1169,6 +1177,21 @@ export class SignalingDO implements DurableObject {
       if (this.connections.get(data.targetDeviceId) === targetWs) {
         this.connections.delete(data.targetDeviceId);
       }
+      // Send to target failed — same failure mode as target-not-found [SB-1000]
+      this.sendPeerUnavailable(ws, data.targetDeviceId);
+    }
+  }
+
+  /**
+   * Best-effort peer_unavailable notification to a relay sender [SB-1000].
+   * Guarded: if the sender's own socket is also dead, there is nothing left
+   * to notify — never let that propagate out of the message handler.
+   */
+  private sendPeerUnavailable(ws: WebSocket, deviceId: string): void {
+    try {
+      wsSend(ws, { type: 'peer_unavailable', deviceId });
+    } catch {
+      // Sender gone too — nothing to do
     }
   }
 
