@@ -180,6 +180,16 @@ export class SignalingDO implements DurableObject {
     `);
 
     this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS pending_pair_complete (
+        host_device_id TEXT PRIMARY KEY,
+        mobile_device_id TEXT NOT NULL,
+        mobile_x25519_public_key TEXT NOT NULL,
+        mobile_name TEXT,
+        created_at INTEGER NOT NULL
+      )
+    `);
+
+    this.sql.exec(`
       CREATE TABLE IF NOT EXISTS challenges (
         nonce TEXT PRIMARY KEY,
         device_id TEXT NOT NULL,
@@ -530,19 +540,23 @@ export class SignalingDO implements DurableObject {
    * Iterates hibernated WebSockets directly (not the 1:1 connections map)
    * so that every connection receives the message — critical when a device
    * has multiple concurrent connections (e.g., background agent + pair CLI).
+   * Returns the number of connections the message was sent to.
    */
-  private notifyDevice(deviceId: string, message: unknown): void {
-    if (!this.state.getWebSockets) return;
+  private notifyDevice(deviceId: string, message: unknown): number {
+    let delivered = 0;
+    if (!this.state.getWebSockets) return delivered;
     for (const ws of this.state.getWebSockets()) {
       const att = ws.deserializeAttachment() as WsAttachment | null;
       if (att?.authenticated && att.deviceId === deviceId) {
         try {
           wsSend(ws, message);
+          delivered++;
         } catch {
           // WebSocket may have disconnected
         }
       }
     }
+    return delivered;
   }
 
   // Backward-compatible helpers used by handlePairComplete and tests
@@ -1030,6 +1044,29 @@ export class SignalingDO implements DurableObject {
         if (pairedMobileId) {
           this.notifyDevice(pairedMobileId, hostOnlineMsg);
         }
+
+        // Deliver a pair_complete that was persisted while the host was offline.
+        // Only if the pairing still matches — it may have been replaced/removed since.
+        const pending = this.sql
+          .exec(
+            'SELECT mobile_device_id, mobile_x25519_public_key, mobile_name FROM pending_pair_complete WHERE host_device_id = ?',
+            payload.deviceId
+          )
+          .toArray()[0];
+        if (pending) {
+          if (pairedMobileId === pending['mobile_device_id']) {
+            // Broadcast to ALL host connections (this newly authed socket is
+            // already in getWebSockets() with an authenticated attachment),
+            // matching the live-delivery invariant for agent + pair CLI.
+            this.notifyDevice(payload.deviceId, {
+              type: 'pair_complete',
+              mobileDeviceId: pending['mobile_device_id'],
+              mobileX25519PublicKey: pending['mobile_x25519_public_key'],
+              ...(pending['mobile_name'] !== null && { mobileName: pending['mobile_name'] }),
+            });
+          }
+          this.sql.exec('DELETE FROM pending_pair_complete WHERE host_device_id = ?', payload.deviceId);
+        }
       }
 
       // If mobile, send current presence snapshot for all paired hosts that are connected.
@@ -1315,12 +1352,26 @@ export class SignalingDO implements DurableObject {
     // The host may have multiple connections (background agent + pair CLI).
     // After DO hibernation, the connections map only stores one per device,
     // so we iterate all WebSockets directly to ensure the pair CLI receives it.
-    this.notifyDevice(session.hostDeviceId, {
+    const delivered = this.notifyDevice(session.hostDeviceId, {
       type: 'pair_complete',
       mobileDeviceId: body.deviceId,
       mobileX25519PublicKey: body.x25519PublicKey,
       ...(mobileName !== undefined && { mobileName }),
     });
+
+    // Host offline — persist the pair_complete for delivery on its next WS auth.
+    // ponytail: no TTL cleanup — at most one row per host, consumed on next auth;
+    // add a purge to the alarm sweep if orphaned rows ever matter.
+    if (delivered === 0) {
+      this.sql.exec(
+        'INSERT OR REPLACE INTO pending_pair_complete (host_device_id, mobile_device_id, mobile_x25519_public_key, mobile_name, created_at) VALUES (?, ?, ?, ?, ?)',
+        session.hostDeviceId,
+        body.deviceId,
+        body.x25519PublicKey,
+        mobileName ?? null,
+        Date.now()
+      );
+    }
 
     return jsonResponse({
       hostX25519PublicKey: session.hostX25519PublicKey,
