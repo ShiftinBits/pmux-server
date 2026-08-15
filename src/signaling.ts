@@ -1055,7 +1055,10 @@ export class SignalingDO implements DurableObject {
           .toArray()[0];
         if (pending) {
           if (pairedMobileId === pending['mobile_device_id']) {
-            wsSend(ws, {
+            // Broadcast to ALL host connections (this newly authed socket is
+            // already in getWebSockets() with an authenticated attachment),
+            // matching the live-delivery invariant for agent + pair CLI.
+            this.notifyDevice(payload.deviceId, {
               type: 'pair_complete',
               mobileDeviceId: pending['mobile_device_id'],
               mobileX25519PublicKey: pending['mobile_x25519_public_key'],

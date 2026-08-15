@@ -434,10 +434,11 @@ describe('POST /pair/complete', () => {
 
     // Shared setup: initiate + complete pairing on a fresh DO, optionally with
     // a live host WebSocket connected during /pair/complete.
-    async function setupPairing(withLiveHostWs: boolean) {
+    async function setupPairing(withLiveHostWs: boolean, mobileName?: string) {
       const { doInstance: do2, mockState } = await createTestDOFull();
       const keys = await generateEd25519Keypair();
       const pubBase64 = bytesToBase64(keys.publicKeyRaw);
+      const keyPairForHost = keys.keyPair;
 
       async function post(path: string, body: unknown) {
         const req = new Request(`http://localhost${path}`, {
@@ -473,10 +474,25 @@ describe('POST /pair/complete', () => {
         deviceId: 'mobile-1',
         ed25519PublicKey: 'ed25519-pub-key-mobile',
         x25519PublicKey: 'x25519-pub-key-mobile',
+        ...(mobileName !== undefined && { name: mobileName }),
       });
       expect(completeResult.status).toBe(200);
 
-      return { do2, authHostWs, liveWs };
+      // Re-initiate + complete with a different mobile (host still offline)
+      async function repairWith(deviceId: string, x25519PublicKey: string) {
+        const reInitBody = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, keyPairForHost, pubBase64, 'x25519-pub-key-agent');
+        const reInit = await post('/pair/initiate', reInitBody);
+        expect(reInit.status).toBe(200);
+        const res = await post('/pair/complete', {
+          pairingCode: reInit.data['pairingCode'] as string,
+          deviceId,
+          ed25519PublicKey: `ed25519-pub-key-${deviceId}`,
+          x25519PublicKey,
+        });
+        expect(res.status).toBe(200);
+      }
+
+      return { do2, authHostWs, liveWs, repairWith };
     }
 
     it('delivers pair_complete on next host WS auth when host was offline', async () => {
@@ -520,6 +536,37 @@ describe('POST /pair/complete', () => {
       // Row is consumed even when stale — a later auth stays clean too
       const laterWs = await authHostWs();
       expect(laterWs.messagesOfType('pair_complete')).toHaveLength(0);
+    });
+
+    it('propagates mobileName through the deferred path', async () => {
+      const { authHostWs } = await setupPairing(false, 'my-phone');
+
+      const hostWs = await authHostWs();
+      const msgs = hostWs.messagesOfType('pair_complete');
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]['mobileName']).toBe('my-phone');
+    });
+
+    it('omits mobileName in the deferred message when not provided', async () => {
+      const { authHostWs } = await setupPairing(false);
+
+      const hostWs = await authHostWs();
+      const msgs = hostWs.messagesOfType('pair_complete');
+      expect(msgs).toHaveLength(1);
+      expect('mobileName' in msgs[0]).toBe(false);
+    });
+
+    it('re-pairing while host is offline overwrites the pending row', async () => {
+      const { authHostWs, repairWith } = await setupPairing(false);
+
+      // Second pairing (mobile-2) completes before the host ever reconnects
+      await repairWith('mobile-2', 'x25519-pub-key-mobile-2');
+
+      const hostWs = await authHostWs();
+      const msgs = hostWs.messagesOfType('pair_complete');
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]['mobileDeviceId']).toBe('mobile-2');
+      expect(msgs[0]['mobileX25519PublicKey']).toBe('x25519-pub-key-mobile-2');
     });
   });
 
