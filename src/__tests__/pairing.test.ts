@@ -429,6 +429,100 @@ describe('POST /pair/complete', () => {
     expect(pairCliMsgs[0]['mobileX25519PublicKey']).toBe('x25519-pub-key-mobile');
   });
 
+  describe('deferred pair_complete delivery (SB-1002)', () => {
+    const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
+
+    // Shared setup: initiate + complete pairing on a fresh DO, optionally with
+    // a live host WebSocket connected during /pair/complete.
+    async function setupPairing(withLiveHostWs: boolean) {
+      const { doInstance: do2, mockState } = await createTestDOFull();
+      const keys = await generateEd25519Keypair();
+      const pubBase64 = bytesToBase64(keys.publicKeyRaw);
+
+      async function post(path: string, body: unknown) {
+        const req = new Request(`http://localhost${path}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const res = await do2.fetch(req);
+        return { status: res.status, data: await res.json() as Record<string, unknown> };
+      }
+
+      const initBody = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, keys.keyPair, pubBase64, 'x25519-pub-key-agent');
+      const initResult = await post('/pair/initiate', initBody);
+      expect(initResult.status).toBe(200);
+
+      const token = await createJWT(AGENT_1, 'host', JWT_SECRET);
+
+      async function authHostWs(): Promise<MockWebSocket> {
+        const ws = new MockWebSocket();
+        mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
+        await do2.webSocketMessage(ws as unknown as WebSocket, JSON.stringify({ type: 'auth', token }));
+        return ws;
+      }
+
+      let liveWs: MockWebSocket | null = null;
+      if (withLiveHostWs) {
+        liveWs = await authHostWs();
+        liveWs.sent.length = 0;
+      }
+
+      const completeResult = await post('/pair/complete', {
+        pairingCode: initResult.data['pairingCode'] as string,
+        deviceId: 'mobile-1',
+        ed25519PublicKey: 'ed25519-pub-key-mobile',
+        x25519PublicKey: 'x25519-pub-key-mobile',
+      });
+      expect(completeResult.status).toBe(200);
+
+      return { do2, authHostWs, liveWs };
+    }
+
+    it('delivers pair_complete on next host WS auth when host was offline', async () => {
+      const { authHostWs } = await setupPairing(false);
+
+      const hostWs = await authHostWs();
+      const msgs = hostWs.messagesOfType('pair_complete');
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]['mobileDeviceId']).toBe('mobile-1');
+      expect(msgs[0]['mobileX25519PublicKey']).toBe('x25519-pub-key-mobile');
+    });
+
+    it('delivers the deferred pair_complete only once', async () => {
+      const { authHostWs } = await setupPairing(false);
+
+      const firstWs = await authHostWs();
+      expect(firstWs.messagesOfType('pair_complete')).toHaveLength(1);
+
+      const secondWs = await authHostWs();
+      expect(secondWs.messagesOfType('pair_complete')).toHaveLength(0);
+    });
+
+    it('does not persist pair_complete when delivered to a live host WS', async () => {
+      const { authHostWs, liveWs } = await setupPairing(true);
+
+      expect(liveWs!.messagesOfType('pair_complete')).toHaveLength(1);
+
+      // Reconnecting must not produce a duplicate
+      const reconnectWs = await authHostWs();
+      expect(reconnectWs.messagesOfType('pair_complete')).toHaveLength(0);
+    });
+
+    it('does not deliver a stale pair_complete after the pairing was removed', async () => {
+      const { do2, authHostWs } = await setupPairing(false);
+
+      do2.removePairing(AGENT_1);
+
+      const hostWs = await authHostWs();
+      expect(hostWs.messagesOfType('pair_complete')).toHaveLength(0);
+
+      // Row is consumed even when stale — a later auth stays clean too
+      const laterWs = await authHostWs();
+      expect(laterWs.messagesOfType('pair_complete')).toHaveLength(0);
+    });
+  });
+
   it('re-pairing replaces old mobile and sends device_unpaired notification', async () => {
     const { doInstance: do2, mockState } = await createTestDOFull();
 
