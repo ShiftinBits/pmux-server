@@ -7,6 +7,7 @@ coverage/
 
 node_modules/
 dist/
+temp/
 .wrangler/
 .dev.vars
 *.tsbuildinfo
