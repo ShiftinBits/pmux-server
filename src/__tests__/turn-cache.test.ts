@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createTestDOCompat as createTestDO } from './helpers/mock-do';
 import type { SignalingDO } from '../signaling';
+import { TURN_MAX_SERVE_AGE_MS } from '../turn';
 
 const HOUR_MS = 60 * 60 * 1000;
 const T0 = new Date('2026-01-01T00:00:00Z').getTime();
@@ -86,16 +87,47 @@ describe('TURN credential cache', () => {
     expect(b.data['username']).toBe('first');
   });
 
-  it('returns 502 when a refresh fails and the cache is too old to serve', async () => {
+  it('serves stale credentials right up to the max serve age, then 502s', async () => {
     vi.mocked(globalThis.fetch)
       .mockResolvedValueOnce(credsResponse('first'))
+      .mockRejectedValueOnce(new Error('Network error'))
       .mockRejectedValueOnce(new Error('Network error'));
 
     await getCreds();
-    vi.setSystemTime(T0 + 13 * HOUR_MS);
+    vi.setSystemTime(T0 + TURN_MAX_SERVE_AGE_MS - 1);
+    const b = await getCreds();
+    vi.setSystemTime(T0 + TURN_MAX_SERVE_AGE_MS);
+    const c = await getCreds();
+
+    expect(b.status).toBe(200);
+    expect(b.data['username']).toBe('first');
+    expect(c.status).toBe(502);
+  });
+
+  it('retries on the next request after a fallback (fallback does not refresh the cache age)', async () => {
+    vi.mocked(globalThis.fetch)
+      .mockResolvedValueOnce(credsResponse('first'))
+      .mockRejectedValueOnce(new Error('Network error'))
+      .mockResolvedValueOnce(credsResponse('second'));
+
+    await getCreds();
+    vi.setSystemTime(T0 + 2 * HOUR_MS);
+    await getCreds();
+    const c = await getCreds();
+
+    expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+    expect(c.data['username']).toBe('second');
+  });
+
+  it('survives DO hibernation via storage', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(credsResponse('first'));
+
+    await getCreds();
+    doInstance.clearTurnCache();
     const b = await getCreds();
 
-    expect(b.status).toBe(502);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    expect(b.data['username']).toBe('first');
   });
 
   it('does not cache failures — the next request retries', async () => {
