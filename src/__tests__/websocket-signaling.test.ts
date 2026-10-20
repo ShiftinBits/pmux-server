@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestDOCompat as createTestDOCompat, createTestDO, type MockDOState } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
@@ -1399,5 +1399,269 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(unavailable).toHaveLength(1);
       expect(unavailable[0]!['deviceId']).toBe('mobile-1');
     });
+  });
+});
+
+describe('signaling session timeout [SB-1001]', () => {
+  const T0 = 1_800_000_000_000;
+  let hostWs: MockWebSocket;
+  let mobileWs: MockWebSocket;
+
+  const at = (t: number): void => {
+    vi.spyOn(Date, 'now').mockReturnValue(t);
+  };
+
+  const send = async (ws: MockWebSocket, msg: Record<string, unknown>): Promise<void> => {
+    await doInstance.webSocketMessage(ws as unknown as WebSocket, JSON.stringify(msg));
+  };
+
+  const connectRequest = (): Promise<void> =>
+    send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1' });
+
+  beforeEach(async () => {
+    at(T0);
+    ({ ws: hostWs } = await connectAndAuth('agent-1', 'host'));
+    ({ ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile'));
+    doInstance.createPairing('agent-1', 'mobile-1');
+    hostWs.sent.length = 0;
+    mobileWs.sent.length = 0;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('notifies both ends with peer_unavailable when the host never replies', async () => {
+    await connectRequest();
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    const toMobile = mobileWs.messagesOfType('peer_unavailable');
+    expect(toMobile).toHaveLength(1);
+    expect(toMobile[0]!['deviceId']).toBe('agent-1');
+    const toHost = hostWs.messagesOfType('peer_unavailable');
+    expect(toHost).toHaveLength(1);
+    expect(toHost[0]!['deviceId']).toBe('mobile-1');
+    // Nothing pending — back to the regular 30s sweep, not a past timestamp
+    expect(mockState.scheduledAlarm).toBe(T0 + 12_001 + 30_000);
+
+    // Session is gone — a later sweep sends nothing more
+    await doInstance.alarm();
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(1);
+    expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(1);
+  });
+
+  it('clears the session when the host replies with sdp_offer', async () => {
+    await connectRequest();
+    await send(hostWs, { type: 'sdp_offer', sdp: 'v=0', targetDeviceId: 'mobile-1' });
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+    expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+  });
+
+  it('clears the session when the host replies with connection_rejected', async () => {
+    await connectRequest();
+    await send(hostWs, { type: 'connection_rejected', reason: 'busy', targetDeviceId: 'mobile-1' });
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+  });
+
+  it('pulls the alarm forward to the session expiry', async () => {
+    // Sweep alarm already scheduled 30s out
+    await doInstance.alarm();
+    expect(mockState.scheduledAlarm).toBe(T0 + 30_000);
+
+    await connectRequest();
+
+    expect(mockState.scheduledAlarm).toBe(T0 + 12_000);
+  });
+
+  it('does not notify before the session expires', async () => {
+    await connectRequest();
+
+    at(T0 + 5_000);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+    // Pending session keeps the alarm pinned to its expiry, not the 30s sweep
+    expect(mockState.scheduledAlarm).toBe(T0 + 12_000);
+  });
+
+  it('resets the timer on a repeat connect_request', async () => {
+    await connectRequest();
+    at(T0 + 8_000);
+    await connectRequest();
+
+    at(T0 + 14_000);
+    await doInstance.alarm();
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+
+    at(T0 + 20_001);
+    await doInstance.alarm();
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(1);
+  });
+
+  it('does not double-notify when the host disconnects mid-session', async () => {
+    await connectRequest();
+
+    await doInstance.webSocketClose(hostWs as unknown as WebSocket, 1000, 'normal closure', true);
+    mockState.acceptedWebSockets.splice(
+      mockState.acceptedWebSockets.indexOf(hostWs as unknown as WebSocket),
+      1
+    );
+    expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+  });
+
+  it('creates no session when the host is offline', async () => {
+    await doInstance.webSocketClose(hostWs as unknown as WebSocket, 1000, 'normal closure', true);
+    mockState.acceptedWebSockets.splice(
+      mockState.acceptedWebSockets.indexOf(hostWs as unknown as WebSocket),
+      1
+    );
+    mobileWs.sent.length = 0;
+
+    await connectRequest();
+    expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+  });
+
+  it('notifies every mobile socket, not just the cached one', async () => {
+    // Mobile's presence socket connects after its signaling socket and wins the cache
+    const { ws: presenceWs } = await connectAndAuth('mobile-1', 'mobile');
+    presenceWs.sent.length = 0;
+    await connectRequest();
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(1);
+    expect(presenceWs.messagesOfType('peer_unavailable')).toHaveLength(1);
+  });
+
+  it('does not time out after the host disconnects and reconnects in the window', async () => {
+    await connectRequest();
+
+    await doInstance.webSocketClose(hostWs as unknown as WebSocket, 1000, 'normal closure', true);
+    mockState.acceptedWebSockets.splice(
+      mockState.acceptedWebSockets.indexOf(hostWs as unknown as WebSocket),
+      1
+    );
+    const { ws: newHostWs } = await connectAndAuth('agent-1', 'host');
+    expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+    expect(newHostWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+  });
+
+  it('does not notify devices that were unpaired before expiry', async () => {
+    await connectRequest();
+    doInstance.removePairing('agent-1');
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+    expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+  });
+
+  it('only a host sdp_offer/connection_rejected clears the session', async () => {
+    await connectRequest();
+    await send(hostWs, { type: 'ice_candidate', candidate: 'c', targetDeviceId: 'mobile-1' });
+    await send(mobileWs, { type: 'connection_rejected', reason: 'busy', targetDeviceId: 'agent-1' });
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(1);
+  });
+
+  it('creates no session for a host-sent connect_request', async () => {
+    await send(hostWs, { type: 'connect_request', targetDeviceId: 'mobile-1' });
+    expect(mockState.scheduledAlarm).toBeNull();
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+  });
+
+  it('keeps the alarm pinned to a pending session when no sockets are active', async () => {
+    await connectRequest();
+    // Both sockets vanish without close events (e.g. DO eviction)
+    mockState.acceptedWebSockets.length = 0;
+
+    at(T0 + 5_000);
+    await doInstance.alarm();
+    expect(mockState.scheduledAlarm).toBe(T0 + 12_000);
+
+    // Expiry with nobody to notify: row dropped, no reschedule
+    at(T0 + 12_001);
+    await doInstance.alarm();
+    expect(mockState.scheduledAlarm).toBe(T0 + 12_000);
+  });
+
+  it('clears the session when the idle sweep reaps the host', async () => {
+    await connectRequest();
+    // Host froze right after the relay — its socket goes idle past the window
+    const att = hostWs.deserializeAttachment() as Record<string, unknown>;
+    att.lastMessageTime = T0 - 100_000;
+    hostWs.serializeAttachment(att);
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+  });
+
+  it('clears the session when a retry finds the host stale', async () => {
+    await connectRequest();
+    const att = hostWs.deserializeAttachment() as Record<string, unknown>;
+    att.lastMessageTime = T0 - 100_000;
+    hostWs.serializeAttachment(att);
+
+    at(T0 + 5_000);
+    await connectRequest();
+    expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+
+    // Host recovers before the old expiry; the stale row must not fire
+    att.lastMessageTime = T0 + 6_000;
+    hostWs.serializeAttachment(att);
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+  });
+
+  it('creates no session when relaying connect_request to the host fails', async () => {
+    hostWs.send = () => { throw new Error('WebSocket closed'); };
+
+    await connectRequest();
+    expect(mockState.scheduledAlarm).toBeNull();
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
   });
 });
