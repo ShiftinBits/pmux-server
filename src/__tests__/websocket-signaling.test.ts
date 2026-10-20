@@ -1652,4 +1652,16 @@ describe('signaling session timeout [SB-1001]', () => {
 
     expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
   });
+
+  it('creates no session when relaying connect_request to the host fails', async () => {
+    hostWs.send = () => { throw new Error('WebSocket closed'); };
+
+    await connectRequest();
+    expect(mockState.scheduledAlarm).toBeNull();
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+  });
 });
