@@ -1,10 +1,11 @@
 /**
  * SignalingDO — Durable Object for WebSocket signaling, presence, and storage.
  *
- * Uses built-in SQLite for persistent device/pairing storage.
- * Uses in-memory maps for ephemeral state (pairing codes, WebSocket sessions).
+ * Uses built-in SQLite for devices, pairings, and short-lived pairing/auth/signaling rows.
+ * Uses in-memory maps for the WebSocket connection cache (rebuilt after hibernation).
  * Uses the WebSocket Hibernation API for cost-efficient persistent connections.
- * Uses DO key-value storage for rate limit counters.
+ * Uses DO key-value storage for the TURN credential cache.
+ * Rate limiting uses native Workers Rate Limiting bindings (env.*_LIMITER).
  */
 
 import type { Env } from './worker';
