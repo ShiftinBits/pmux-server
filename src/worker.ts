@@ -1,6 +1,7 @@
 import { SignalingDO } from './signaling';
 import { verifyJWT, type JWTPayload } from './auth';
 import { validateClientSignature, validateClientSignatureV1 } from './hmac';
+import { version } from '../package.json';
 
 export { SignalingDO };
 
@@ -27,9 +28,6 @@ export const PUBLIC_PATHS = new Set([
   '/ws', // WebSocket auth is handled at the DO level via auth message, not HTTP headers
 ]);
 
-/** Package version, used in health endpoint. */
-const VERSION = '0.1.0';
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const startTime = Date.now();
@@ -53,7 +51,7 @@ export default {
         new Response(
           JSON.stringify({
             status: 'ok',
-            version: VERSION,
+            version,
             timestamp: Date.now(),
           }),
           {
