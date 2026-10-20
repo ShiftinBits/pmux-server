@@ -215,15 +215,12 @@ export class SignalingDO implements DurableObject {
       )
     `);
 
-    // Opaque pairing MAC relayed to the host (column added after initial release)
-    try {
+    // Opaque pairing MAC relayed to the host (column added after initial release).
+    // Check for the column instead of catching the ALTER's error, so the
+    // migration doesn't depend on SqlStorage's error wording.
+    const pendingCols = this.sql.exec('PRAGMA table_info(pending_pair_complete)').toArray();
+    if (!pendingCols.some((col) => col['name'] === 'mobile_pair_mac')) {
       this.sql.exec('ALTER TABLE pending_pair_complete ADD COLUMN mobile_pair_mac TEXT');
-    } catch (err) {
-      // Column already exists (fresh CREATE TABLE above or earlier migration);
-      // anything else is a real schema failure and must not be swallowed.
-      if (!(err instanceof Error) || !/duplicate column/i.test(err.message)) {
-        throw err;
-      }
     }
 
     this.sql.exec(`
@@ -441,6 +438,9 @@ export class SignalingDO implements DurableObject {
 
     // Invalidate any existing sessions for this host (prevents multiple valid codes)
     this.sql.exec('DELETE FROM pairing_sessions WHERE host_device_id = ?', hostDeviceId);
+    // Drop any pair_complete still pending from an earlier attempt: it was MAC'd
+    // with that attempt's pairing secret, so the new pair CLI would reject it.
+    this.sql.exec('DELETE FROM pending_pair_complete WHERE host_device_id = ?', hostDeviceId);
 
     let code: string;
     do {
@@ -1437,7 +1437,7 @@ export class SignalingDO implements DurableObject {
       ed25519PublicKey?: string;
       x25519PublicKey?: string;
       name?: string;
-      pairMac?: string;
+      pairMac?: string | null;
     };
     try {
       body = await request.json() as typeof body;
@@ -1453,16 +1453,17 @@ export class SignalingDO implements DurableObject {
     }
 
     // pairMac is an opaque pass-through (the agent verifies it); optional so
-    // older mobile builds still pair. Shape is a 32-byte MAC in standard padded
-    // base64 (44 chars). Validate before consuming the code.
+    // older mobile builds still pair, and null counts as absent. Only bound the
+    // size and charset (any base64 variant) so a MAC format change doesn't need
+    // a server deploy. Validate before consuming the code.
     if (
-      body.pairMac !== undefined &&
+      body.pairMac != null &&
       (typeof body.pairMac !== 'string' ||
-        !/^[A-Za-z0-9+/]{43}=$/.test(body.pairMac))
+        !/^[A-Za-z0-9+/=_-]{1,64}$/.test(body.pairMac))
     ) {
       return jsonResponse({ error: 'Invalid pairMac' }, 400);
     }
-    const pairMac = body.pairMac;
+    const pairMac = body.pairMac ?? undefined;
 
     const mobileName = validateDeviceName(body.name);
 

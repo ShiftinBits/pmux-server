@@ -434,7 +434,7 @@ describe('POST /pair/complete', () => {
 
     // Shared setup: initiate + complete pairing on a fresh DO, optionally with
     // a live host WebSocket connected during /pair/complete.
-    async function setupPairing(withLiveHostWs: boolean, mobileName?: string, pairMac?: string) {
+    async function setupPairing(withLiveHostWs: boolean, mobileName?: string, pairMac?: string | null) {
       const { doInstance: do2, mockState } = await createTestDOFull();
       const keys = await generateEd25519Keypair();
       const pubBase64 = bytesToBase64(keys.publicKeyRaw);
@@ -479,11 +479,16 @@ describe('POST /pair/complete', () => {
       });
       expect(completeResult.status).toBe(200);
 
-      // Re-initiate + complete with a different mobile (host still offline)
-      async function repairWith(deviceId: string, x25519PublicKey: string) {
+      async function initiate() {
         const reInitBody = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, keyPairForHost, pubBase64, 'x25519-pub-key-agent');
         const reInit = await post('/pair/initiate', reInitBody);
         expect(reInit.status).toBe(200);
+        return reInit;
+      }
+
+      // Re-initiate + complete with a different mobile (host still offline)
+      async function repairWith(deviceId: string, x25519PublicKey: string) {
+        const reInit = await initiate();
         const res = await post('/pair/complete', {
           pairingCode: reInit.data['pairingCode'] as string,
           deviceId,
@@ -493,7 +498,7 @@ describe('POST /pair/complete', () => {
         expect(res.status).toBe(200);
       }
 
-      return { do2, authHostWs, liveWs, repairWith, post, initResult };
+      return { do2, authHostWs, liveWs, repairWith, initiate, post, initResult };
     }
 
     it('delivers pair_complete on next host WS auth when host was offline', async () => {
@@ -594,17 +599,34 @@ describe('POST /pair/complete', () => {
     });
 
     it.each([
+      ['base64url', 'A'.repeat(42) + '-_'],
+      ['unpadded', 'A'.repeat(43)],
+      ['64 chars', 'A'.repeat(64)],
+    ])('relays a non-canonical pairMac (%s) verbatim', async (_label, mac) => {
+      const { liveWs } = await setupPairing(true, undefined, mac);
+
+      const msgs = liveWs!.messagesOfType('pair_complete');
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]['pairMac']).toBe(mac);
+    });
+
+    it('treats a null pairMac as absent', async () => {
+      const { liveWs } = await setupPairing(true, undefined, null);
+
+      const msgs = liveWs!.messagesOfType('pair_complete');
+      expect(msgs).toHaveLength(1);
+      expect('pairMac' in msgs[0]).toBe(false);
+    });
+
+    it.each([
       ['non-string', 12345],
-      ['over 44 chars', 'A'.repeat(45)],
-      ['wrong length', 'dGVzdC1tYWM='],
-      ['base64url', 'A'.repeat(42) + '-='],
-      ['unpadded', 'A'.repeat(44)],
+      ['over 64 chars', 'A'.repeat(65)],
       ['bad charset', 'not base64!!'],
       ['empty string', ''],
     ])('rejects a malformed pairMac (%s) with 400', async (_label, badMac) => {
       const { post, initResult } = await setupPairing(false);
 
-      // Fresh pairing code so the first (valid) completion does not interfere
+      // initResult's code is already spent, so only pairMac validation can fail here
       const res = await post('/pair/complete', {
         pairingCode: initResult.data['pairingCode'] as string,
         deviceId: 'mobile-bad',
@@ -614,6 +636,34 @@ describe('POST /pair/complete', () => {
       });
       expect(res.status).toBe(400);
       expect(res.data['error']).toBe('Invalid pairMac');
+    });
+
+    it('migrates a pending_pair_complete table created before mobile_pair_mac', async () => {
+      const { doInstance: do2 } = await createTestDOFull();
+      const sql = do2['sql'];
+      sql.exec(`CREATE TABLE pending_pair_complete (
+        host_device_id TEXT PRIMARY KEY,
+        mobile_device_id TEXT NOT NULL,
+        mobile_x25519_public_key TEXT NOT NULL,
+        mobile_name TEXT,
+        created_at INTEGER NOT NULL
+      )`);
+
+      do2.createPairingSession(AGENT_1, 'x25519-pub-key-agent', 'ed-pub-key-agent'); // runs ensureSchema
+
+      const cols = sql.exec('PRAGMA table_info(pending_pair_complete)').toArray().map((c) => c['name']);
+      expect(cols).toContain('mobile_pair_mac');
+    });
+
+    it('drops a pending pair_complete when the host initiates a new pairing', async () => {
+      const { authHostWs, initiate } = await setupPairing(false, undefined, VALID_PAIR_MAC);
+
+      // The new pair CLI must not receive the earlier attempt's pair_complete,
+      // whose pairMac was computed with the old pairing secret.
+      await initiate();
+
+      const hostWs = await authHostWs();
+      expect(hostWs.messagesOfType('pair_complete')).toHaveLength(0);
     });
 
     it('re-pairing while host is offline overwrites the pending row', async () => {

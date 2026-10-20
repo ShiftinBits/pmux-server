@@ -39,7 +39,7 @@ export async function createMockSqlStorage(): Promise<MockSqlStorage> {
         stmt.bind(bindings as (string | number | null | Uint8Array)[]);
       }
 
-      const isReader = query.trimStart().toUpperCase().startsWith('SELECT');
+      const isReader = /^(SELECT|PRAGMA)\b/i.test(query.trimStart());
 
       if (isReader) {
         const rows: Record<string, unknown>[] = [];
