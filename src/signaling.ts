@@ -99,6 +99,15 @@ const ALARM_INTERVAL_MS = 30_000; // 30 seconds
  */
 const WS_IDLE_TIMEOUT_MS = 90_000; // 90 seconds
 
+/**
+ * How long the host has to reply to a relayed connect_request (sdp_offer or
+ * connection_rejected) before both ends get peer_unavailable [SB-1001].
+ * The agent sends its offer immediately (trickle ICE), so this is generous;
+ * kept below the mobile's fastest negotiation watchdog (15s) so the server's
+ * signal arrives first.
+ */
+const SIGNALING_SESSION_TIMEOUT_MS = 10_000; // 10 seconds
+
 // --- Durable Object ---
 
 export class SignalingDO implements DurableObject {
@@ -193,6 +202,15 @@ export class SignalingDO implements DurableObject {
       CREATE TABLE IF NOT EXISTS challenges (
         nonce TEXT PRIMARY KEY,
         device_id TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+      )
+    `);
+
+    // Pending connect_request awaiting the host's first reply [SB-1001]
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS signaling_sessions (
+        host_device_id TEXT PRIMARY KEY,
+        mobile_device_id TEXT NOT NULL,
         expires_at INTEGER NOT NULL
       )
     `);
@@ -748,7 +766,7 @@ export class SignalingDO implements DurableObject {
         break;
 
       case 'connect_request':
-        this.handleConnectRequest(ws, attachment, data.targetDeviceId);
+        await this.handleConnectRequest(ws, attachment, data.targetDeviceId);
         break;
 
       case 'sdp_offer':
@@ -909,9 +927,18 @@ export class SignalingDO implements DurableObject {
     // Purge expired pairing codes
     this.cleanExpiredPairings();
 
-    // Re-schedule alarm if there are still active connections
-    if (activeCount > 0) {
-      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+    // Time out connect_requests the host never answered [SB-1001]
+    this.expireSignalingSessions(now);
+
+    // Re-schedule: next idle sweep if there are still active connections,
+    // pulled forward to the earliest pending signaling session expiry.
+    let next = activeCount > 0 ? Date.now() + ALARM_INTERVAL_MS : Infinity;
+    const pending = this.sql
+      .exec('SELECT MIN(expires_at) AS next FROM signaling_sessions')
+      .toArray()[0]?.['next'];
+    if (typeof pending === 'number') next = Math.min(next, pending);
+    if (next !== Infinity) {
+      await this.state.storage.setAlarm(next);
     }
   }
 
@@ -923,6 +950,43 @@ export class SignalingDO implements DurableObject {
     const currentAlarm = await this.state.storage.getAlarm();
     if (!currentAlarm) {
       await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+    }
+  }
+
+  /**
+   * Ensure the alarm fires no later than `time` — moves an existing later
+   * alarm forward, leaves an earlier one alone.
+   */
+  private async scheduleAlarmBy(time: number): Promise<void> {
+    const currentAlarm = await this.state.storage.getAlarm();
+    if (!currentAlarm || currentAlarm > time) {
+      await this.state.storage.setAlarm(time);
+    }
+  }
+
+  /**
+   * Expire signaling sessions whose host never replied to connect_request and
+   * tell both ends with peer_unavailable [SB-1001]. If the host's socket is
+   * already gone or stale, the mobile has received host_offline from the close
+   * handler or idle sweep — drop the session silently to avoid double-notifying.
+   */
+  private expireSignalingSessions(now: number): void {
+    this.ensureSchema();
+    const expired = this.sql
+      .exec('SELECT host_device_id, mobile_device_id FROM signaling_sessions WHERE expires_at <= ?', now)
+      .toArray();
+    if (expired.length === 0) return;
+    this.sql.exec('DELETE FROM signaling_sessions WHERE expires_at <= ?', now);
+
+    for (const row of expired) {
+      const hostId = row['host_device_id'] as string;
+      const mobileId = row['mobile_device_id'] as string;
+      const hostWs = this.findWebSocket(hostId);
+      if (!hostWs || !this.isWebSocketFresh(hostWs)) continue;
+
+      const mobileWs = this.findWebSocket(mobileId);
+      if (mobileWs) this.sendPeerUnavailable(mobileWs, hostId);
+      this.sendPeerUnavailable(hostWs, mobileId);
     }
   }
 
@@ -1104,7 +1168,7 @@ export class SignalingDO implements DurableObject {
    * Relays the request to the target host with the mobile's deviceId.
    * Only allows signaling between paired devices.
    */
-  private handleConnectRequest(ws: WebSocket, sender: WsAttachment, targetDeviceId: string): void {
+  private async handleConnectRequest(ws: WebSocket, sender: WsAttachment, targetDeviceId: string): Promise<void> {
     // Check pairing FIRST (before WS lookup) — don't reveal device existence to unpaired callers
     const hostId = sender.deviceType === 'host' ? sender.deviceId : targetDeviceId;
     const mobileId = sender.deviceType === 'mobile' ? sender.deviceId : targetDeviceId;
@@ -1134,6 +1198,19 @@ export class SignalingDO implements DurableObject {
       if (this.connections.get(targetDeviceId) === targetWs) {
         this.connections.delete(targetDeviceId);
       }
+      return;
+    }
+
+    // Relayed — track until the host replies so a silent host times out [SB-1001]
+    if (sender.deviceType === 'mobile') {
+      const expiresAt = Date.now() + SIGNALING_SESSION_TIMEOUT_MS;
+      this.sql.exec(
+        'INSERT OR REPLACE INTO signaling_sessions (host_device_id, mobile_device_id, expires_at) VALUES (?, ?, ?)',
+        hostId,
+        mobileId,
+        expiresAt
+      );
+      await this.scheduleAlarmBy(expiresAt);
     }
   }
 
@@ -1153,6 +1230,14 @@ export class SignalingDO implements DurableObject {
     const hostId = sender.deviceType === 'host' ? sender.deviceId : data.targetDeviceId;
     const mobileId = sender.deviceType === 'mobile' ? sender.deviceId : data.targetDeviceId;
     if (!this.isPaired(hostId, mobileId)) return;
+
+    // Host answered the connect_request — signaling session complete [SB-1001]
+    if (
+      sender.deviceType === 'host' &&
+      (data.type === 'sdp_offer' || data.type === 'connection_rejected')
+    ) {
+      this.sql.exec('DELETE FROM signaling_sessions WHERE host_device_id = ?', hostId);
+    }
 
     const targetWs = this.findWebSocket(data.targetDeviceId);
     if (!targetWs) {

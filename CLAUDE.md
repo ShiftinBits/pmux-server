@@ -32,7 +32,7 @@ Single global Durable Object instance — `env.SIGNALING.idFromName('global')` i
 
 | Layer | What | Backing |
 |-------|------|---------|
-| SQLite (persistent) | devices, pairings, pairing_sessions | `state.storage.sql` |
+| SQLite (persistent) | devices, pairings, pairing_sessions, signaling_sessions | `state.storage.sql` |
 | Rate Limiting binding | Per-endpoint request limits | native Workers Rate Limiting (`env.*_LIMITER`) |
 | In-memory maps | WebSocket connection cache, per-device WS counts | `Map<string, WebSocket>` |
 | WS Attachments | Per-socket metadata (survives hibernation) | `serializeAttachment()` |
@@ -91,4 +91,4 @@ Real Web Crypto used in tests (not mocked). Ed25519 keys generated per-test.
 - **Pairing code**: Direct modulo indexing (alphabet is 32 chars, divides 256 evenly), base32-like alphabet (no 0/O/1/I), 6 chars, 5-min expiry, single-use.
 - **Device orphan cleanup**: On re-pair, old mobile removed only if zero remaining pairings elsewhere.
 - **JWT defenses**: Explicit header check (HS256 only — blocks alg:none), audience `pocketmux`, sub must match deviceId, clock skew ≤60s.
-- **Alarm lifecycle**: Scheduled on first WS connection (`scheduleAlarmIfNeeded()`), re-schedules only if active connections remain after cleanup sweep.
+- **Alarm lifecycle**: Scheduled on first WS connection (`scheduleAlarmIfNeeded()`), re-schedules only if active connections remain after cleanup sweep, pulled forward to the earliest pending `signaling_sessions` expiry (`scheduleAlarmBy()`). Unanswered `connect_request` → `peer_unavailable` to both ends after 10s [SB-1001].
