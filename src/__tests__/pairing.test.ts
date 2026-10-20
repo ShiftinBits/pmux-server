@@ -434,7 +434,7 @@ describe('POST /pair/complete', () => {
 
     // Shared setup: initiate + complete pairing on a fresh DO, optionally with
     // a live host WebSocket connected during /pair/complete.
-    async function setupPairing(withLiveHostWs: boolean, mobileName?: string) {
+    async function setupPairing(withLiveHostWs: boolean, mobileName?: string, pairMac?: string) {
       const { doInstance: do2, mockState } = await createTestDOFull();
       const keys = await generateEd25519Keypair();
       const pubBase64 = bytesToBase64(keys.publicKeyRaw);
@@ -475,6 +475,7 @@ describe('POST /pair/complete', () => {
         ed25519PublicKey: 'ed25519-pub-key-mobile',
         x25519PublicKey: 'x25519-pub-key-mobile',
         ...(mobileName !== undefined && { name: mobileName }),
+        ...(pairMac !== undefined && { pairMac }),
       });
       expect(completeResult.status).toBe(200);
 
@@ -492,7 +493,7 @@ describe('POST /pair/complete', () => {
         expect(res.status).toBe(200);
       }
 
-      return { do2, authHostWs, liveWs, repairWith };
+      return { do2, authHostWs, liveWs, repairWith, post, initResult };
     }
 
     it('delivers pair_complete on next host WS auth when host was offline', async () => {
@@ -554,6 +555,59 @@ describe('POST /pair/complete', () => {
       const msgs = hostWs.messagesOfType('pair_complete');
       expect(msgs).toHaveLength(1);
       expect('mobileName' in msgs[0]).toBe(false);
+    });
+
+    it('relays pairMac on the live path', async () => {
+      const { liveWs } = await setupPairing(true, undefined, 'dGVzdC1tYWM=');
+
+      const msgs = liveWs!.messagesOfType('pair_complete');
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]['pairMac']).toBe('dGVzdC1tYWM=');
+    });
+
+    it('persists pairMac and delivers it exactly once on the deferred path', async () => {
+      const { authHostWs } = await setupPairing(false, undefined, 'dGVzdC1tYWM=');
+
+      const firstWs = await authHostWs();
+      const msgs = firstWs.messagesOfType('pair_complete');
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]['pairMac']).toBe('dGVzdC1tYWM=');
+
+      const secondWs = await authHostWs();
+      expect(secondWs.messagesOfType('pair_complete')).toHaveLength(0);
+    });
+
+    it('omits pairMac from live and deferred payloads when absent', async () => {
+      const live = await setupPairing(true);
+      const liveMsgs = live.liveWs!.messagesOfType('pair_complete');
+      expect(liveMsgs).toHaveLength(1);
+      expect('pairMac' in liveMsgs[0]).toBe(false);
+
+      const deferred = await setupPairing(false);
+      const hostWs = await deferred.authHostWs();
+      const msgs = hostWs.messagesOfType('pair_complete');
+      expect(msgs).toHaveLength(1);
+      expect('pairMac' in msgs[0]).toBe(false);
+    });
+
+    it.each([
+      ['non-string', 12345],
+      ['over 64 chars', 'A'.repeat(65)],
+      ['bad charset', 'not base64!!'],
+      ['empty string', ''],
+    ])('rejects a malformed pairMac (%s) with 400', async (_label, badMac) => {
+      const { post, initResult } = await setupPairing(false);
+
+      // Fresh pairing code so the first (valid) completion does not interfere
+      const res = await post('/pair/complete', {
+        pairingCode: initResult.data['pairingCode'] as string,
+        deviceId: 'mobile-bad',
+        ed25519PublicKey: 'ed25519-pub-key-bad',
+        x25519PublicKey: 'x25519-pub-key-bad',
+        pairMac: badMac,
+      });
+      expect(res.status).toBe(400);
+      expect(res.data['error']).toBe('Invalid pairMac');
     });
 
     it('re-pairing while host is offline overwrites the pending row', async () => {
