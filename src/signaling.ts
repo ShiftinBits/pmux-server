@@ -8,9 +8,9 @@
  */
 
 import type { Env } from './worker';
-import type { DeviceType, SignalingClientMessage, HostOnlineMessage } from '@pocketmux/shared';
+import type { DeviceType, SignalingClientMessage, HostOnlineMessage, TurnCredentials } from '@pocketmux/shared';
 import { verifyEd25519Signature, createJWT, verifyJWT } from './auth';
-import { generateTurnCredentials } from './turn';
+import { generateTurnCredentials, TURN_REFRESH_AGE_MS, TURN_MAX_SERVE_AGE_MS } from './turn';
 import {
   rateLimitResponse,
   MAX_WS_CONNECTIONS_PER_DEVICE,
@@ -121,6 +121,12 @@ export class SignalingDO implements DurableObject {
 
   // In-memory WebSocket connection count per device ID (for abuse prevention)
   private wsConnectionCounts = new Map<string, number>();
+
+  // In-memory TURN credential cache (lost on hibernation/eviction — just refetched).
+  // Shared by all devices: any authenticated device can already obtain valid
+  // credentials, and they are time-limited and relay-only.
+  private turnCache: { creds: TurnCredentials; fetchedAt: number } | null = null;
+  private turnFetch: Promise<TurnCredentials> | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -1625,12 +1631,27 @@ export class SignalingDO implements DurableObject {
    * GET /turn/credentials
    * Returns TURN credentials from Cloudflare Realtime API.
    * Rate limited per device ID. Routed through DO for rate limit storage access.
+   * Cached in-DO for TURN_REFRESH_AGE_MS; concurrent refetches share one request,
+   * and a failed refetch falls back to cached credentials up to TURN_MAX_SERVE_AGE_MS old.
    */
   private async handleTurnCredentials(): Promise<Response> {
+    const age = this.turnCache ? Date.now() - this.turnCache.fetchedAt : Infinity;
+    if (this.turnCache && age < TURN_REFRESH_AGE_MS) {
+      return jsonResponse(this.turnCache.creds);
+    }
+
     try {
-      const credentials = await generateTurnCredentials(this.env);
-      return jsonResponse(credentials);
+      this.turnFetch ??= generateTurnCredentials(this.env).finally(() => {
+        this.turnFetch = null;
+      });
+      const creds = await this.turnFetch;
+      this.turnCache = { creds, fetchedAt: Date.now() };
+      return jsonResponse(creds);
     } catch (err) {
+      if (this.turnCache && age < TURN_MAX_SERVE_AGE_MS) {
+        console.warn('[turn] Refresh failed, serving cached credentials:', err);
+        return jsonResponse(this.turnCache.creds);
+      }
       console.error('[turn] Failed to generate credentials:', err);
       return jsonResponse({ error: 'Failed to generate TURN credentials' }, 502);
     }
