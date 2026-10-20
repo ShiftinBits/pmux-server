@@ -7,13 +7,16 @@ Cloudflare Worker + Durable Object signaling server for Pocketmux. Zero-knowledg
 | Task | Command |
 |------|---------|
 | Dev | `npm run dev` (wrangler dev --ip 0.0.0.0) |
-| Deploy | `npm run deploy` |
-| Test (unit) | `npm test` |
-| Test (integration) | `npm run test:integration` |
+| Deploy | `npm run deploy` (CI: `v*` tag or manual → `wrangler-action`) |
+| Test (all, incl. integration) | `npm test` |
+| Test (integration subset) | `npm run test:integration` |
+| Build check (what CI runs) | `npx wrangler deploy --dry-run --outdir dist` |
 
-Worker name: `pmux-signaling` | Domain: `signal.pmux.io`
+Worker name: `pmux-signaling` | Domain: `signal.pmux.io` (custom domain; `workers_dev` and `preview_urls` off)
 
-Secrets: `TURN_TOKEN_ID`, `TURN_API_TOKEN`, `JWT_SECRET` — set in `.dev.vars` locally, `wrangler secret put` in production.
+Secrets: `TURN_TOKEN_ID`, `TURN_API_TOKEN`, `JWT_SECRET`, optional `PMUX_HMAC_SECRET` — `.dev.vars` locally, `wrangler secret put` in production.
+
+**Type-checking:** CI runs only vitest + the wrangler dry-run, never `tsc`. `npx tsc --noEmit` currently fails on main with pre-existing errors (`auth.ts`, `hmac.ts`, `signaling.ts`, `worker.ts`) — diff against main's output rather than expecting clean. `tsconfig.json` excludes `src/__tests__`, so tests are never type-checked.
 
 ## Architecture
 
@@ -21,76 +24,89 @@ Single global Durable Object instance — `env.SIGNALING.idFromName('global')` i
 
 | File | Responsibility |
 |------|---------------|
-| `src/worker.ts` | HTTP entry, JWT auth middleware, route dispatch to DO |
-| `src/signaling.ts` | `SignalingDO`: WebSocket signaling, SQLite storage, pairing, presence |
+| `src/worker.ts` | HTTP entry: `/v1` strip, HMAC check, JWT auth, header injection, route dispatch to DO |
+| `src/signaling.ts` | `SignalingDO`: REST handlers, WebSocket signaling, SQLite storage, pairing, presence, alarm, TURN cache |
 | `src/auth.ts` | Ed25519 verification (Web Crypto), JWT create/verify (HS256) |
+| `src/hmac.ts` | Optional client HMAC signature validation (legacy + v1 formulas) |
 | `src/turn.ts` | TURN credential generation via Cloudflare Realtime API |
-| `src/types.ts` | Re-exports from `@pocketmux/shared` (type-only, no runtime dep) |
-| `src/middleware/ratelimit.ts` | 429 response helper + WS connection-count constant (request rate limiting is the native Workers Rate Limiting binding) |
+| `src/types.ts` | Re-exports from `@pocketmux/shared` |
+| `src/middleware/ratelimit.ts` | `rateLimitResponse()` (429 + `Retry-After`) and `MAX_WS_CONNECTIONS_PER_DEVICE` (5) |
+
+`@pocketmux/shared` imports are all `import type` — no runtime dependency. The git dep's SHA is pinned in `package-lock.json`.
+
+### Request Pipeline (`worker.ts` default `fetch`)
+
+1. Strip `/v1` prefix (`/v1/x` → `/x`, sets `apiVersion`).
+2. `/health` (JSON status) and `/` (308 → `pmux.io`) return immediately — no HMAC, auth, or rate limit.
+3. If `PMUX_HMAC_SECRET` is set → HMAC check (below). Applies to `/ws` upgrades too.
+4. Path not in `PUBLIC_PATHS` → JWT required (`authenticateRequest()`). Runs before routing, so unknown paths without a JWT get 401, not 404.
+5. Inject `X-Client-IP` (all) + `X-Device-Id`/`X-Device-Type` (JWT routes), then `routeToDO()` strips `/auth` (`/auth/token` → `/token`). Query string is dropped.
+
+### Endpoints
+
+| Public path | DO path | Method | Auth | Limiter | Key |
+|-------------|---------|--------|------|---------|-----|
+| `/auth/challenge` | `/challenge` | POST | none | `TOKEN_LIMITER` | `challenge:IP` |
+| `/auth/pair/initiate` | `/pair/initiate` | POST | Ed25519 + challenge | `PAIR_LIMITER` | `pair/initiate:IP` |
+| `/auth/pair/complete` | `/pair/complete` | POST | pairing code | `PAIR_LIMITER` | `pair/complete:IP` |
+| `/auth/token` | `/token` | POST | Ed25519 + challenge | `TOKEN_LIMITER` | `token:IP` (body untrusted pre-auth) |
+| `/auth/pairing` | `/pairing` | DELETE | JWT (`pmux unpair`) | `PAIR_LIMITER` | `pairing:deviceId` |
+| `/auth/device` | `/device` | DELETE | JWT (`pmux uninstall`) | `PAIR_LIMITER` | `device:deviceId` |
+| `/turn/credentials` | same | GET | JWT | `TURN_LIMITER` | `turn:deviceId` |
+| `/ws` | same | upgrade | in-band `{type:'auth', token}` | `WS_LIMITER` | `ws:IP` |
+
+Limits (`wrangler.toml` `[[ratelimits]]`, period must be 10 or 60): TOKEN 30/60s, PAIR 10/60s, TURN 20/60s, WS 8/10s. Bindings shared across endpoints keep independent counters via the namespaced key. Wrong method → 405 via `SignalingDO.ROUTE_METHODS`. Max 5 concurrent WebSockets per device. All endpoints must match SPEC §5.1.
+
+### HMAC (`hmac.ts`)
+
+Headers `pmux-signature` + `pmux-timestamp` (unix seconds, ±60s); `/v1/*` also needs `pmux-nonce` (32 lowercase hex). Signature = hex `HMAC-SHA256(secret, msg)`:
+- v1 (`validateClientSignatureV1`): `"{timestamp}:{nonce}:{pathname}"`
+- legacy (`validateClientSignature`): `"{timestamp}:{pathname}"`
+
+`pathname` is the **original** path including `/v1`. Method, query and body are not signed. Nonce is format-checked only — no replay store.
 
 ### Storage Model
 
 | Layer | What | Backing |
 |-------|------|---------|
-| SQLite (persistent) | devices, pairings, pairing_sessions, signaling_sessions | `state.storage.sql` |
+| SQLite | `devices`, `pairings`, `pairing_sessions`, `pending_pair_complete`, `challenges`, `signaling_sessions` | `state.storage.sql`, created in `ensureSchema()` |
 | Rate Limiting binding | Per-endpoint request limits | native Workers Rate Limiting (`env.*_LIMITER`) |
-| In-memory maps | WebSocket connection cache, per-device WS counts | `Map<string, WebSocket>` |
-| DO KV storage + in-memory | TURN credential cache | `state.storage` key `turn_cache`, mirrored in `turnCache` |
-| WS Attachments | Per-socket metadata (survives hibernation) | `serializeAttachment()` |
+| In-memory maps | WebSocket connection cache, per-device WS counts | `connections`, rebuilt after hibernation |
+| DO KV + in-memory | TURN credential cache | key `turn_cache`, mirrored in `turnCache` |
+| WS attachments | `{deviceId, deviceType, authenticated, lastMessageTime}` (survives hibernation) | `serializeAttachment()` |
 
-### Endpoints
-
-REST (worker → DO): `/auth/pair/initiate`, `/auth/pair/complete`, `/auth/token`, `/turn/credentials`
-WebSocket: `/ws` (Hibernation API — DO sleeps when idle)
-
-Worker strips `/auth` prefix before forwarding to DO (e.g., `/auth/token` → `/token`). See `worker.ts` — `routeToDO()`.
-
-Public (no JWT): `/health`, `/auth/pair/*`, `/auth/token`, `/ws` (WS auth via in-band message, not HTTP header).
-Authenticated (JWT): `/turn/credentials`.
-
-All endpoints must match spec Section 5.1.
+Schema changes: `CREATE TABLE IF NOT EXISTS` + idempotent try/catch `ALTER` in `ensureSchema()`; no schema-version table. **Units differ:** `devices`/`pairings` `created_at` are seconds; every `expires_at` and `pending_pair_complete.created_at` are ms.
 
 ## Conventions
 
 - **Workers runtime only** — Web Crypto API, not Node.js crypto
-- TypeScript strict mode + `noUncheckedIndexedAccess` enabled
-- Named exports, `async`/`await`, `const` by default
-
-## Rate Limiting
-
-Per-endpoint via native Cloudflare Workers Rate Limiting bindings (`wrangler.toml`, called as `env.*_LIMITER.limit({ key })` in `signaling.ts`). Keys are namespaced by endpoint so endpoints sharing a binding keep independent counters:
-
-| Endpoint | Limit | Window | Binding | Key |
-|----------|-------|--------|---------|-----|
-| `/pair/initiate` | 10 | 60s | `PAIR_LIMITER` | IP |
-| `/pair/complete` | 10 | 60s | `PAIR_LIMITER` | IP |
-| `/pairing` | 10 | 60s | `PAIR_LIMITER` | device ID or IP |
-| `/device` | 10 | 60s | `PAIR_LIMITER` | device ID or IP |
-| `/token` | 30 | 60s | `TOKEN_LIMITER` | **IP** (body untrusted pre-auth) |
-| `/turn/credentials` | 20 | 60s | `TURN_LIMITER` | device ID or IP |
-| `/ws` | 8 | 10s | `WS_LIMITER` | IP |
-
-Max 5 concurrent WebSocket connections per device (`MAX_WS_CONNECTIONS_PER_DEVICE`).
+- Strict mode + `noUncheckedIndexedAccess` (hence `!` on indexed access)
+- Error bodies: worker → `{error, requestId}`; DO → `{error}`. Logging is `console.warn/error` with `[tag]` prefixes.
 
 ## Testing
 
-Vitest with mocked DO environment. Unit tests in `src/__tests__/`, integration in `src/__tests__/integration/`.
+Vitest, no Miniflare/workerd — tests call `doInstance.fetch()` and the WS handler methods directly. Integration tests (`src/__tests__/integration/`) use the same mocks, just multi-step flows. Real Web Crypto; Ed25519 keys generated per test.
 
 | Helper | Purpose |
 |--------|---------|
-| `helpers/mock-do.ts` | `createTestDO()` — mocked SQL, KV, WebSocket lifecycle |
+| `helpers/mock-do.ts` | `createTestDO()` → `{doInstance, mockState}`; `createMockRateLimit()`, `createMockKVStorage()` |
 | `helpers/mock-sql-storage.ts` | sql.js WASM SQLite matching Cloudflare's `SqlStorage` API |
-| `helpers/mock-websocket.ts` | `MockWebSocket` with `sent[]`, attachment tracking, `messagesOfType()` |
+| `helpers/mock-websocket.ts` | `MockWebSocket` with `sent[]`, `closeCode`, attachments, `messagesOfType()` |
+| `helpers/crypto.ts` | Keypairs, signing, `fetchChallenge()`, `signedPairInitiateBody()` |
 
-Real Web Crypto used in tests (not mocked). Ed25519 keys generated per-test.
+- **Mock SQL returns rows only for queries starting with `SELECT`** — a `WITH` CTE or `RETURNING` clause silently yields nothing in tests.
+- `createMockRateLimit()` is a plain counter with no time window. `createTestDO()` env has no `PMUX_HMAC_SECRET`.
 
 ## Gotchas
 
-- **Hibernation cache rebuild**: After DO wake, `connections` map is empty. `rebuildConnectionCache()` scans `state.getWebSockets()` to restore. See `signaling.ts` — `findWebSocket()`.
-- **notifyDevice iterates ALL WebSockets**: Not the 1:1 cache — a device may have multiple connections (agent + pair CLI). Critical for `pair_complete` delivery.
-- **Request cloning**: Worker clones request before injecting auth headers (`X-Device-Id`, `X-Device-Type`, `X-Client-IP`) to preserve body stream.
-- **Pairing code**: Direct modulo indexing (alphabet is 32 chars, divides 256 evenly), base32-like alphabet (no 0/O/1/I), 6 chars, 5-min expiry, single-use.
-- **Device orphan cleanup**: On re-pair, old mobile removed only if zero remaining pairings elsewhere.
-- **JWT defenses**: Explicit header check (HS256 only — blocks alg:none), audience `pocketmux`, sub must match deviceId, clock skew ≤60s.
-- **Alarm lifecycle**: Scheduled on first WS connection (`scheduleAlarmIfNeeded()`), re-schedules only if active connections remain after cleanup sweep, pulled forward to the earliest pending `signaling_sessions` expiry (`scheduleAlarmBy()`). Unanswered `connect_request` → `peer_unavailable` to both ends after 12s (session also cleared wherever `host_offline` is sent) [SB-1001].
-- **TURN credential cache**: Credentials are requested with a 24h TTL and cached in the DO (shared by all devices), refetched once older than 1h. Concurrent refetches share one in-flight request (5s upstream timeout); on Realtime API failure, cached creds up to 12h old are served instead of a 502. Persisted to DO KV storage (`turn_cache`) so the cache survives hibernation — the one server-owned secret stored besides pairings; no user data [SB-1003].
+- **Hibernation cache rebuild**: After DO wake, `connections` is empty. `rebuildConnectionCache()` scans `state.getWebSockets()`. See `findWebSocket()`.
+- **notifyDevice iterates ALL WebSockets**, not the 1:1 cache — a device may have multiple connections (agent + pair CLI). Critical for `pair_complete` delivery; undelivered ones go to `pending_pair_complete` and are flushed on host WS auth.
+- **Request cloning**: Worker clones the request before injecting headers to preserve the body stream.
+- **Local dev rate limiting is effectively off**: `extractClientIp()` falls back to `crypto.randomUUID()` when `CF-Connecting-IP` is missing, so every request gets a fresh bucket.
+- **Pairing code**: base32-like alphabet (no 0/O/1/I), 6 chars, direct modulo (32 divides 256), 5-min expiry, single-use. Challenges: 60s TTL, consumed unconditionally on use, swept in `createChallenge()`.
+- **Re-pair**: replaced mobile gets `device_unpaired` (`replaced_by_new_pairing`); its `devices` row is removed only if no other pairings reference it. DELETE `/pairing` → `host_unpaired`, `/device` → `host_uninstalled`.
+- **JWT defenses**: exact header match (HS256 only — blocks alg:none), `aud` `pocketmux`, `sub` must equal `deviceId`, 1h expiry, ≤60s future-`iat` skew.
+- **WS relay**: `sdp_offer`/`sdp_answer`/`ice_candidate`/`connection_rejected` relay only whitelisted fields; unpaired senders are dropped silently (`connect_request` instead gets `connection_rejected` `not_paired`). Relay failure → `peer_unavailable` to sender.
+- **Alarm lifecycle**: every 30s (`ALARM_INTERVAL_MS`) while sockets remain; closes sockets idle >90s (`WS_IDLE_TIMEOUT_MS`), cleans expired pairing codes, expires `signaling_sessions`. Scheduled on WS upgrade (`scheduleAlarmIfNeeded()`), pulled earlier (never later) by `scheduleAlarmBy()`. Unanswered `connect_request` → `peer_unavailable` to both ends after 12s; session also cleared wherever `host_offline` is sent [SB-1001].
+- **Idle timeout is coupled to the agent heartbeat**: 90s = 3× the agent's 30s heartbeat, but only 2× at its 45s keepalive clamp cap (zero dropped-heartbeat margin). Don't raise that cap or lower the timeout without checking the other side.
+- **TURN credential cache**: requested with 24h TTL, shared by all devices, refetched once older than 1h. Concurrent refetches share one in-flight request (5s timeout); on Realtime API failure, cached creds up to 12h old are served instead of a 502. Persisted to DO KV (`turn_cache`) — the one server-owned secret stored besides pairings; no user data [SB-1003].
