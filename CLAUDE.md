@@ -75,7 +75,7 @@ Headers `pmux-signature` + `pmux-timestamp` (unix seconds, ±60s); `/v1/*` also 
 | DO KV + in-memory | TURN credential cache | key `turn_cache`, mirrored in `turnCache` |
 | WS attachments | `{deviceId, deviceType, authenticated, lastMessageTime}` (survives hibernation) | `serializeAttachment()` |
 
-Schema changes: `CREATE TABLE IF NOT EXISTS` + idempotent try/catch `ALTER` in `ensureSchema()`; no schema-version table. **Units differ:** `devices`/`pairings` `created_at` are seconds; every `expires_at` and `pending_pair_complete.created_at` are ms.
+Schema changes: `CREATE TABLE IF NOT EXISTS` + idempotent `ALTER` in `ensureSchema()` (guarded by a `PRAGMA table_info` column check; the older RENAME uses try/catch); no schema-version table. **Units differ:** `devices`/`pairings` `created_at` are seconds; every `expires_at` and `pending_pair_complete.created_at` are ms.
 
 ## Conventions
 
@@ -94,7 +94,7 @@ Vitest, no Miniflare/workerd — tests call `doInstance.fetch()` and the WS hand
 | `helpers/mock-websocket.ts` | `MockWebSocket` with `sent[]`, `closeCode`, attachments, `messagesOfType()` |
 | `helpers/crypto.ts` | Keypairs, signing, `fetchChallenge()`, `signedPairInitiateBody()` |
 
-- **Mock SQL returns rows only for queries starting with `SELECT`** — a `WITH` CTE or `RETURNING` clause silently yields nothing in tests.
+- **Mock SQL returns rows only for queries starting with `SELECT` or `PRAGMA`** — a `WITH` CTE or `RETURNING` clause silently yields nothing in tests.
 - `createMockRateLimit()` is a plain counter with no time window. `createTestDO()` env has no `PMUX_HMAC_SECRET`.
 
 ## Gotchas

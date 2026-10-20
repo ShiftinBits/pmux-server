@@ -210,9 +210,18 @@ export class SignalingDO implements DurableObject {
         mobile_device_id TEXT NOT NULL,
         mobile_x25519_public_key TEXT NOT NULL,
         mobile_name TEXT,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        mobile_pair_mac TEXT
       )
     `);
+
+    // Opaque pairing MAC relayed to the host (column added after initial release).
+    // Check for the column instead of catching the ALTER's error, so the
+    // migration doesn't depend on SqlStorage's error wording.
+    const pendingCols = this.sql.exec('PRAGMA table_info(pending_pair_complete)').toArray();
+    if (!pendingCols.some((col) => col['name'] === 'mobile_pair_mac')) {
+      this.sql.exec('ALTER TABLE pending_pair_complete ADD COLUMN mobile_pair_mac TEXT');
+    }
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS challenges (
@@ -429,6 +438,9 @@ export class SignalingDO implements DurableObject {
 
     // Invalidate any existing sessions for this host (prevents multiple valid codes)
     this.sql.exec('DELETE FROM pairing_sessions WHERE host_device_id = ?', hostDeviceId);
+    // Drop any pair_complete still pending from an earlier attempt: it was MAC'd
+    // with that attempt's pairing secret, so the new pair CLI would reject it.
+    this.sql.exec('DELETE FROM pending_pair_complete WHERE host_device_id = ?', hostDeviceId);
 
     let code: string;
     do {
@@ -1144,7 +1156,7 @@ export class SignalingDO implements DurableObject {
         // Only if the pairing still matches — it may have been replaced/removed since.
         const pending = this.sql
           .exec(
-            'SELECT mobile_device_id, mobile_x25519_public_key, mobile_name FROM pending_pair_complete WHERE host_device_id = ?',
+            'SELECT mobile_device_id, mobile_x25519_public_key, mobile_name, mobile_pair_mac FROM pending_pair_complete WHERE host_device_id = ?',
             payload.deviceId
           )
           .toArray()[0];
@@ -1158,6 +1170,7 @@ export class SignalingDO implements DurableObject {
               mobileDeviceId: pending['mobile_device_id'],
               mobileX25519PublicKey: pending['mobile_x25519_public_key'],
               ...(pending['mobile_name'] !== null && { mobileName: pending['mobile_name'] }),
+              ...(pending['mobile_pair_mac'] != null && { pairMac: pending['mobile_pair_mac'] }),
             });
           }
           this.sql.exec('DELETE FROM pending_pair_complete WHERE host_device_id = ?', payload.deviceId);
@@ -1424,6 +1437,7 @@ export class SignalingDO implements DurableObject {
       ed25519PublicKey?: string;
       x25519PublicKey?: string;
       name?: string;
+      pairMac?: string | null;
     };
     try {
       body = await request.json() as typeof body;
@@ -1437,6 +1451,19 @@ export class SignalingDO implements DurableObject {
         400
       );
     }
+
+    // pairMac is an opaque pass-through (the agent verifies it); optional so
+    // older mobile builds still pair, and null counts as absent. Only bound the
+    // size and charset (any base64 variant) so a MAC format change doesn't need
+    // a server deploy. Validate before consuming the code.
+    if (
+      body.pairMac != null &&
+      (typeof body.pairMac !== 'string' ||
+        !/^[A-Za-z0-9+/=_-]{1,64}$/.test(body.pairMac))
+    ) {
+      return jsonResponse({ error: 'Invalid pairMac' }, 400);
+    }
+    const pairMac = body.pairMac ?? undefined;
 
     const mobileName = validateDeviceName(body.name);
 
@@ -1497,6 +1524,7 @@ export class SignalingDO implements DurableObject {
       mobileDeviceId: body.deviceId,
       mobileX25519PublicKey: body.x25519PublicKey,
       ...(mobileName !== undefined && { mobileName }),
+      ...(pairMac !== undefined && { pairMac }),
     });
 
     // Host offline — persist the pair_complete for delivery on its next WS auth.
@@ -1504,12 +1532,13 @@ export class SignalingDO implements DurableObject {
     // add a purge to the alarm sweep if orphaned rows ever matter.
     if (delivered === 0) {
       this.sql.exec(
-        'INSERT OR REPLACE INTO pending_pair_complete (host_device_id, mobile_device_id, mobile_x25519_public_key, mobile_name, created_at) VALUES (?, ?, ?, ?, ?)',
+        'INSERT OR REPLACE INTO pending_pair_complete (host_device_id, mobile_device_id, mobile_x25519_public_key, mobile_name, created_at, mobile_pair_mac) VALUES (?, ?, ?, ?, ?, ?)',
         session.hostDeviceId,
         body.deviceId,
         body.x25519PublicKey,
         mobileName ?? null,
-        Date.now()
+        Date.now(),
+        pairMac ?? null
       );
     }
 
