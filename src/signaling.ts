@@ -102,11 +102,12 @@ const WS_IDLE_TIMEOUT_MS = 90_000; // 90 seconds
 /**
  * How long the host has to reply to a relayed connect_request (sdp_offer or
  * connection_rejected) before both ends get peer_unavailable [SB-1001].
- * The agent sends its offer immediately (trickle ICE), so this is generous;
- * kept below the mobile's fastest negotiation watchdog (15s) so the server's
- * signal arrives first.
+ * Must exceed the agent's worst-case pre-offer delay: on a cold TURN cache it
+ * fetches credentials first with a 10s HTTP timeout (agent peer.go), then
+ * offers. Kept below the mobile's fastest negotiation watchdog (15s) so the
+ * server's signal arrives first.
  */
-const SIGNALING_SESSION_TIMEOUT_MS = 10_000; // 10 seconds
+const SIGNALING_SESSION_TIMEOUT_MS = 12_000; // 12 seconds
 
 // --- Durable Object ---
 
@@ -808,6 +809,7 @@ export class SignalingDO implements DurableObject {
     if (attachment.deviceType === 'host') {
       const otherCount = this.countOtherActiveWsForDevice(attachment.deviceId, ws);
       if (otherCount === 0) {
+        this.clearSignalingSession(attachment.deviceId);
         this.notifyPairedMobile(attachment.deviceId, {
           type: 'host_offline',
           deviceId: attachment.deviceId,
@@ -834,6 +836,7 @@ export class SignalingDO implements DurableObject {
         attachment.deviceType === 'host' &&
         this.countOtherActiveWsForDevice(attachment.deviceId, ws) === 0
       ) {
+        this.clearSignalingSession(attachment.deviceId);
         this.notifyPairedMobile(attachment.deviceId, {
           type: 'host_offline',
           deviceId: attachment.deviceId,
@@ -912,6 +915,7 @@ export class SignalingDO implements DurableObject {
               att.deviceType === 'host' &&
               this.countOtherActiveWsForDevice(att.deviceId, ws) === 0
             ) {
+              this.clearSignalingSession(att.deviceId);
               this.notifyPairedMobile(att.deviceId, {
                 type: 'host_offline',
                 deviceId: att.deviceId,
@@ -965,10 +969,18 @@ export class SignalingDO implements DurableObject {
   }
 
   /**
+   * Drop a host's pending signaling session [SB-1001]. Called wherever the host
+   * answers or host_offline is sent, so a timeout never follows host_offline.
+   */
+  private clearSignalingSession(hostDeviceId: string): void {
+    this.ensureSchema();
+    this.sql.exec('DELETE FROM signaling_sessions WHERE host_device_id = ?', hostDeviceId);
+  }
+
+  /**
    * Expire signaling sessions whose host never replied to connect_request and
-   * tell both ends with peer_unavailable [SB-1001]. If the host's socket is
-   * already gone or stale, the mobile has received host_offline from the close
-   * handler or idle sweep — drop the session silently to avoid double-notifying.
+   * tell both ends with peer_unavailable [SB-1001]. Every socket of each device
+   * is notified — a mobile may hold separate presence and signaling sockets.
    */
   private expireSignalingSessions(now: number): void {
     this.ensureSchema();
@@ -981,12 +993,11 @@ export class SignalingDO implements DurableObject {
     for (const row of expired) {
       const hostId = row['host_device_id'] as string;
       const mobileId = row['mobile_device_id'] as string;
-      const hostWs = this.findWebSocket(hostId);
-      if (!hostWs || !this.isWebSocketFresh(hostWs)) continue;
+      // Unpaired since the request — the devices must learn nothing of each other
+      if (!this.isPaired(hostId, mobileId)) continue;
 
-      const mobileWs = this.findWebSocket(mobileId);
-      if (mobileWs) this.sendPeerUnavailable(mobileWs, hostId);
-      this.sendPeerUnavailable(hostWs, mobileId);
+      this.notifyDevice(mobileId, { type: 'peer_unavailable', deviceId: hostId });
+      this.notifyDevice(hostId, { type: 'peer_unavailable', deviceId: mobileId });
     }
   }
 
@@ -1236,7 +1247,7 @@ export class SignalingDO implements DurableObject {
       sender.deviceType === 'host' &&
       (data.type === 'sdp_offer' || data.type === 'connection_rejected')
     ) {
-      this.sql.exec('DELETE FROM signaling_sessions WHERE host_device_id = ?', hostId);
+      this.clearSignalingSession(hostId);
     }
 
     const targetWs = this.findWebSocket(data.targetDeviceId);
