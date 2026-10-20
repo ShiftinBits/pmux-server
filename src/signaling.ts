@@ -218,8 +218,12 @@ export class SignalingDO implements DurableObject {
     // Opaque pairing MAC relayed to the host (column added after initial release)
     try {
       this.sql.exec('ALTER TABLE pending_pair_complete ADD COLUMN mobile_pair_mac TEXT');
-    } catch {
-      // Column already exists (fresh CREATE TABLE above or earlier migration)
+    } catch (err) {
+      // Column already exists (fresh CREATE TABLE above or earlier migration);
+      // anything else is a real schema failure and must not be swallowed.
+      if (!(err instanceof Error) || !/duplicate column/i.test(err.message)) {
+        throw err;
+      }
     }
 
     this.sql.exec(`
@@ -1449,12 +1453,12 @@ export class SignalingDO implements DurableObject {
     }
 
     // pairMac is an opaque pass-through (the agent verifies it); optional so
-    // older mobile builds still pair. Validate before consuming the code.
+    // older mobile builds still pair. Shape is a 32-byte MAC in standard padded
+    // base64 (44 chars). Validate before consuming the code.
     if (
       body.pairMac !== undefined &&
       (typeof body.pairMac !== 'string' ||
-        body.pairMac.length > 64 ||
-        !/^[A-Za-z0-9+/]+={0,2}$/.test(body.pairMac))
+        !/^[A-Za-z0-9+/]{43}=$/.test(body.pairMac))
     ) {
       return jsonResponse({ error: 'Invalid pairMac' }, 400);
     }

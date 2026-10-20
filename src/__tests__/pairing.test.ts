@@ -557,21 +557,24 @@ describe('POST /pair/complete', () => {
       expect('mobileName' in msgs[0]).toBe(false);
     });
 
+    // 32-byte MAC, standard base64 with padding
+    const VALID_PAIR_MAC = 'A'.repeat(43) + '=';
+
     it('relays pairMac on the live path', async () => {
-      const { liveWs } = await setupPairing(true, undefined, 'dGVzdC1tYWM=');
+      const { liveWs } = await setupPairing(true, undefined, VALID_PAIR_MAC);
 
       const msgs = liveWs!.messagesOfType('pair_complete');
       expect(msgs).toHaveLength(1);
-      expect(msgs[0]['pairMac']).toBe('dGVzdC1tYWM=');
+      expect(msgs[0]['pairMac']).toBe(VALID_PAIR_MAC);
     });
 
     it('persists pairMac and delivers it exactly once on the deferred path', async () => {
-      const { authHostWs } = await setupPairing(false, undefined, 'dGVzdC1tYWM=');
+      const { authHostWs } = await setupPairing(false, undefined, VALID_PAIR_MAC);
 
       const firstWs = await authHostWs();
       const msgs = firstWs.messagesOfType('pair_complete');
       expect(msgs).toHaveLength(1);
-      expect(msgs[0]['pairMac']).toBe('dGVzdC1tYWM=');
+      expect(msgs[0]['pairMac']).toBe(VALID_PAIR_MAC);
 
       const secondWs = await authHostWs();
       expect(secondWs.messagesOfType('pair_complete')).toHaveLength(0);
@@ -592,7 +595,10 @@ describe('POST /pair/complete', () => {
 
     it.each([
       ['non-string', 12345],
-      ['over 64 chars', 'A'.repeat(65)],
+      ['over 44 chars', 'A'.repeat(45)],
+      ['wrong length', 'dGVzdC1tYWM='],
+      ['base64url', 'A'.repeat(42) + '-='],
+      ['unpadded', 'A'.repeat(44)],
       ['bad charset', 'not base64!!'],
       ['empty string', ''],
     ])('rejects a malformed pairMac (%s) with 400', async (_label, badMac) => {
