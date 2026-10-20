@@ -1619,4 +1619,37 @@ describe('signaling session timeout [SB-1001]', () => {
     await doInstance.alarm();
     expect(mockState.scheduledAlarm).toBe(T0 + 12_000);
   });
+
+  it('clears the session when the idle sweep reaps the host', async () => {
+    await connectRequest();
+    // Host froze right after the relay — its socket goes idle past the window
+    const att = hostWs.deserializeAttachment() as Record<string, unknown>;
+    att.lastMessageTime = T0 - 100_000;
+    hostWs.serializeAttachment(att);
+
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+  });
+
+  it('clears the session when a retry finds the host stale', async () => {
+    await connectRequest();
+    const att = hostWs.deserializeAttachment() as Record<string, unknown>;
+    att.lastMessageTime = T0 - 100_000;
+    hostWs.serializeAttachment(att);
+
+    at(T0 + 5_000);
+    await connectRequest();
+    expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+
+    // Host recovers before the old expiry; the stale row must not fire
+    att.lastMessageTime = T0 + 6_000;
+    hostWs.serializeAttachment(att);
+    at(T0 + 12_001);
+    await doInstance.alarm();
+
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+  });
 });

@@ -1195,6 +1195,7 @@ export class SignalingDO implements DurableObject {
     const targetWs = this.findWebSocket(targetDeviceId);
     if (!targetWs || !this.isWebSocketFresh(targetWs)) {
       // Paired but offline → send host_offline so mobile can schedule reconnect
+      if (sender.deviceType === 'mobile') this.clearSignalingSession(hostId);
       wsSend(ws, { type: 'host_offline', deviceId: targetDeviceId });
       return;
     }
