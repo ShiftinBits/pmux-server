@@ -9,8 +9,20 @@
 import type { Env } from './worker';
 import type { TurnCredentials } from '@pocketmux/shared';
 
-/** TTL for TURN credentials in seconds (1 hour). */
-const CREDENTIAL_TTL = 3600;
+/**
+ * TTL for TURN credentials in seconds (24 hours). Cloudflare advises a TTL
+ * longer than the expected TURN session — relayed tmux sessions run for hours.
+ */
+const CREDENTIAL_TTL = 86400;
+
+/** Age after which the DO's cached credentials are refetched (1 hour). */
+export const TURN_REFRESH_AGE_MS = 60 * 60 * 1000;
+
+/** Oldest cached credentials served when a refetch fails (12 hours — still ≥12h valid). */
+export const TURN_MAX_SERVE_AGE_MS = 12 * 60 * 60 * 1000;
+
+/** Abort the Realtime API call after this long so a hung upstream can't stall requests. */
+const FETCH_TIMEOUT_MS = 5000;
 
 /** Expected ICE server URLs from Cloudflare's TURN service. */
 const ICE_URLS = [
@@ -33,6 +45,7 @@ export async function generateTurnCredentials(env: Env): Promise<TurnCredentials
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ ttl: CREDENTIAL_TTL }),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {

@@ -35,6 +35,7 @@ Single global Durable Object instance — `env.SIGNALING.idFromName('global')` i
 | SQLite (persistent) | devices, pairings, pairing_sessions, signaling_sessions | `state.storage.sql` |
 | Rate Limiting binding | Per-endpoint request limits | native Workers Rate Limiting (`env.*_LIMITER`) |
 | In-memory maps | WebSocket connection cache, per-device WS counts | `Map<string, WebSocket>` |
+| DO KV storage + in-memory | TURN credential cache | `state.storage` key `turn_cache`, mirrored in `turnCache` |
 | WS Attachments | Per-socket metadata (survives hibernation) | `serializeAttachment()` |
 
 ### Endpoints
@@ -92,3 +93,4 @@ Real Web Crypto used in tests (not mocked). Ed25519 keys generated per-test.
 - **Device orphan cleanup**: On re-pair, old mobile removed only if zero remaining pairings elsewhere.
 - **JWT defenses**: Explicit header check (HS256 only — blocks alg:none), audience `pocketmux`, sub must match deviceId, clock skew ≤60s.
 - **Alarm lifecycle**: Scheduled on first WS connection (`scheduleAlarmIfNeeded()`), re-schedules only if active connections remain after cleanup sweep, pulled forward to the earliest pending `signaling_sessions` expiry (`scheduleAlarmBy()`). Unanswered `connect_request` → `peer_unavailable` to both ends after 12s (session also cleared wherever `host_offline` is sent) [SB-1001].
+- **TURN credential cache**: Credentials are requested with a 24h TTL and cached in the DO (shared by all devices), refetched once older than 1h. Concurrent refetches share one in-flight request (5s upstream timeout); on Realtime API failure, cached creds up to 12h old are served instead of a 502. Persisted to DO KV storage (`turn_cache`) so the cache survives hibernation — the one server-owned secret stored besides pairings; no user data [SB-1003].

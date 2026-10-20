@@ -8,9 +8,9 @@
  */
 
 import type { Env } from './worker';
-import type { DeviceType, SignalingClientMessage, HostOnlineMessage } from '@pocketmux/shared';
+import type { DeviceType, SignalingClientMessage, HostOnlineMessage, TurnCredentials } from '@pocketmux/shared';
 import { verifyEd25519Signature, createJWT, verifyJWT } from './auth';
-import { generateTurnCredentials } from './turn';
+import { generateTurnCredentials, TURN_REFRESH_AGE_MS, TURN_MAX_SERVE_AGE_MS } from './turn';
 import {
   rateLimitResponse,
   MAX_WS_CONNECTIONS_PER_DEVICE,
@@ -18,6 +18,14 @@ import {
 
 /** Maximum WebSocket message length in characters (16K — generous for SDP/ICE signaling). */
 const MAX_WS_MESSAGE_SIZE = 16_384;
+
+/** DO KV storage key for the cached TURN credentials. */
+const TURN_CACHE_KEY = 'turn_cache';
+
+interface TurnCacheEntry {
+  creds: TurnCredentials;
+  fetchedAt: number;
+}
 
 /** Maximum device name length in characters. */
 const MAX_DEVICE_NAME_LENGTH = 64;
@@ -121,6 +129,12 @@ export class SignalingDO implements DurableObject {
 
   // In-memory WebSocket connection count per device ID (for abuse prevention)
   private wsConnectionCounts = new Map<string, number>();
+
+  // TURN credential cache, mirrored to DO KV storage (TURN_CACHE_KEY) so it survives
+  // hibernation. Shared by all devices: any authenticated device can already obtain
+  // valid credentials, and they are time-limited and relay-only.
+  private turnCache: TurnCacheEntry | null = null;
+  private turnFetch: Promise<TurnCredentials> | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -599,6 +613,11 @@ export class SignalingDO implements DurableObject {
   /** Simulate DO hibernation by clearing in-memory connection counts (for testing). */
   clearWsConnectionCounts(): void {
     this.wsConnectionCounts.clear();
+  }
+
+  /** Simulate DO hibernation by clearing the in-memory TURN credential cache (for testing). */
+  clearTurnCache(): void {
+    this.turnCache = null;
   }
 
   // --- HTTP routing ---
@@ -1625,14 +1644,41 @@ export class SignalingDO implements DurableObject {
    * GET /turn/credentials
    * Returns TURN credentials from Cloudflare Realtime API.
    * Rate limited per device ID. Routed through DO for rate limit storage access.
+   * Cached for TURN_REFRESH_AGE_MS (in memory + DO KV storage); concurrent refetches
+   * share one request, and a failed refetch falls back to cached credentials up to
+   * TURN_MAX_SERVE_AGE_MS old.
    */
   private async handleTurnCredentials(): Promise<Response> {
+    if (!this.turnCache) {
+      const stored = await this.state.storage.get<TurnCacheEntry>(TURN_CACHE_KEY);
+      this.turnCache ??= stored ?? null;
+    }
+    if (this.turnCache && Date.now() - this.turnCache.fetchedAt < TURN_REFRESH_AGE_MS) {
+      return jsonResponse(this.turnCache.creds);
+    }
+
     try {
-      const credentials = await generateTurnCredentials(this.env);
-      return jsonResponse(credentials);
+      this.turnFetch ??= this.refreshTurnCredentials();
+      return jsonResponse(await this.turnFetch);
     } catch (err) {
+      if (this.turnCache && Date.now() - this.turnCache.fetchedAt < TURN_MAX_SERVE_AGE_MS) {
+        console.warn('[turn] Refresh failed, serving cached credentials:', err);
+        return jsonResponse(this.turnCache.creds);
+      }
       console.error('[turn] Failed to generate credentials:', err);
       return jsonResponse({ error: 'Failed to generate TURN credentials' }, 502);
+    }
+  }
+
+  /** Fetch fresh TURN credentials and update the cache. Shared by concurrent callers via turnFetch. */
+  private async refreshTurnCredentials(): Promise<TurnCredentials> {
+    try {
+      const creds = await generateTurnCredentials(this.env);
+      this.turnCache = { creds, fetchedAt: Date.now() };
+      await this.state.storage.put(TURN_CACHE_KEY, this.turnCache);
+      return creds;
+    } finally {
+      this.turnFetch = null;
     }
   }
 }
