@@ -3,6 +3,7 @@ import { createTestDO, type MockDOState } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
 import type { SignalingDO } from '../signaling';
+import { version } from '../../package.json';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
@@ -489,7 +490,7 @@ describe('Health endpoint [T3.10]', () => {
 
     const body = await response.json() as Record<string, unknown>;
     expect(body.status).toBe('ok');
-    expect(body.version).toBe('0.1.0');
+    expect(body.version).toBe(version);
     expect(typeof body.timestamp).toBe('number');
     expect(body.timestamp).toBeGreaterThan(0);
   });
