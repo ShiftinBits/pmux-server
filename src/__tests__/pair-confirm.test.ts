@@ -353,6 +353,77 @@ describe('host-confirmed pairing (SB-1348)', () => {
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('[pair]'), expect.any(Error));
   });
 
+  it('rolls back a failed commit: the old pairing survives and the old mobile is not told', async () => {
+    const { do2, code, hostWs, authWs, complete, send, heldCount } = await setup();
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    do2.registerDevice('mobile-old', 'ed25519-pub-key-mobile-old', 'mobile');
+    do2.createPairing(AGENT_1, 'mobile-old');
+    const oldWs = await authWs('mobile-old', 'mobile');
+
+    const pending = complete(code);
+    await relayed(hostWs!);
+    // Fails after the old pairing was removed and the new mobile registered.
+    vi.spyOn(do2, 'createPairing').mockImplementation(() => {
+      throw new Error('storage failure');
+    });
+
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    expect((await pending).status).toBe(500);
+    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: 'mobile-1', ok: false }]);
+    expect(heldCount()).toBe(0);
+    expect(do2.isPaired(AGENT_1, 'mobile-old')).toBe(true);
+    expect(do2.getDevice('mobile-old')).not.toBeNull();
+    expect(do2.getDevice('mobile-1')).toBeNull();
+    expect(oldWs.messagesOfType('device_unpaired')).toHaveLength(0);
+  });
+
+  it('a second /pair/complete for the host supersedes the held one with 409', async () => {
+    const { do2, code, hostWs, complete, send, heldCount } = await setup();
+    const first = complete(code, 'mobile-1');
+    await relayed(hostWs!);
+
+    // Codes are single-use, so plant a second session for the same host directly.
+    do2['sql'].exec(
+      'INSERT INTO pairing_sessions (code, host_device_id, host_x25519_public_key, host_ed_public_key, expires_at, pair_confirm) VALUES (?, ?, ?, ?, ?, 1)',
+      'ZZZZZZ', AGENT_1, 'x25519-pub-key-agent', 'unused', Date.now() + 60_000
+    );
+    const second = complete('ZZZZZZ', 'mobile-2');
+    const res = await first;
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'Pairing superseded by a newer request' });
+    await relayed(hostWs!, 2);
+    expect(heldCount()).toBe(1);
+
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-2' });
+    expect((await second).status).toBe(200);
+    expect(do2.isPaired(AGENT_1, 'mobile-2')).toBe(true);
+  });
+
+  it.each([
+    { path: '/device', action: 'uninstall' },
+    { path: '/pairing', action: 'unpair' },
+  ])('host $action during the hold answers 409 and a late pair_accept commits nothing', async ({ path }) => {
+    const { do2, code, hostWs, complete, send, heldCount } = await setup();
+    const pending = complete(code);
+    await relayed(hostWs!);
+
+    const del = await do2.fetch(new Request(`http://localhost${path}`, {
+      method: 'DELETE',
+      headers: { 'X-Device-Id': AGENT_1 },
+    }));
+    expect(del.status).toBe(200);
+
+    const res = await pending;
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'Pairing cancelled by the host' });
+    expect(heldCount()).toBe(0);
+
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: 'mobile-1', ok: false }]);
+    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(false);
+    expect(do2.getDevice('mobile-1')).toBeNull();
+  });
+
   it.each([
     { field: 'deviceId', value: 'd'.repeat(65) },
     { field: 'ed25519PublicKey', value: 'k'.repeat(129) },
