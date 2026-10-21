@@ -72,6 +72,7 @@ Headers `pmux-signature` + `pmux-timestamp` (unix seconds, ±60s); `/v1/*` also 
 | SQLite | `devices`, `pairings`, `pairing_sessions`, `pending_pair_complete`, `challenges`, `signaling_sessions` | `state.storage.sql`, created in `ensureSchema()` |
 | Rate Limiting binding | Per-endpoint request limits | native Workers Rate Limiting (`env.*_LIMITER`) |
 | In-memory maps | WebSocket connection cache, per-device WS counts | `connections`, rebuilt after hibernation |
+| In-memory map | Held `/pair/complete` requests awaiting `pair_accept`/`pair_reject` (30s) | `pendingPairs`, keyed by host; the in-flight request keeps the DO awake |
 | DO KV + in-memory | TURN credential cache | key `turn_cache`, mirrored in `turnCache` |
 | WS attachments | `{deviceId, deviceType, authenticated, lastMessageTime}` (survives hibernation) | `serializeAttachment()` |
 
@@ -100,7 +101,10 @@ Vitest, no Miniflare/workerd — tests call `doInstance.fetch()` and the WS hand
 ## Gotchas
 
 - **Hibernation cache rebuild**: After DO wake, `connections` is empty. `rebuildConnectionCache()` scans `state.getWebSockets()`. See `findWebSocket()`.
-- **notifyDevice iterates ALL WebSockets**, not the 1:1 cache — a device may have multiple connections (agent + pair CLI). Critical for `pair_complete` delivery; undelivered ones go to `pending_pair_complete` and are flushed on host WS auth.
+- **notifyDevice iterates ALL WebSockets**, not the 1:1 cache — a device may have multiple connections (agent + pair CLI). Critical for `pair_complete` delivery.
+- **Two pairing paths** [SB-1348], chosen by `pairing_sessions.pair_confirm` (agent sends `pairConfirm: true` at initiate):
+  - *Confirming:* `/pair/complete` relays `pair_complete` and holds the request in `pendingPairs` (30s). The host answers `pair_accept`/`pair_reject`. Only an accept runs `commitPairing` (evict old mobile, register, create pairing), and the host gets `pair_result {ok}`. Otherwise the result is 403 (reject), 504 (timeout) or 409 (superseded by a newer complete).
+  - *Legacy:* commits immediately. An undelivered `pair_complete` goes to `pending_pair_complete` and is flushed on host WS auth.
 - **Request cloning**: Worker clones the request before injecting headers to preserve the body stream.
 - **Local dev rate limiting is effectively off**: `extractClientIp()` falls back to `crypto.randomUUID()` when `CF-Connecting-IP` is missing, so every request gets a fresh bucket.
 - **Pairing code**: base32-like alphabet (no 0/O/1/I), 6 chars, direct modulo (32 divides 256), 5-min expiry, single-use. Challenges: 60s TTL, consumed unconditionally on use, swept in `createChallenge()`.
