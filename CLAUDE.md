@@ -40,7 +40,7 @@ Single global Durable Object instance — `env.SIGNALING.idFromName('global')` i
 2. `/health` (JSON status) and `/` (308 → `pmux.io`) return immediately — no HMAC, auth, or rate limit.
 3. If `PMUX_HMAC_SECRET` is set → HMAC check (below). Applies to `/ws` upgrades too.
 4. Path not in `PUBLIC_PATHS` → JWT required (`authenticateRequest()`). Runs before routing, so unknown paths without a JWT get 401, not 404.
-5. Inject `X-Client-IP` (all) + `X-Device-Id`/`X-Device-Type` (JWT routes), then `routeToDO()` strips `/auth` (`/auth/token` → `/token`). Query string is dropped.
+5. Set `X-Client-IP` (all) + `X-Device-Id`/`X-Device-Type` (JWT routes; stripped on public routes), overwriting any client-sent copy, then `routeToDO()` strips `/auth` (`/auth/token` → `/token`). Query string is dropped.
 
 ### Endpoints
 

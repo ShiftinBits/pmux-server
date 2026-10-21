@@ -102,6 +102,11 @@ export default {
     // Extract client IP for rate limiting (Cloudflare provides CF-Connecting-IP)
     const clientIp = extractClientIp(request);
 
+    // Context headers for the DO. set()/delete() replace any client-sent copy;
+    // spreading into new Headers() would append, letting clients spoof rate-limit keys.
+    const headers = new Headers(request.headers);
+    headers.set('X-Client-IP', clientIp);
+
     // Auth middleware: verify JWT for non-public routes
     if (!PUBLIC_PATHS.has(normalizedPathname)) {
       const authResult = await authenticateRequest(request, env);
@@ -118,24 +123,15 @@ export default {
           startTime
         );
       }
-      // Clone request to preserve body stream, then inject auth context headers
-      request = new Request(request.clone(), {
-        headers: new Headers([
-          ...request.headers,
-          ['X-Device-Id', authResult.payload!.deviceId],
-          ['X-Device-Type', authResult.payload!.deviceType],
-          ['X-Client-IP', clientIp],
-        ]),
-      });
+      headers.set('X-Device-Id', authResult.payload!.deviceId);
+      headers.set('X-Device-Type', authResult.payload!.deviceType);
     } else {
-      // Public routes still need client IP for rate limiting
-      request = new Request(request.clone(), {
-        headers: new Headers([
-          ...request.headers,
-          ['X-Client-IP', clientIp],
-        ]),
-      });
+      // Public routes carry no authenticated device identity
+      headers.delete('X-Device-Id');
+      headers.delete('X-Device-Type');
     }
+    // Clone request to preserve body stream
+    request = new Request(request.clone(), { headers });
 
     // Routes that dispatch to the Durable Object (including TURN credentials)
     if (normalizedPathname.startsWith('/auth/') || normalizedPathname === '/ws' || normalizedPathname === '/turn/credentials') {
