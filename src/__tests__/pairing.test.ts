@@ -511,6 +511,15 @@ describe('POST /pair/complete', () => {
       expect(msgs[0]['mobileX25519PublicKey']).toBe('x25519-pub-key-mobile');
     });
 
+    it('sends the auth reply before the deferred pair_complete', async () => {
+      const { authHostWs } = await setupPairing(false);
+
+      const hostWs = await authHostWs();
+      const types = hostWs.sent.map((m) => (m as { type: string }).type);
+      expect(types.indexOf('auth')).toBeGreaterThanOrEqual(0);
+      expect(types.indexOf('auth')).toBeLessThan(types.indexOf('pair_complete'));
+    });
+
     it('delivers the deferred pair_complete only once', async () => {
       const { authHostWs } = await setupPairing(false);
 
@@ -974,7 +983,7 @@ describe('POST /pair/complete', () => {
     });
 
     expect(status).toBe(409);
-    expect(data['error']).toContain('Device type conflict');
+    expect(data['error']).toBe('Device conflict: device cannot be registered');
 
     // Original device should still be a host
     const device = doInstance.getDevice(AGENT_1);

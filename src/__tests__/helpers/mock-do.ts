@@ -70,6 +70,19 @@ export async function createTestDO(): Promise<{ doInstance: SignalingDO; mockSta
       sql: mockSql,
       get: mockKV.get,
       put: mockKV.put,
+      // Same contract as DurableObjectStorage.transactionSync: commit when the
+      // closure returns, roll back and rethrow when it throws.
+      transactionSync<T>(closure: () => T): T {
+        mockSql.exec('BEGIN');
+        try {
+          const result = closure();
+          mockSql.exec('COMMIT');
+          return result;
+        } catch (err) {
+          mockSql.exec('ROLLBACK');
+          throw err;
+        }
+      },
       async setAlarm(scheduledTime: number): Promise<void> {
         scheduledAlarm = scheduledTime;
         trackableState.scheduledAlarm = scheduledTime;

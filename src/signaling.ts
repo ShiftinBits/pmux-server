@@ -9,7 +9,16 @@
  */
 
 import type { Env } from './worker';
-import type { DeviceType, SignalingClientMessage, HostOnlineMessage, TurnCredentials } from '@pocketmux/shared';
+import type {
+  DeviceType,
+  SignalingClientMessage,
+  HostOnlineMessage,
+  TurnCredentials,
+  PairCompleteMessage,
+  PairAcceptMessage,
+  PairRejectMessage,
+  PairResultMessage,
+} from '@pocketmux/shared';
 import { verifyEd25519Signature, createJWT, verifyJWT } from './auth';
 import { generateTurnCredentials, TURN_REFRESH_AGE_MS, TURN_MAX_SERVE_AGE_MS } from './turn';
 import {
@@ -73,6 +82,19 @@ export interface PairingSession {
   hostX25519PublicKey: string;
   hostEdPublicKey: string;
   expiresAt: number;
+  /** The host confirms pair_complete (pair_accept/pair_reject) before the server commits. */
+  pairConfirm: boolean;
+}
+
+/** A /pair/complete request held open until the host accepts or rejects [SB-1348]. */
+interface PendingPair {
+  /** Relayed to the host, and re-sent to a host socket that authenticates during the hold. */
+  pairComplete: PairCompleteMessage;
+  mobileEd25519PublicKey: string;
+  hostX25519PublicKey: string;
+  hostName: string | null;
+  resolve: (response: Response) => void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 export interface StoredPairing {
@@ -118,6 +140,17 @@ const WS_IDLE_TIMEOUT_MS = 90_000; // 90 seconds
  */
 const SIGNALING_SESSION_TIMEOUT_MS = 12_000; // 12 seconds
 
+/**
+ * How long /pair/complete waits for a confirming host's pair_accept/pair_reject
+ * before answering 504 [SB-1348]. Covers the pair CLI connecting its WebSocket
+ * after the QR is shown. The mobile's fetch timeout (45s) must stay above it.
+ */
+const PAIR_CONFIRM_TIMEOUT_MS = 30_000; // 30 seconds
+
+/** Upper bounds on /pair/complete identity fields (a 32-hex ID and base64 32-byte keys fit well inside). */
+const MAX_PAIR_DEVICE_ID_LENGTH = 64;
+const MAX_PAIR_PUBLIC_KEY_LENGTH = 128;
+
 // --- Durable Object ---
 
 export class SignalingDO implements DurableObject {
@@ -136,6 +169,11 @@ export class SignalingDO implements DurableObject {
   // valid credentials, and they are time-limited and relay-only.
   private turnCache: TurnCacheEntry | null = null;
   private turnFetch: Promise<TurnCredentials> | null = null;
+
+  // Held /pair/complete requests by host device ID [SB-1348]. In-memory only:
+  // the in-flight HTTP request keeps the DO from hibernating, and a DO restart
+  // drops the request with nothing committed.
+  private pendingPairs = new Map<string, PendingPair>();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -221,6 +259,12 @@ export class SignalingDO implements DurableObject {
     const pendingCols = this.sql.exec('PRAGMA table_info(pending_pair_complete)').toArray();
     if (!pendingCols.some((col) => col['name'] === 'mobile_pair_mac')) {
       this.sql.exec('ALTER TABLE pending_pair_complete ADD COLUMN mobile_pair_mac TEXT');
+    }
+
+    // Host confirms pair_complete before the server commits [SB-1348]
+    const sessionCols = this.sql.exec('PRAGMA table_info(pairing_sessions)').toArray();
+    if (!sessionCols.some((col) => col['name'] === 'pair_confirm')) {
+      this.sql.exec('ALTER TABLE pairing_sessions ADD COLUMN pair_confirm INTEGER NOT NULL DEFAULT 0');
     }
 
     this.sql.exec(`
@@ -430,7 +474,8 @@ export class SignalingDO implements DurableObject {
   createPairingSession(
     hostDeviceId: string,
     hostX25519PublicKey: string,
-    hostEdPublicKey: string
+    hostEdPublicKey: string,
+    pairConfirm = false
   ): string {
     this.ensureSchema();
     // Clean up expired sessions
@@ -441,6 +486,8 @@ export class SignalingDO implements DurableObject {
     // Drop any pair_complete still pending from an earlier attempt: it was MAC'd
     // with that attempt's pairing secret, so the new pair CLI would reject it.
     this.sql.exec('DELETE FROM pending_pair_complete WHERE host_device_id = ?', hostDeviceId);
+    // Likewise a /pair/complete still held for a confirming host [SB-1348].
+    this.settlePendingPair(hostDeviceId, pairSupersededResponse());
 
     let code: string;
     do {
@@ -448,12 +495,13 @@ export class SignalingDO implements DurableObject {
     } while (this.sql.exec('SELECT 1 FROM pairing_sessions WHERE code = ?', code).toArray().length > 0);
 
     this.sql.exec(
-      'INSERT INTO pairing_sessions (code, host_device_id, host_x25519_public_key, host_ed_public_key, expires_at) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO pairing_sessions (code, host_device_id, host_x25519_public_key, host_ed_public_key, expires_at, pair_confirm) VALUES (?, ?, ?, ?, ?, ?)',
       code,
       hostDeviceId,
       hostX25519PublicKey,
       hostEdPublicKey,
-      Date.now() + 5 * 60 * 1000
+      Date.now() + 5 * 60 * 1000,
+      pairConfirm ? 1 : 0
     );
 
     return code;
@@ -468,7 +516,7 @@ export class SignalingDO implements DurableObject {
     this.cleanExpiredPairings();
 
     const rows = this.sql.exec(
-      'SELECT host_device_id, host_x25519_public_key, host_ed_public_key, expires_at FROM pairing_sessions WHERE code = ?',
+      'SELECT host_device_id, host_x25519_public_key, host_ed_public_key, expires_at, pair_confirm FROM pairing_sessions WHERE code = ?',
       code
     ).toArray();
 
@@ -807,6 +855,11 @@ export class SignalingDO implements DurableObject {
       case 'ice_candidate':
       case 'connection_rejected':
         this.relaySignalingMessage(ws, attachment, data);
+        break;
+
+      case 'pair_accept':
+      case 'pair_reject':
+        this.handlePairDecision(ws, attachment, data);
         break;
 
       default:
@@ -1152,6 +1205,10 @@ export class SignalingDO implements DurableObject {
           this.notifyDevice(pairedMobileId, hostOnlineMsg);
         }
 
+        // Auth reply before any pair_complete: a pair CLI reads the auth reply
+        // first and would drop a pair_complete that arrived ahead of it.
+        wsSend(ws, { type: 'auth', status: 'ok' });
+
         // Deliver a pair_complete that was persisted while the host was offline.
         // Only if the pairing still matches — it may have been replaced/removed since.
         const pending = this.sql
@@ -1175,6 +1232,12 @@ export class SignalingDO implements DurableObject {
           }
           this.sql.exec('DELETE FROM pending_pair_complete WHERE host_device_id = ?', payload.deviceId);
         }
+
+        // A confirming host's pair_complete is held in memory, not in SQL. Send it
+        // only to this socket; sockets that were already connected got it when
+        // /pair/complete relayed it.
+        const held = this.pendingPairs.get(payload.deviceId);
+        if (held) wsSend(ws, held.pairComplete);
       }
 
       // If mobile, send current presence snapshot for all paired hosts that are connected.
@@ -1198,9 +1261,9 @@ export class SignalingDO implements DurableObject {
         // getWebSockets() but mid-close). Re-setting here guarantees the freshly
         // authenticated WS is always the routable entry.
         this.connections.set(payload.deviceId, ws);
-      }
 
-      wsSend(ws, { type: 'auth', status: 'ok' });
+        wsSend(ws, { type: 'auth', status: 'ok' });
+      }
     } catch {
       wsSend(ws, { type: 'error', error: 'Authentication failed' });
       ws.close(4001, 'Authentication failed');
@@ -1355,8 +1418,9 @@ export class SignalingDO implements DurableObject {
   /**
    * POST /pair/initiate
    * Host calls this to start pairing. Creates a pairing session.
-   * Body: { deviceId, ed25519PublicKey, x25519PublicKey, nonce, signature, name? }
-   * Returns: { pairingCode }
+   * Body: { deviceId, ed25519PublicKey, x25519PublicKey, nonce, signature, name?, pairConfirm? }
+   * Returns: { pairingCode, pairConfirm? } — pairConfirm: true is echoed when
+   * requested, telling the host this server holds /pair/complete for its decision.
    */
   private async handlePairInitiate(request: Request): Promise<Response> {
     let body: {
@@ -1366,6 +1430,7 @@ export class SignalingDO implements DurableObject {
       nonce?: string;
       signature?: string;
       name?: string;
+      pairConfirm?: boolean;
     };
     try {
       body = await request.json() as typeof body;
@@ -1415,20 +1480,28 @@ export class SignalingDO implements DurableObject {
       this.updateDeviceName(body.deviceId, body.name);
     }
 
+    const pairConfirm = body.pairConfirm === true;
     const pairingCode = this.createPairingSession(
       body.deviceId,
       body.x25519PublicKey,
-      body.ed25519PublicKey
+      body.ed25519PublicKey,
+      pairConfirm
     );
 
-    return jsonResponse({ pairingCode });
+    return jsonResponse(pairConfirm ? { pairingCode, pairConfirm } : { pairingCode });
   }
 
   /**
    * POST /pair/complete
    * Mobile calls this with the pairing code to complete pairing.
-   * Body: { pairingCode, deviceId, ed25519PublicKey, x25519PublicKey }
+   * Body: { pairingCode, deviceId, ed25519PublicKey, x25519PublicKey, name?, pairMac? }
    * Returns: { hostX25519PublicKey, hostDeviceId, hostName? }
+   * For a confirming host (pairConfirm at initiate) the request is held until
+   * the host answers: 200 accepted, 403 rejected, 504 no answer, 409 superseded
+   * by a newer pairing, cancelled by the host's unpair/uninstall, or a
+   * device-type/key conflict at commit, 500 commit failure.
+   * Either path answers 409 for a device-type/key conflict before any pairing
+   * changes.
    */
   private async handlePairComplete(request: Request): Promise<Response> {
     let body: {
@@ -1450,6 +1523,16 @@ export class SignalingDO implements DurableObject {
         { error: 'Missing required fields: pairingCode, deviceId, ed25519PublicKey, x25519PublicKey' },
         400
       );
+    }
+
+    // Bound what a held confirming-path request can pin in memory. Validate
+    // before consuming the code.
+    if (
+      typeof body.deviceId !== 'string' || body.deviceId.length > MAX_PAIR_DEVICE_ID_LENGTH ||
+      typeof body.ed25519PublicKey !== 'string' || body.ed25519PublicKey.length > MAX_PAIR_PUBLIC_KEY_LENGTH ||
+      typeof body.x25519PublicKey !== 'string' || body.x25519PublicKey.length > MAX_PAIR_PUBLIC_KEY_LENGTH
+    ) {
+      return jsonResponse({ error: 'Invalid deviceId or public key' }, 400);
     }
 
     // pairMac is an opaque pass-through (the agent verifies it); optional so
@@ -1479,53 +1562,65 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Host device not found' }, 500);
     }
 
-    // Check if this host already has a paired mobile — if so, replace it
-    const existingMobileId = this.getPairedMobile(session.hostDeviceId);
-    if (existingMobileId && existingMobileId !== body.deviceId) {
-      // Notify the old mobile that it has been unpaired
-      this.notifyDevice(existingMobileId, {
-        type: 'device_unpaired',
-        reason: 'replaced_by_new_pairing',
-        hostDeviceId: session.hostDeviceId,
-        hostName: hostDevice.name ?? undefined,
-      });
-      // Remove the old pairing (also cleans up orphaned mobile device)
-      this.removePairing(session.hostDeviceId);
-    } else if (existingMobileId) {
-      // Same mobile re-pairing — just remove old pairing, no notification needed
-      this.removePairing(session.hostDeviceId);
-    }
-
-    // Register the mobile device (rejects if device already registered as a different type)
-    try {
-      this.registerDevice(
-        body.deviceId,
-        body.ed25519PublicKey,
-        'mobile',
-        mobileName
-      );
-    } catch (err) {
-      if (err instanceof DeviceTypeConflictError) {
-        // Intentionally generic — avoid leaking stored device state to the caller
-        return jsonResponse({ error: 'Device type conflict: device is registered as a different type' }, 409);
-      }
-      throw err;
-    }
-
-    // Create the pairing
-    this.createPairing(session.hostDeviceId, body.deviceId);
-
-    // Relay mobile's X25519 key to ALL host WebSocket connections.
-    // The host may have multiple connections (background agent + pair CLI).
-    // After DO hibernation, the connections map only stores one per device,
-    // so we iterate all WebSockets directly to ensure the pair CLI receives it.
-    const delivered = this.notifyDevice(session.hostDeviceId, {
+    const pairComplete: PairCompleteMessage = {
       type: 'pair_complete',
       mobileDeviceId: body.deviceId,
       mobileX25519PublicKey: body.x25519PublicKey,
       ...(mobileName !== undefined && { mobileName }),
       ...(pairMac !== undefined && { pairMac }),
-    });
+    };
+
+    // Confirming host: hold the request until it accepts or rejects [SB-1348].
+    if (session.pairConfirm) {
+      // Fast-fail a conflict before holding the request; commitPairing
+      // re-checks at accept time.
+      if (this.hasMobileConflict(body.deviceId, body.ed25519PublicKey)) {
+        return mobileConflictResponse();
+      }
+
+      const hostDeviceId = session.hostDeviceId;
+      // createPairingSession already settles a held request when it issues a
+      // new code; settle here too so an entry is never overwritten unanswered.
+      this.settlePendingPair(hostDeviceId, pairSupersededResponse());
+      const mobileEd25519PublicKey = body.ed25519PublicKey;
+      const response = new Promise<Response>((resolve) => {
+        const entry: PendingPair = {
+          pairComplete,
+          mobileEd25519PublicKey,
+          hostX25519PublicKey: session.hostX25519PublicKey,
+          hostName: hostDevice.name,
+          resolve,
+          timer: setTimeout(() => {
+            if (this.pendingPairs.get(hostDeviceId) === entry) {
+              this.settlePendingPair(hostDeviceId, jsonResponse({ error: 'Host did not respond' }, 504));
+            }
+          }, PAIR_CONFIRM_TIMEOUT_MS),
+        };
+        this.pendingPairs.set(hostDeviceId, entry);
+      });
+
+      // Host not connected yet: handleWsAuth delivers it from pendingPairs.
+      this.notifyDevice(hostDeviceId, pairComplete);
+      return response;
+    }
+
+    // Legacy host: commit now, before the host has checked pairMac.
+    const committed = this.commitPairing(
+      session.hostDeviceId,
+      hostDevice.name,
+      body.deviceId,
+      body.ed25519PublicKey,
+      mobileName
+    );
+    if (!committed) {
+      return mobileConflictResponse();
+    }
+
+    // Relay mobile's X25519 key to ALL host WebSocket connections.
+    // The host may have multiple connections (background agent + pair CLI).
+    // After DO hibernation, the connections map only stores one per device,
+    // so we iterate all WebSockets directly to ensure the pair CLI receives it.
+    const delivered = this.notifyDevice(session.hostDeviceId, pairComplete);
 
     // Host offline — persist the pair_complete for delivery on its next WS auth.
     // ponytail: no TTL cleanup — at most one row per host, consumed on next auth;
@@ -1542,11 +1637,126 @@ export class SignalingDO implements DurableObject {
       );
     }
 
-    return jsonResponse({
-      hostX25519PublicKey: session.hostX25519PublicKey,
-      hostDeviceId: session.hostDeviceId,
-      hostName: hostDevice.name ?? '',
+    return pairCompleteResponse(session.hostDeviceId, session.hostX25519PublicKey, hostDevice.name);
+  }
+
+  /**
+   * Whether the mobile can't be registered: its ID belongs to a non-mobile
+   * device, or its Ed25519 key is already registered to a different device
+   * (devices.ed25519_public_key is UNIQUE).
+   */
+  private hasMobileConflict(mobileDeviceId: string, mobileEd25519PublicKey: string): boolean {
+    const existing = this.getDevice(mobileDeviceId);
+    if (existing && existing.deviceType !== 'mobile') return true;
+    const keyOwners = this.sql
+      .exec('SELECT 1 FROM devices WHERE ed25519_public_key = ? AND id != ?', mobileEd25519PublicKey, mobileDeviceId)
+      .toArray();
+    return keyOwners.length > 0;
+  }
+
+  /**
+   * Replace any existing pairing for the host, register the mobile and create
+   * the pairing in one transaction. Validates first and returns false on a
+   * conflict without touching the old pairing; returns true once committed.
+   * A throw rolls back, leaving the old pairing intact. The replaced mobile is
+   * told only after the commit succeeds.
+   */
+  private commitPairing(
+    hostDeviceId: string,
+    hostName: string | null,
+    mobileDeviceId: string,
+    mobileEd25519PublicKey: string,
+    mobileName: string | undefined
+  ): boolean {
+    if (this.hasMobileConflict(mobileDeviceId, mobileEd25519PublicKey)) return false;
+
+    const existingMobileId = this.getPairedMobile(hostDeviceId);
+    this.state.storage.transactionSync(() => {
+      // Remove the old pairing (also cleans up an orphaned old mobile device)
+      if (existingMobileId) this.removePairing(hostDeviceId);
+      // Validated above, so this registers (or refreshes) a mobile device
+      this.registerDevice(mobileDeviceId, mobileEd25519PublicKey, 'mobile', mobileName);
+      this.createPairing(hostDeviceId, mobileDeviceId);
     });
+
+    // A different mobile was replaced; the same mobile re-pairing isn't told.
+    if (existingMobileId && existingMobileId !== mobileDeviceId) {
+      this.notifyDevice(existingMobileId, {
+        type: 'device_unpaired',
+        reason: 'replaced_by_new_pairing',
+        hostDeviceId,
+        hostName: hostName ?? undefined,
+      });
+    }
+    return true;
+  }
+
+  /**
+   * Answer the /pair/complete request held for this host, if any, and drop it
+   * [SB-1348]. Every way a held request ends goes through here.
+   */
+  private settlePendingPair(hostDeviceId: string, response: Response): void {
+    const entry = this.pendingPairs.get(hostDeviceId);
+    if (!entry) return;
+    this.pendingPairs.delete(hostDeviceId);
+    clearTimeout(entry.timer);
+    entry.resolve(response);
+  }
+
+  /**
+   * pair_accept / pair_reject from a confirming host [SB-1348]. Settles the held
+   * /pair/complete request; on accept, commits the pairing and answers the host
+   * with pair_result so it stores the shared secret only once the server has.
+   * pair_reject gets no reply.
+   */
+  private handlePairDecision(
+    ws: WebSocket,
+    attachment: WsAttachment,
+    data: PairAcceptMessage | PairRejectMessage
+  ): void {
+    const mobileDeviceId = typeof data.mobileDeviceId === 'string' ? data.mobileDeviceId : '';
+    const isAccept = data.type === 'pair_accept';
+    const result = (ok: boolean): void => {
+      if (!isAccept) return;
+      const msg: PairResultMessage = { type: 'pair_result', mobileDeviceId, ok };
+      wsSend(ws, msg);
+    };
+
+    const hostDeviceId = attachment.deviceId;
+    const entry = attachment.deviceType === 'host' ? this.pendingPairs.get(hostDeviceId) : undefined;
+    if (!entry || entry.pairComplete.mobileDeviceId !== mobileDeviceId) {
+      result(false);
+      return;
+    }
+
+    if (!isAccept) {
+      this.settlePendingPair(hostDeviceId, jsonResponse({ error: 'Host rejected the pairing' }, 403));
+      return;
+    }
+
+    let committed: boolean;
+    try {
+      committed = this.commitPairing(
+        hostDeviceId,
+        entry.hostName,
+        mobileDeviceId,
+        entry.mobileEd25519PublicKey,
+        entry.pairComplete.mobileName
+      );
+    } catch (err) {
+      console.error(`[pair] Commit failed for host ${hostDeviceId}:`, err);
+      this.settlePendingPair(hostDeviceId, jsonResponse({ error: 'Pairing failed' }, 500));
+      result(false);
+      return;
+    }
+
+    if (!committed) {
+      this.settlePendingPair(hostDeviceId, mobileConflictResponse());
+      result(false);
+      return;
+    }
+    this.settlePendingPair(hostDeviceId, pairCompleteResponse(hostDeviceId, entry.hostX25519PublicKey, entry.hostName));
+    result(true);
   }
 
   // --- Token exchange endpoint [T1.6] ---
@@ -1623,6 +1833,9 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Missing device ID' }, 400);
     }
 
+    // A held confirming-path request must not commit after the unpair
+    this.settlePendingPair(hostDeviceId, pairCancelledResponse());
+
     // Get host device name before removing pairing (for the notification)
     const hostDevice = this.getDevice(hostDeviceId);
     const hostName = hostDevice?.name ?? undefined;
@@ -1651,6 +1864,9 @@ export class SignalingDO implements DurableObject {
     if (!hostDeviceId) {
       return jsonResponse({ error: 'Missing device ID' }, 400);
     }
+
+    // A held confirming-path request must not commit after the uninstall
+    this.settlePendingPair(hostDeviceId, pairCancelledResponse());
 
     // Get host device name before removal (for the notification)
     const hostDevice = this.getDevice(hostDeviceId);
@@ -1739,6 +1955,7 @@ function rowToPairingSession(row: Record<string, SqlStorageValue>): PairingSessi
     hostX25519PublicKey: row['host_x25519_public_key'] as string,
     hostEdPublicKey: row['host_ed_public_key'] as string,
     expiresAt: row['expires_at'] as number,
+    pairConfirm: row['pair_confirm'] === 1,
   };
 }
 
@@ -1771,6 +1988,29 @@ function jsonResponse(data: unknown, status = 200): Response {
     status,
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+/** Successful /pair/complete body. */
+function pairCompleteResponse(hostDeviceId: string, hostX25519PublicKey: string, hostName: string | null): Response {
+  return jsonResponse({ hostX25519PublicKey, hostDeviceId, hostName: hostName ?? '' });
+}
+
+/**
+ * 409 for a /pair/complete mobile that can't be registered. One message for
+ * every conflict kind, so the caller learns nothing about stored devices.
+ */
+function mobileConflictResponse(): Response {
+  return jsonResponse({ error: 'Device conflict: device cannot be registered' }, 409);
+}
+
+/** 409 for a held /pair/complete replaced by a newer pairing attempt for the host. */
+function pairSupersededResponse(): Response {
+  return jsonResponse({ error: 'Pairing superseded by a newer request' }, 409);
+}
+
+/** 409 for a held /pair/complete whose host unpaired or uninstalled meanwhile. */
+function pairCancelledResponse(): Response {
+  return jsonResponse({ error: 'Pairing cancelled by the host' }, 409);
 }
 
 /** Send a JSON message over a WebSocket. */
