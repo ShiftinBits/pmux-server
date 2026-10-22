@@ -23,10 +23,10 @@
     "wrangler": "^4.72.0"
   },
   "overrides": {
-    "undici": "^7.29.0",
+    "undici": "^7.30.1",
     "esbuild": "^0.28.1",
     "ws": "^8.21.0",
-    "sharp": "^0.35.3"
+    "sharp": "^0.35.5"
   },
   "allowScripts": {
     "esbuild": true,
