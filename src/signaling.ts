@@ -13,6 +13,7 @@ import type {
   DeviceType,
   SignalingClientMessage,
   HostOnlineMessage,
+  HostOfflineMessage,
   TurnCredentials,
   PairCompleteMessage,
   PairAcceptMessage,
@@ -866,7 +867,7 @@ export class SignalingDO implements DurableObject {
 
     // Re-auth announces host_online itself in handleWsAuth
     if (hostWasHidden && priorAtt && data.type !== 'auth') {
-      const msg: HostOnlineMessage = { type: 'host_online', deviceId: priorAtt.deviceId };
+      const msg: HostOnlineMessage = { type: 'host_online', deviceId: priorAtt.deviceId, ts: Date.now() };
       const name = this.getDevice(priorAtt.deviceId)?.name;
       if (name) msg.name = name;
       this.notifyPairedMobile(priorAtt.deviceId, msg);
@@ -959,10 +960,8 @@ export class SignalingDO implements DurableObject {
       const otherCount = this.countOtherActiveWsForDevice(attachment.deviceId, ws);
       if (otherCount === 0) {
         this.clearSignalingSession(attachment.deviceId);
-        this.notifyPairedMobile(attachment.deviceId, {
-          type: 'host_offline',
-          deviceId: attachment.deviceId,
-        });
+        const msg: HostOfflineMessage = { type: 'host_offline', deviceId: attachment.deviceId, ts: Date.now() };
+        this.notifyPairedMobile(attachment.deviceId, msg);
       }
     }
   }
@@ -986,10 +985,8 @@ export class SignalingDO implements DurableObject {
         this.countOtherActiveWsForDevice(attachment.deviceId, ws) === 0
       ) {
         this.clearSignalingSession(attachment.deviceId);
-        this.notifyPairedMobile(attachment.deviceId, {
-          type: 'host_offline',
-          deviceId: attachment.deviceId,
-        });
+        const msg: HostOfflineMessage = { type: 'host_offline', deviceId: attachment.deviceId, ts: Date.now() };
+        this.notifyPairedMobile(attachment.deviceId, msg);
       }
     }
     try {
@@ -1084,10 +1081,8 @@ export class SignalingDO implements DurableObject {
               this.countOtherActiveWsForDevice(att.deviceId, ws) === 0
             ) {
               this.clearSignalingSession(att.deviceId);
-              this.notifyPairedMobile(att.deviceId, {
-                type: 'host_offline',
-                deviceId: att.deviceId,
-              });
+              const msg: HostOfflineMessage = { type: 'host_offline', deviceId: att.deviceId, ts: Date.now() };
+              this.notifyPairedMobile(att.deviceId, msg);
             }
           }
         } else {
@@ -1281,6 +1276,7 @@ export class SignalingDO implements DurableObject {
         const hostOnlineMsg: HostOnlineMessage = {
           type: 'host_online',
           deviceId: payload.deviceId,
+          ts: Date.now(),
         };
         if (validName) {
           hostOnlineMsg.name = validName;
@@ -1333,7 +1329,7 @@ export class SignalingDO implements DurableObject {
         for (const hostDeviceId of pairedHosts) {
           if (this.findFreshWebSocket(hostDeviceId)) {
             const device = this.getDevice(hostDeviceId);
-            const msg: HostOnlineMessage = { type: 'host_online', deviceId: hostDeviceId };
+            const msg: HostOnlineMessage = { type: 'host_online', deviceId: hostDeviceId, ts: Date.now() };
             if (device?.name) {
               msg.name = device.name;
             }
@@ -1390,7 +1386,8 @@ export class SignalingDO implements DurableObject {
     if (!targetWs) {
       // Paired but offline → send host_offline so mobile can schedule reconnect
       this.clearSignalingSession(hostId);
-      wsSend(ws, { type: 'host_offline', deviceId: targetDeviceId });
+      const msg: HostOfflineMessage = { type: 'host_offline', deviceId: targetDeviceId, ts: Date.now() };
+      wsSend(ws, msg);
       return;
     }
 

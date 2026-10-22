@@ -287,6 +287,24 @@ describe('Signaling server efficiency [T3.10]', () => {
       expect(offlineMessages[0]?.['deviceId']).toBe('alarm-host');
     });
 
+    it('stamps ts on host_offline sent by the alarm idle reap [SB-1375]', async () => {
+      const now = 1_800_000_000_000;
+      vi.spyOn(Date, 'now').mockReturnValue(now);
+      const { ws: hostWs } = await connectAndAuth('alarm-host', 'host');
+      const { ws: mobileWs } = await connectAndAuth('alarm-mobile', 'mobile');
+      doInstance.createPairing('alarm-host', 'alarm-mobile');
+
+      const att = hostWs.deserializeAttachment() as Record<string, unknown>;
+      att.lastMessageTime = now - 6 * 60 * 1000;
+      hostWs.serializeAttachment(att);
+
+      await doInstance.alarm();
+
+      const offlineMessages = mobileWs.messagesOfType('host_offline');
+      expect(offlineMessages).toHaveLength(1);
+      expect(offlineMessages[0]?.['ts']).toBe(now);
+    });
+
     it('does not send host_offline for idle mobile WS closed by alarm', async () => {
       doInstance.registerDevice('alarm-host2', 'pubkey-alarm-host2', 'host');
       doInstance.registerDevice('alarm-mobile2', 'pubkey-alarm-mobile2', 'mobile');

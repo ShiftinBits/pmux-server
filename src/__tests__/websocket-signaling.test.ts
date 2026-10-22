@@ -6,6 +6,9 @@ import type { SignalingDO } from '../signaling';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
+/** Mocked Date.now() for asserting presence ts. */
+const FIXED_NOW = 1_800_000_000_000;
+
 let doInstance: SignalingDO;
 let mockState: MockDOState;
 
@@ -13,6 +16,10 @@ beforeEach(async () => {
   const result = await createTestDO();
   doInstance = result.doInstance;
   mockState = result.mockState;
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 /**
@@ -289,6 +296,33 @@ describe('WebSocket signaling [T1.8]', () => {
       );
 
       expect(mobileWs.messagesOfType('host_online')).toHaveLength(0);
+    });
+
+    it('stamps ts on host_online when the host authenticates [SB-1375]', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(FIXED_NOW);
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host');
+      doInstance.createPairing('agent-1', 'mobile-1');
+      mobileWs.sent.length = 0;
+
+      await connectAndAuth('agent-1', 'host');
+
+      const onlineMessages = mobileWs.messagesOfType('host_online');
+      expect(onlineMessages).toHaveLength(1);
+      expect(onlineMessages[0]!['ts']).toBe(FIXED_NOW);
+    });
+
+    it('stamps ts on the presence snapshot host_online [SB-1375]', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(FIXED_NOW);
+      await connectAndAuth('agent-1', 'host');
+      doInstance.registerDevice('mobile-1', 'pubkey-mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+
+      const onlineMessages = mobileWs.messagesOfType('host_online');
+      expect(onlineMessages).toHaveLength(1);
+      expect(onlineMessages[0]!['ts']).toBe(FIXED_NOW);
     });
   });
 
@@ -649,6 +683,19 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
     });
 
+    it('stamps ts on host_offline when the host disconnects [SB-1375]', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(FIXED_NOW);
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+      mobileWs.sent.length = 0;
+
+      await doInstance.webSocketClose(hostWs as unknown as WebSocket, 1000, 'normal closure', true);
+
+      const offlineMessages = mobileWs.messagesOfType('host_offline');
+      expect(offlineMessages).toHaveLength(1);
+      expect(offlineMessages[0]!['ts']).toBe(FIXED_NOW);
+    });
   });
 
   describe('connect_request relay', () => {
@@ -710,6 +757,22 @@ describe('WebSocket signaling [T1.8]', () => {
       // Should NOT receive a generic error
       const errors = mobileWs.messagesOfType('error');
       expect(errors).toHaveLength(0);
+    });
+
+    it('stamps ts on the host_offline reply for an offline host [SB-1375]', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(FIXED_NOW);
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+      mobileWs.sent.length = 0;
+
+      await doInstance.webSocketMessage(
+        mobileWs as unknown as WebSocket,
+        JSON.stringify({ type: 'connect_request', targetDeviceId: 'agent-1' })
+      );
+
+      const offlineMessages = mobileWs.messagesOfType('host_offline');
+      expect(offlineMessages).toHaveLength(1);
+      expect(offlineMessages[0]!['ts']).toBe(FIXED_NOW);
     });
 
     it('sends host_offline when the target host is stale (asleep, not yet reaped)', async () => {
@@ -1321,6 +1384,21 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(offlineMessages[0]!['deviceId']).toBe('agent-1');
     });
 
+    it('stamps ts on host_offline on webSocketError [SB-1375]', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(FIXED_NOW);
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      doInstance.createPairing('agent-1', 'mobile-1');
+      mobileWs.sent.length = 0;
+
+      await doInstance.webSocketError(hostWs as unknown as WebSocket, new Error('connection reset'));
+
+      const offlineMessages = mobileWs.messagesOfType('host_offline');
+      expect(offlineMessages).toHaveLength(1);
+      expect(offlineMessages[0]!['ts']).toBe(FIXED_NOW);
+    });
+
     it('handles unknown message type', async () => {
       const { ws } = await connectAndAuth('agent-1', 'host');
       ws.sent.length = 0;
@@ -1505,6 +1583,27 @@ describe('WebSocket signaling [T1.8]', () => {
       );
 
       expect(mobileWs.messagesOfType('host_online')).toHaveLength(1);
+    });
+
+    it('stamps ts on the re-announced host_online [SB-1375]', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(FIXED_NOW);
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      hostWs.serializeAttachment({
+        deviceId: 'agent-1',
+        deviceType: 'host',
+        authenticated: true,
+        lastMessageTime: FIXED_NOW - 10 * 60 * 1000,
+      });
+      mobileWs.sent.length = 0;
+
+      await doInstance.webSocketMessage(hostWs as unknown as WebSocket, JSON.stringify({ type: 'presence' }));
+
+      const onlineMessages = mobileWs.messagesOfType('host_online');
+      expect(onlineMessages).toHaveLength(1);
+      expect(onlineMessages[0]!['ts']).toBe(FIXED_NOW);
     });
 
     it('does not re-announce when another socket of the host is still fresh [SB-1004]', async () => {
