@@ -1372,6 +1372,7 @@ describe('WebSocket signaling [T1.8]', () => {
         deviceId: 'mobile-1',
         deviceType: 'mobile',
         authenticated: true,
+        lastMessageTime: Date.now(),
       });
       brokenWs.send = () => { throw new Error('WebSocket closed'); };
       doInstance.setConnection('mobile-1', brokenWs as unknown as WebSocket);
@@ -1398,6 +1399,66 @@ describe('WebSocket signaling [T1.8]', () => {
       const unavailable = hostWs.messagesOfType('peer_unavailable');
       expect(unavailable).toHaveLength(1);
       expect(unavailable[0]!['deviceId']).toBe('mobile-1');
+    });
+
+    it('treats a stale (idle) target as unavailable and relays nothing [SB-1360]', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      mobileWs.serializeAttachment({
+        deviceId: 'mobile-1',
+        deviceType: 'mobile',
+        authenticated: true,
+        lastMessageTime: Date.now() - 10 * 60 * 1000,
+      });
+
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'sdp_offer', sdp: 'v=0\r\noffer', targetDeviceId: 'mobile-1' })
+      );
+
+      expect(mobileWs.messagesOfType('sdp_offer')).toHaveLength(0);
+      const unavailable = hostWs.messagesOfType('peer_unavailable');
+      expect(unavailable).toHaveLength(1);
+      expect(unavailable[0]!['deviceId']).toBe('mobile-1');
+    });
+  });
+
+  describe('connect_request sender type [SB-1360]', () => {
+    it('rejects connect_request from a host and relays nothing', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'connect_request', targetDeviceId: 'mobile-1' })
+      );
+
+      expect(mobileWs.messagesOfType('connect_request')).toHaveLength(0);
+      expect(hostWs.lastMessage()).toEqual({
+        type: 'error',
+        error: 'connect_request is only accepted from a mobile device',
+      });
+    });
+  });
+
+  describe('connection cache rebuild [SB-1360]', () => {
+    it('keeps the socket with the greatest lastMessageTime even when iterated first', () => {
+      const now = Date.now();
+      const fresh = new MockWebSocket();
+      fresh.serializeAttachment({
+        deviceId: 'agent-1', deviceType: 'host', authenticated: true, lastMessageTime: now,
+      });
+      const older = new MockWebSocket();
+      older.serializeAttachment({
+        deviceId: 'agent-1', deviceType: 'host', authenticated: true, lastMessageTime: now - 5000,
+      });
+      // Fresher socket is iterated first
+      mockState.acceptedWebSockets.push(fresh as unknown as WebSocket, older as unknown as WebSocket);
+
+      expect(doInstance.getConnection('agent-1')).toBe(fresh);
     });
   });
 });

@@ -608,10 +608,16 @@ export class SignalingDO implements DurableObject {
   private rebuildConnectionCache(): void {
     if (!this.state.getWebSockets) return;
     this.wsConnectionCounts.clear();
+    // When a device has several sockets, keep the freshest one [SB-1360]
+    const freshest = new Map<string, number>();
     for (const ws of this.state.getWebSockets()) {
       const att = ws.deserializeAttachment() as WsAttachment | null;
       if (att?.authenticated && att.deviceId) {
-        this.connections.set(att.deviceId, ws);
+        const last = att.lastMessageTime ?? 0;
+        if (!this.connections.has(att.deviceId) || last > (freshest.get(att.deviceId) ?? 0)) {
+          this.connections.set(att.deviceId, ws);
+          freshest.set(att.deviceId, last);
+        }
         const count = this.wsConnectionCounts.get(att.deviceId) ?? 0;
         this.wsConnectionCounts.set(att.deviceId, count + 1);
       }
@@ -847,6 +853,11 @@ export class SignalingDO implements DurableObject {
         break;
 
       case 'connect_request':
+        // Only a mobile initiates a connection [SB-1360]
+        if (attachment.deviceType !== 'mobile') {
+          wsSend(ws, { type: 'error', error: 'connect_request is only accepted from a mobile device' });
+          break;
+        }
         await this.handleConnectRequest(ws, attachment, data.targetDeviceId);
         break;
 
@@ -1348,7 +1359,9 @@ export class SignalingDO implements DurableObject {
     }
 
     const targetWs = this.findWebSocket(data.targetDeviceId);
-    if (!targetWs) {
+    // A stale socket (e.g. a sleeping host not yet reaped) is as unreachable
+    // as a missing one [SB-1360]
+    if (!targetWs || !this.isWebSocketFresh(targetWs)) {
       // Target disconnected mid-negotiation [SB-1000] — tell the sender so it
       // can fail fast or retry instead of stalling until its watchdog fires.
       this.sendPeerUnavailable(ws, data.targetDeviceId);
