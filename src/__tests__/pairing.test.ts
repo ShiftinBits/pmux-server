@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestDOCompat as createTestDO, createTestDO as createTestDOFull } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
@@ -248,6 +248,65 @@ describe('POST /pair/initiate', () => {
     const { status, data } = await postJSON('/pair/initiate', body);
     expect(status).toBe(401);
     expect(data['error']).toContain('Invalid or expired challenge');
+  });
+});
+
+describe('POST /pair/initiate code collisions', () => {
+  const AGENT_2 = 'b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2';
+
+  // Zero bytes always generate the same code ('AAAAAA'), forcing collisions.
+  function forceConstantCode(): void {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView | null>(array: T): T => {
+      if (array) new Uint8Array(array.buffer, array.byteOffset, array.byteLength).fill(0);
+      return array;
+    });
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('returns 503 without touching the host existing state when every code collides', async () => {
+    // AGENT_1 has an existing session with a random code.
+    const first = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const { data: firstData } = await postJSON('/pair/initiate', first);
+    const existingCode = firstData['pairingCode'] as string;
+
+    // Another host holds the only code the generator can now produce.
+    forceConstantCode();
+    doInstance.createPairingSession(AGENT_2, 'x25519-other', 'ed-other');
+    const settleSpy = vi.spyOn(doInstance as unknown as { settlePendingPair: () => void }, 'settlePendingPair');
+    const sqlStore = (doInstance as unknown as { sql: { exec: (q: string, ...b: unknown[]) => unknown } }).sql;
+    const execSpy = vi.spyOn(sqlStore, 'exec');
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const second = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    execSpy.mockClear();
+    const { status, data } = await postJSON('/pair/initiate', second);
+
+    expect(status).toBe(503);
+    expect(data['error']).toBe('Pairing temporarily unavailable');
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[pair]'));
+    expect(settleSpy).not.toHaveBeenCalled();
+    const deletes = execSpy.mock.calls.filter(([q]) => typeof q === 'string' && q.startsWith('DELETE FROM pairing_sessions WHERE host_device_id'));
+    expect(deletes).toHaveLength(0);
+    const pendingDeletes = execSpy.mock.calls.filter(([q]) => typeof q === 'string' && q.startsWith('DELETE FROM pending_pair_complete'));
+    expect(pendingDeletes).toHaveLength(0);
+
+    const rows = (sqlStore.exec('SELECT code FROM pairing_sessions WHERE host_device_id = ?', AGENT_1) as { toArray(): Array<{ code: string }> }).toArray();
+    expect(rows.map((r) => r.code)).toEqual([existingCode]);
+  });
+
+  it('does not treat the host own existing code as a collision', async () => {
+    forceConstantCode();
+    const first = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const { status: s1, data: d1 } = await postJSON('/pair/initiate', first);
+    expect(s1).toBe(200);
+
+    const second = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, 'x25519-pub-key-agent');
+    const { status: s2, data: d2 } = await postJSON('/pair/initiate', second);
+    expect(s2).toBe(200);
+    expect(d2['pairingCode']).toBe(d1['pairingCode']);
   });
 });
 

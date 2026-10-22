@@ -287,7 +287,11 @@ describe('Full auth flow integration [T3.11]', () => {
       JSON.stringify({ type: 'auth', token: expiredToken })
     );
 
-    expect(ws.lastMessage()).toEqual({ type: 'error', error: 'Authentication failed' });
+    expect(ws.lastMessage()).toEqual({
+      type: 'error',
+      error: 'Authentication failed',
+      code: 'token_expired',
+    });
     expect(ws.closed).toBe(true);
     expect(ws.closeCode).toBe(4001);
   });

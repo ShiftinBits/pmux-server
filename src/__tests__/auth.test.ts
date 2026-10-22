@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { verifyEd25519Signature, createJWT, verifyJWT } from '../auth';
+import { verifyEd25519Signature, createJWT, verifyJWT, TokenExpiredError } from '../auth';
 
 // --- Ed25519 helpers ---
 
@@ -151,6 +151,7 @@ describe('verifyJWT', () => {
     vi.spyOn(Date, 'now').mockReturnValue(realDateNow());
 
     await expect(verifyJWT(token, TEST_SECRET)).rejects.toThrow('token expired');
+    await expect(verifyJWT(token, TEST_SECRET)).rejects.toBeInstanceOf(TokenExpiredError);
   });
 
   afterEach(() => {

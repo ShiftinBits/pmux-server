@@ -19,7 +19,7 @@ import type {
   PairRejectMessage,
   PairResultMessage,
 } from '@pocketmux/shared';
-import { verifyEd25519Signature, createJWT, verifyJWT } from './auth';
+import { verifyEd25519Signature, createJWT, verifyJWT, TokenExpiredError } from './auth';
 import { generateTurnCredentials, TURN_REFRESH_AGE_MS, TURN_MAX_SERVE_AGE_MS } from './turn';
 import {
   rateLimitResponse,
@@ -36,6 +36,9 @@ interface TurnCacheEntry {
   creds: TurnCredentials;
   fetchedAt: number;
 }
+
+/** Maximum attempts to find an unused pairing code before giving up. */
+const MAX_PAIRING_CODE_ATTEMPTS = 10;
 
 /** Maximum device name length in characters. */
 const MAX_DEVICE_NAME_LENGTH = 64;
@@ -468,7 +471,9 @@ export class SignalingDO implements DurableObject {
   // --- Pairing session management ---
 
   /**
-   * Create a pairing session. Returns a 6-character alphanumeric code.
+   * Create a pairing session. Returns a 6-character alphanumeric code, or null
+   * when no unused code was found within MAX_PAIRING_CODE_ATTEMPTS; in that
+   * case the host's existing session and any held /pair/complete are untouched.
    * Stored in SQLite so it survives DO hibernation.
    */
   createPairingSession(
@@ -476,10 +481,27 @@ export class SignalingDO implements DurableObject {
     hostX25519PublicKey: string,
     hostEdPublicKey: string,
     pairConfirm = false
-  ): string {
+  ): string | null {
     this.ensureSchema();
     // Clean up expired sessions
     this.cleanExpiredPairings();
+
+    // Pick a free code before mutating anything. The host's own row is about to
+    // be replaced, so it does not count as a collision.
+    let code: string | null = null;
+    for (let attempt = 0; attempt < MAX_PAIRING_CODE_ATTEMPTS; attempt++) {
+      const candidate = generatePairingCode();
+      const taken = this.sql
+        .exec('SELECT 1 FROM pairing_sessions WHERE code = ? AND host_device_id != ?', candidate, hostDeviceId)
+        .toArray();
+      if (taken.length === 0) {
+        code = candidate;
+        break;
+      }
+    }
+    if (code === null) {
+      return null;
+    }
 
     // Invalidate any existing sessions for this host (prevents multiple valid codes)
     this.sql.exec('DELETE FROM pairing_sessions WHERE host_device_id = ?', hostDeviceId);
@@ -488,11 +510,6 @@ export class SignalingDO implements DurableObject {
     this.sql.exec('DELETE FROM pending_pair_complete WHERE host_device_id = ?', hostDeviceId);
     // Likewise a /pair/complete still held for a confirming host [SB-1348].
     this.settlePendingPair(hostDeviceId, pairSupersededResponse());
-
-    let code: string;
-    do {
-      code = generatePairingCode();
-    } while (this.sql.exec('SELECT 1 FROM pairing_sessions WHERE code = ?', code).toArray().length > 0);
 
     this.sql.exec(
       'INSERT INTO pairing_sessions (code, host_device_id, host_x25519_public_key, host_ed_public_key, expires_at, pair_confirm) VALUES (?, ?, ?, ?, ?, ?)',
@@ -608,10 +625,16 @@ export class SignalingDO implements DurableObject {
   private rebuildConnectionCache(): void {
     if (!this.state.getWebSockets) return;
     this.wsConnectionCounts.clear();
+    // When a device has several sockets, keep the freshest one [SB-1360]
+    const freshest = new Map<string, number>();
     for (const ws of this.state.getWebSockets()) {
       const att = ws.deserializeAttachment() as WsAttachment | null;
       if (att?.authenticated && att.deviceId) {
-        this.connections.set(att.deviceId, ws);
+        const last = att.lastMessageTime ?? 0;
+        if (!this.connections.has(att.deviceId) || last > (freshest.get(att.deviceId) ?? 0)) {
+          this.connections.set(att.deviceId, ws);
+          freshest.set(att.deviceId, last);
+        }
         const count = this.wsConnectionCounts.get(att.deviceId) ?? 0;
         this.wsConnectionCounts.set(att.deviceId, count + 1);
       }
@@ -807,6 +830,14 @@ export class SignalingDO implements DurableObject {
       return;
     }
 
+    // A host whose sockets were all stale was hidden from mobile presence by
+    // isWebSocketFresh(); note it so it can be re-announced once live [SB-1004]
+    const priorAtt = ws.deserializeAttachment() as WsAttachment | null;
+    const hostWasHidden =
+      priorAtt?.authenticated === true &&
+      priorAtt.deviceType === 'host' &&
+      !this.findFreshWebSocket(priorAtt.deviceId);
+
     // Update lastMessageTime on every received message (for idle timeout tracking)
     this.touchWebSocket(ws);
 
@@ -816,6 +847,14 @@ export class SignalingDO implements DurableObject {
     } catch {
       wsSend(ws, { type: 'error', error: 'Invalid JSON' });
       return;
+    }
+
+    // Re-auth announces host_online itself in handleWsAuth
+    if (hostWasHidden && priorAtt && data.type !== 'auth') {
+      const msg: HostOnlineMessage = { type: 'host_online', deviceId: priorAtt.deviceId };
+      const name = this.getDevice(priorAtt.deviceId)?.name;
+      if (name) msg.name = name;
+      this.notifyPairedMobile(priorAtt.deviceId, msg);
     }
 
     if (!data.type) {
@@ -847,6 +886,11 @@ export class SignalingDO implements DurableObject {
         break;
 
       case 'connect_request':
+        // Only a mobile initiates a connection [SB-1360]
+        if (attachment.deviceType !== 'mobile') {
+          wsSend(ws, { type: 'error', error: 'connect_request is only accepted from a mobile device' });
+          break;
+        }
         await this.handleConnectRequest(ws, attachment, data.targetDeviceId);
         break;
 
@@ -962,6 +1006,25 @@ export class SignalingDO implements DurableObject {
     const att = ws.deserializeAttachment() as WsAttachment | null;
     const last = att?.lastMessageTime ?? 0;
     return last > 0 && Date.now() - last <= WS_IDLE_TIMEOUT_MS;
+  }
+
+  /**
+   * Find a fresh socket for a device. Prefers the cached socket, then falls back
+   * to any other authenticated socket of the same device [SB-1004].
+   */
+  private findFreshWebSocket(deviceId: string): WebSocket | undefined {
+    const cached = this.findWebSocket(deviceId);
+    if (cached && this.isWebSocketFresh(cached)) return cached;
+    if (!this.state.getWebSockets) return undefined;
+    for (const ws of this.state.getWebSockets()) {
+      if (ws === cached) continue;
+      const att = ws.deserializeAttachment() as WsAttachment | null;
+      if (att?.authenticated && att.deviceId === deviceId && this.isWebSocketFresh(ws)) {
+        this.connections.set(deviceId, ws);
+        return ws;
+      }
+    }
+    return undefined;
   }
 
   // --- DO alarm handler (idle WS cleanup + expired pairing purge) ---
@@ -1244,8 +1307,7 @@ export class SignalingDO implements DurableObject {
       if (payload.deviceType === 'mobile') {
         const pairedHosts = this.getHostsForMobile(payload.deviceId);
         for (const hostDeviceId of pairedHosts) {
-          const hostWs = this.findWebSocket(hostDeviceId);
-          if (hostWs && this.isWebSocketFresh(hostWs)) {
+          if (this.findFreshWebSocket(hostDeviceId)) {
             const device = this.getDevice(hostDeviceId);
             const msg: HostOnlineMessage = { type: 'host_online', deviceId: hostDeviceId };
             if (device?.name) {
@@ -1264,7 +1326,13 @@ export class SignalingDO implements DurableObject {
 
         wsSend(ws, { type: 'auth', status: 'ok' });
       }
-    } catch {
+    } catch (err) {
+      if (err instanceof TokenExpiredError) {
+        // [SB-1004] Distinct code so clients can refresh their JWT; text and close code stay back-compat.
+        wsSend(ws, { type: 'error', error: 'Authentication failed', code: 'token_expired' });
+        ws.close(4001, 'token_expired');
+        return;
+      }
       wsSend(ws, { type: 'error', error: 'Authentication failed' });
       ws.close(4001, 'Authentication failed');
     }
@@ -1276,9 +1344,10 @@ export class SignalingDO implements DurableObject {
    * Only allows signaling between paired devices.
    */
   private async handleConnectRequest(ws: WebSocket, sender: WsAttachment, targetDeviceId: string): Promise<void> {
-    // Check pairing FIRST (before WS lookup) — don't reveal device existence to unpaired callers
-    const hostId = sender.deviceType === 'host' ? sender.deviceId : targetDeviceId;
-    const mobileId = sender.deviceType === 'mobile' ? sender.deviceId : targetDeviceId;
+    // Check pairing FIRST (before WS lookup) — don't reveal device existence to unpaired callers.
+    // The sender is always a mobile: webSocketMessage rejects connect_request from hosts [SB-1360].
+    const hostId = targetDeviceId;
+    const mobileId = sender.deviceId;
     if (!this.isPaired(hostId, mobileId)) {
       wsSend(ws, { type: 'connection_rejected', reason: 'not_paired' });
       return;
@@ -1288,10 +1357,10 @@ export class SignalingDO implements DurableObject {
     // yet reaped by the idle sweep) is treated as offline so the mobile gets an
     // immediate host_offline instead of a connect_request that never reaches a
     // frozen host.
-    const targetWs = this.findWebSocket(targetDeviceId);
-    if (!targetWs || !this.isWebSocketFresh(targetWs)) {
+    const targetWs = this.findFreshWebSocket(targetDeviceId);
+    if (!targetWs) {
       // Paired but offline → send host_offline so mobile can schedule reconnect
-      if (sender.deviceType === 'mobile') this.clearSignalingSession(hostId);
+      this.clearSignalingSession(hostId);
       wsSend(ws, { type: 'host_offline', deviceId: targetDeviceId });
       return;
     }
@@ -1310,16 +1379,14 @@ export class SignalingDO implements DurableObject {
     }
 
     // Relayed — track until the host replies so a silent host times out [SB-1001]
-    if (sender.deviceType === 'mobile') {
-      const expiresAt = Date.now() + SIGNALING_SESSION_TIMEOUT_MS;
-      this.sql.exec(
-        'INSERT OR REPLACE INTO signaling_sessions (host_device_id, mobile_device_id, expires_at) VALUES (?, ?, ?)',
-        hostId,
-        mobileId,
-        expiresAt
-      );
-      await this.scheduleAlarmBy(expiresAt);
-    }
+    const expiresAt = Date.now() + SIGNALING_SESSION_TIMEOUT_MS;
+    this.sql.exec(
+      'INSERT OR REPLACE INTO signaling_sessions (host_device_id, mobile_device_id, expires_at) VALUES (?, ?, ?)',
+      hostId,
+      mobileId,
+      expiresAt
+    );
+    await this.scheduleAlarmBy(expiresAt);
   }
 
   /**
@@ -1347,7 +1414,9 @@ export class SignalingDO implements DurableObject {
       this.clearSignalingSession(hostId);
     }
 
-    const targetWs = this.findWebSocket(data.targetDeviceId);
+    // A stale socket (e.g. a sleeping host not yet reaped) is as unreachable
+    // as a missing one, but any fresh socket of the device will do [SB-1360]
+    const targetWs = this.findFreshWebSocket(data.targetDeviceId);
     if (!targetWs) {
       // Target disconnected mid-negotiation [SB-1000] — tell the sender so it
       // can fail fast or retry instead of stalling until its watchdog fires.
@@ -1487,6 +1556,10 @@ export class SignalingDO implements DurableObject {
       body.ed25519PublicKey,
       pairConfirm
     );
+    if (pairingCode === null) {
+      console.warn('[pair] no free pairing code after retries');
+      return jsonResponse({ error: 'Pairing temporarily unavailable' }, 503);
+    }
 
     return jsonResponse(pairConfirm ? { pairingCode, pairConfirm } : { pairingCode });
   }

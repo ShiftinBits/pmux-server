@@ -78,6 +78,29 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(ws.closeCode).toBe(4001);
     });
 
+    it('signals token_expired for an expired JWT [SB-1004]', async () => {
+      doInstance.registerDevice('agent-exp', 'pubkey-agent-exp', 'host');
+      const realNow = Date.now();
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(realNow - 2 * 60 * 60 * 1000);
+      const token = await createJWT('agent-exp', 'host', JWT_SECRET);
+      nowSpy.mockRestore();
+      const ws = new MockWebSocket();
+
+      await doInstance.webSocketMessage(
+        ws as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token })
+      );
+
+      expect(ws.lastMessage()).toEqual({
+        type: 'error',
+        error: 'Authentication failed',
+        code: 'token_expired',
+      });
+      expect(ws.closed).toBe(true);
+      expect(ws.closeCode).toBe(4001);
+      expect(ws.closeReason).toBe('token_expired');
+    });
+
     it('rejects auth message with missing token [SB-361]', async () => {
       const ws = new MockWebSocket();
 
@@ -1372,6 +1395,7 @@ describe('WebSocket signaling [T1.8]', () => {
         deviceId: 'mobile-1',
         deviceType: 'mobile',
         authenticated: true,
+        lastMessageTime: Date.now(),
       });
       brokenWs.send = () => { throw new Error('WebSocket closed'); };
       doInstance.setConnection('mobile-1', brokenWs as unknown as WebSocket);
@@ -1398,6 +1422,170 @@ describe('WebSocket signaling [T1.8]', () => {
       const unavailable = hostWs.messagesOfType('peer_unavailable');
       expect(unavailable).toHaveLength(1);
       expect(unavailable[0]!['deviceId']).toBe('mobile-1');
+    });
+
+    it('treats a stale (idle) target as unavailable and relays nothing [SB-1360]', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      mobileWs.serializeAttachment({
+        deviceId: 'mobile-1',
+        deviceType: 'mobile',
+        authenticated: true,
+        lastMessageTime: Date.now() - 10 * 60 * 1000,
+      });
+
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'sdp_offer', sdp: 'v=0\r\noffer', targetDeviceId: 'mobile-1' })
+      );
+
+      expect(mobileWs.messagesOfType('sdp_offer')).toHaveLength(0);
+      const unavailable = hostWs.messagesOfType('peer_unavailable');
+      expect(unavailable).toHaveLength(1);
+      expect(unavailable[0]!['deviceId']).toBe('mobile-1');
+    });
+
+    it('relays to another fresh socket when the cached target socket is quiet [SB-1004]', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: freshMobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      const { ws: quietMobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      quietMobileWs.serializeAttachment({
+        deviceId: 'mobile-1',
+        deviceType: 'mobile',
+        authenticated: true,
+        lastMessageTime: Date.now() - 10 * 60 * 1000,
+      });
+      doInstance.setConnection('mobile-1', quietMobileWs as unknown as WebSocket);
+
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'sdp_offer', sdp: 'v=0\r\noffer', targetDeviceId: 'mobile-1' })
+      );
+
+      expect(freshMobileWs.messagesOfType('sdp_offer')).toHaveLength(1);
+      expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+    });
+
+    it('treats a socket without lastMessageTime as not fresh (fail closed) [SB-1360]', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      mobileWs.serializeAttachment({ deviceId: 'mobile-1', deviceType: 'mobile', authenticated: true });
+
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'sdp_offer', sdp: 'v=0\r\noffer', targetDeviceId: 'mobile-1' })
+      );
+
+      expect(mobileWs.messagesOfType('sdp_offer')).toHaveLength(0);
+      expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(1);
+    });
+
+    it('re-announces host_online when a stale host socket sends again [SB-1004]', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      hostWs.serializeAttachment({
+        deviceId: 'agent-1',
+        deviceType: 'host',
+        authenticated: true,
+        lastMessageTime: Date.now() - 10 * 60 * 1000,
+      });
+      mobileWs.sent.length = 0;
+
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'sdp_offer', sdp: 'v=0\r\noffer', targetDeviceId: 'mobile-1' })
+      );
+
+      expect(mobileWs.messagesOfType('host_online')).toHaveLength(1);
+    });
+
+    it('does not re-announce when another socket of the host is still fresh [SB-1004]', async () => {
+      const { ws: staleHostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+      const freshHostWs = new MockWebSocket();
+      freshHostWs.serializeAttachment({
+        deviceId: 'agent-1',
+        deviceType: 'host',
+        authenticated: true,
+        lastMessageTime: Date.now(),
+      });
+      mockState.acceptedWebSockets.push(freshHostWs as unknown as WebSocket);
+
+      staleHostWs.serializeAttachment({
+        deviceId: 'agent-1',
+        deviceType: 'host',
+        authenticated: true,
+        lastMessageTime: Date.now() - 10 * 60 * 1000,
+      });
+      mobileWs.sent.length = 0;
+
+      await doInstance.webSocketMessage(staleHostWs as unknown as WebSocket, JSON.stringify({ type: 'presence' }));
+
+      expect(mobileWs.messagesOfType('host_online')).toHaveLength(0);
+    });
+
+    it('announces host_online once when a stale host socket re-authenticates [SB-1004]', async () => {
+      const { ws: hostWs, token } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      hostWs.serializeAttachment({
+        deviceId: 'agent-1',
+        deviceType: 'host',
+        authenticated: true,
+        lastMessageTime: Date.now() - 10 * 60 * 1000,
+      });
+      mobileWs.sent.length = 0;
+
+      await doInstance.webSocketMessage(hostWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token }));
+
+      expect(mobileWs.messagesOfType('host_online')).toHaveLength(1);
+    });
+  });
+
+  describe('connect_request sender type [SB-1360]', () => {
+    it('rejects connect_request from a host and relays nothing', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'connect_request', targetDeviceId: 'mobile-1' })
+      );
+
+      expect(mobileWs.messagesOfType('connect_request')).toHaveLength(0);
+      expect(hostWs.lastMessage()).toEqual({
+        type: 'error',
+        error: 'connect_request is only accepted from a mobile device',
+      });
+    });
+  });
+
+  describe('connection cache rebuild [SB-1360]', () => {
+    it('keeps the socket with the greatest lastMessageTime even when iterated first', () => {
+      const now = Date.now();
+      const fresh = new MockWebSocket();
+      fresh.serializeAttachment({
+        deviceId: 'agent-1', deviceType: 'host', authenticated: true, lastMessageTime: now,
+      });
+      const older = new MockWebSocket();
+      older.serializeAttachment({
+        deviceId: 'agent-1', deviceType: 'host', authenticated: true, lastMessageTime: now - 5000,
+      });
+      // Fresher socket is iterated first
+      mockState.acceptedWebSockets.push(fresh as unknown as WebSocket, older as unknown as WebSocket);
+
+      expect(doInstance.getConnection('agent-1')).toBe(fresh);
     });
   });
 });
