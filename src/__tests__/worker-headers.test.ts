@@ -46,6 +46,7 @@ describe('worker context headers [SB-1340]', () => {
     expect(headers.get('X-Client-IP')).toBe('1.2.3.4');
     expect(headers.get('X-Device-Id')).toBeNull();
     expect(headers.get('X-Device-Type')).toBeNull();
+    expect(headers.get('Upgrade')).toBeNull();
   });
 
   it('forwards Upgrade but no other client header on /ws', async () => {
@@ -78,6 +79,7 @@ describe('worker context headers [SB-1340]', () => {
         'x-client-ip': '9.9.9.9',
         'X-Device-Id': 'evil',
         'X-Device-Type': 'host',
+        'X-Anything': 'client-value',
       },
     });
 
@@ -87,5 +89,7 @@ describe('worker context headers [SB-1340]', () => {
     expect(headers.get('X-Client-IP')).toBe('1.2.3.4');
     expect(headers.get('X-Device-Id')).toBe('device-1');
     expect(headers.get('X-Device-Type')).toBe('mobile');
+    expect(headers.get('X-Anything')).toBeNull();
+    expect(headers.get('Authorization')).toBeNull();
   });
 });
