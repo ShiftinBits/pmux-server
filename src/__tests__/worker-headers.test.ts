@@ -48,6 +48,26 @@ describe('worker context headers [SB-1340]', () => {
     expect(headers.get('X-Device-Type')).toBeNull();
   });
 
+  it('forwards Upgrade but no other client header on /ws', async () => {
+    const { env, received } = makeCapturingEnv();
+    const req = new Request('http://localhost/ws', {
+      headers: {
+        'CF-Connecting-IP': '1.2.3.4',
+        Upgrade: 'websocket',
+        'X-Client-IP': '9.9.9.9',
+        'X-Anything': 'client-value',
+      },
+    });
+
+    await worker.fetch(req, env);
+
+    const headers = received().headers;
+    expect(headers.get('Upgrade')).toBe('websocket');
+    expect(headers.get('X-Client-IP')).toBe('1.2.3.4');
+    expect(headers.get('X-Anything')).toBeNull();
+    expect(headers.get('CF-Connecting-IP')).toBeNull();
+  });
+
   it('replaces client-sent X-Client-IP / X-Device-Id / X-Device-Type on a JWT route', async () => {
     const { env, received } = makeCapturingEnv();
     const token = await createJWT('device-1', 'mobile', JWT_SECRET);

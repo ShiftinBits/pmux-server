@@ -40,7 +40,7 @@ Single global Durable Object instance — `env.SIGNALING.idFromName('global')` i
 2. `/health` (JSON status) and `/` (308 → `pmux.io`) return immediately — no HMAC, auth, or rate limit.
 3. If `PMUX_HMAC_SECRET` is set → HMAC check (below). Applies to `/ws` upgrades too.
 4. Path not in `PUBLIC_PATHS` → JWT required (`authenticateRequest()`). Runs before routing, so unknown paths without a JWT get 401, not 404.
-5. Set `X-Client-IP` (all) + `X-Device-Id`/`X-Device-Type` (JWT routes; stripped on public routes), overwriting any client-sent copy, then `routeToDO()` strips `/auth` (`/auth/token` → `/token`). Query string is dropped.
+5. Build the DO request's headers from empty: `X-Client-IP` (all), `X-Device-Id`/`X-Device-Type` (JWT routes) and the client's `Upgrade`. No other client header reaches the DO [SB-1340]. Then `routeToDO()` strips `/auth` (`/auth/token` → `/token`). Query string is dropped.
 
 ### Endpoints
 
@@ -105,7 +105,7 @@ Vitest, no Miniflare/workerd — tests call `doInstance.fetch()` and the WS hand
 - **Two pairing paths** [SB-1348], chosen by `pairing_sessions.pair_confirm` (agent sends `pairConfirm: true` at initiate):
   - *Confirming:* `/pair/initiate` echoes `pairConfirm: true`. `/pair/complete` relays `pair_complete` and holds the request in `pendingPairs` (30s); a host socket that authenticates during the hold gets it right after its `auth` ok reply. The host answers `pair_accept`/`pair_reject`. Only an accept runs `commitPairing` (validate, then remove old pairing + register + create pairing in one `transactionSync`, then tell the evicted mobile), and only an accept gets `pair_result {ok}`. Otherwise the result is 403 (reject), 504 (timeout), 409 (superseded by a newer `/pair/initiate`, cancelled by DELETE `/pairing` or `/device`, or a device conflict — one generic message for every kind) or 500 (commit threw and rolled back; old pairing intact). Every outcome goes through `settlePendingPair`.
   - *Legacy:* commits immediately. An undelivered `pair_complete` goes to `pending_pair_complete` and is flushed on host WS auth.
-- **Request cloning**: Worker clones the request before injecting headers to preserve the body stream.
+- **DO header allowlist**: `routeToDO()` forwards only the method, body and the worker-built headers. A new header the DO must read has to be added explicitly in `worker.ts`.
 - **Local dev rate limiting is effectively off**: `extractClientIp()` falls back to `crypto.randomUUID()` when `CF-Connecting-IP` is missing, so every request gets a fresh bucket.
 - **Pairing code**: base32-like alphabet (no 0/O/1/I), 6 chars, direct modulo (32 divides 256), 5-min expiry, single-use. Challenges: 60s TTL, consumed unconditionally on use, swept in `createChallenge()`.
 - **Re-pair**: replaced mobile gets `device_unpaired` (`replaced_by_new_pairing`); its `devices` row is removed only if no other pairings reference it. DELETE `/pairing` → `host_unpaired`, `/device` → `host_uninstalled`.

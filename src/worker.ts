@@ -102,10 +102,12 @@ export default {
     // Extract client IP for rate limiting (Cloudflare provides CF-Connecting-IP)
     const clientIp = extractClientIp(request);
 
-    // Context headers for the DO. set()/delete() replace any client-sent copy;
-    // spreading into new Headers() would append, letting clients spoof rate-limit keys.
-    const headers = new Headers(request.headers);
-    headers.set('X-Client-IP', clientIp);
+    // DO-bound headers are an allowlist built from empty: worker-derived context plus
+    // Upgrade, the only client header the DO reads. Forwarding the client's headers
+    // would let it supply its own X-Client-IP / X-Device-Id and spoof rate-limit keys.
+    const headers = new Headers({ 'X-Client-IP': clientIp });
+    const upgrade = request.headers.get('Upgrade');
+    if (upgrade) headers.set('Upgrade', upgrade);
 
     // Auth middleware: verify JWT for non-public routes
     if (!PUBLIC_PATHS.has(normalizedPathname)) {
@@ -125,17 +127,11 @@ export default {
       }
       headers.set('X-Device-Id', authResult.payload!.deviceId);
       headers.set('X-Device-Type', authResult.payload!.deviceType);
-    } else {
-      // Public routes carry no authenticated device identity
-      headers.delete('X-Device-Id');
-      headers.delete('X-Device-Type');
     }
-    // Clone request to preserve body stream
-    request = new Request(request.clone(), { headers });
 
     // Routes that dispatch to the Durable Object (including TURN credentials)
     if (normalizedPathname.startsWith('/auth/') || normalizedPathname === '/ws' || normalizedPathname === '/turn/credentials') {
-      const response = await routeToDO(request, normalizedPathname, url, env);
+      const response = await routeToDO(request, headers, normalizedPathname, url, env);
       return addCorrelationHeaders(response, requestId, startTime);
     }
 
@@ -207,8 +203,9 @@ function addCorrelationHeaders(
  * Route requests to the SignalingDO.
  * Uses a single DO instance (named "global") for all signaling.
  * normalizedPathname is the path with any /v1 prefix already stripped.
+ * headers replaces the client's headers entirely; only the method and body are forwarded.
  */
-async function routeToDO(request: Request, normalizedPathname: string, url: URL, env: Env): Promise<Response> {
+async function routeToDO(request: Request, headers: Headers, normalizedPathname: string, url: URL, env: Env): Promise<Response> {
   const id = env.SIGNALING.idFromName('global');
   const stub = env.SIGNALING.get(id);
 
@@ -227,7 +224,7 @@ async function routeToDO(request: Request, normalizedPathname: string, url: URL,
   const doUrl = new URL(doPath, url.origin);
   const doRequest = new Request(doUrl.toString(), {
     method: request.method,
-    headers: request.headers,
+    headers,
     body: request.body,
   });
 
