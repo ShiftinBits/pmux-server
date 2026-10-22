@@ -70,6 +70,14 @@ function validateDeviceName(name: unknown): string | undefined {
   return name;
 }
 
+/**
+ * Validate a connect attempt ID from untrusted input [SB-1375].
+ * Returns the ID if it is 32 lowercase hex chars, undefined otherwise.
+ */
+function validateAttemptId(attemptId: unknown): string | undefined {
+  return typeof attemptId === 'string' && /^[0-9a-f]{32}$/.test(attemptId) ? attemptId : undefined;
+}
+
 // --- Types ---
 
 export interface StoredDevice {
@@ -283,9 +291,16 @@ export class SignalingDO implements DurableObject {
       CREATE TABLE IF NOT EXISTS signaling_sessions (
         host_device_id TEXT PRIMARY KEY,
         mobile_device_id TEXT NOT NULL,
-        expires_at INTEGER NOT NULL
+        expires_at INTEGER NOT NULL,
+        attempt_id TEXT
       )
     `);
+
+    // Mobile's connect attempt ID, echoed on the session's peer_unavailable [SB-1375]
+    const signalingCols = this.sql.exec('PRAGMA table_info(signaling_sessions)').toArray();
+    if (!signalingCols.some((col) => col['name'] === 'attempt_id')) {
+      this.sql.exec('ALTER TABLE signaling_sessions ADD COLUMN attempt_id TEXT');
+    }
 
     this.initialized = true;
   }
@@ -891,7 +906,12 @@ export class SignalingDO implements DurableObject {
           wsSend(ws, { type: 'error', error: 'connect_request is only accepted from a mobile device' });
           break;
         }
-        await this.handleConnectRequest(ws, attachment, data.targetDeviceId);
+        await this.handleConnectRequest(
+          ws,
+          attachment,
+          data.targetDeviceId,
+          validateAttemptId(data.attemptId)
+        );
         break;
 
       case 'sdp_offer':
@@ -1133,7 +1153,10 @@ export class SignalingDO implements DurableObject {
   private expireSignalingSessions(now: number): void {
     this.ensureSchema();
     const expired = this.sql
-      .exec('SELECT host_device_id, mobile_device_id FROM signaling_sessions WHERE expires_at <= ?', now)
+      .exec(
+        'SELECT host_device_id, mobile_device_id, attempt_id FROM signaling_sessions WHERE expires_at <= ?',
+        now
+      )
       .toArray();
     if (expired.length === 0) return;
     this.sql.exec('DELETE FROM signaling_sessions WHERE expires_at <= ?', now);
@@ -1144,8 +1167,9 @@ export class SignalingDO implements DurableObject {
       // Unpaired since the request — the devices must learn nothing of each other
       if (!this.isPaired(hostId, mobileId)) continue;
 
-      this.notifyDevice(mobileId, { type: 'peer_unavailable', deviceId: hostId });
-      this.notifyDevice(hostId, { type: 'peer_unavailable', deviceId: mobileId });
+      const attempt = row['attempt_id'] != null && { attemptId: row['attempt_id'] };
+      this.notifyDevice(mobileId, { type: 'peer_unavailable', deviceId: hostId, ...attempt });
+      this.notifyDevice(hostId, { type: 'peer_unavailable', deviceId: mobileId, ...attempt });
     }
   }
 
@@ -1343,7 +1367,12 @@ export class SignalingDO implements DurableObject {
    * Relays the request to the target host with the mobile's deviceId.
    * Only allows signaling between paired devices.
    */
-  private async handleConnectRequest(ws: WebSocket, sender: WsAttachment, targetDeviceId: string): Promise<void> {
+  private async handleConnectRequest(
+    ws: WebSocket,
+    sender: WsAttachment,
+    targetDeviceId: string,
+    attemptId: string | undefined
+  ): Promise<void> {
     // Check pairing FIRST (before WS lookup) — don't reveal device existence to unpaired callers.
     // The sender is always a mobile: webSocketMessage rejects connect_request from hosts [SB-1360].
     const hostId = targetDeviceId;
@@ -1370,6 +1399,7 @@ export class SignalingDO implements DurableObject {
       wsSend(targetWs, {
         type: 'connect_request',
         targetDeviceId: sender.deviceId,
+        ...(attemptId !== undefined && { attemptId }),
       });
     } catch {
       if (this.connections.get(targetDeviceId) === targetWs) {
@@ -1381,10 +1411,11 @@ export class SignalingDO implements DurableObject {
     // Relayed — track until the host replies so a silent host times out [SB-1001]
     const expiresAt = Date.now() + SIGNALING_SESSION_TIMEOUT_MS;
     this.sql.exec(
-      'INSERT OR REPLACE INTO signaling_sessions (host_device_id, mobile_device_id, expires_at) VALUES (?, ?, ?)',
+      'INSERT OR REPLACE INTO signaling_sessions (host_device_id, mobile_device_id, expires_at, attempt_id) VALUES (?, ?, ?, ?)',
       hostId,
       mobileId,
-      expiresAt
+      expiresAt,
+      attemptId ?? null
     );
     await this.scheduleAlarmBy(expiresAt);
   }
@@ -1406,6 +1437,9 @@ export class SignalingDO implements DurableObject {
     const mobileId = sender.deviceType === 'mobile' ? sender.deviceId : data.targetDeviceId;
     if (!this.isPaired(hostId, mobileId)) return;
 
+    // Relayed through and reflected on peer_unavailable; invalid IDs are dropped [SB-1375]
+    const attemptId = validateAttemptId(data.attemptId);
+
     // Host answered the connect_request — signaling session complete [SB-1001]
     if (
       sender.deviceType === 'host' &&
@@ -1420,7 +1454,7 @@ export class SignalingDO implements DurableObject {
     if (!targetWs) {
       // Target disconnected mid-negotiation [SB-1000] — tell the sender so it
       // can fail fast or retry instead of stalling until its watchdog fires.
-      this.sendPeerUnavailable(ws, data.targetDeviceId);
+      this.sendPeerUnavailable(ws, data.targetDeviceId, attemptId);
       return;
     }
 
@@ -1434,13 +1468,14 @@ export class SignalingDO implements DurableObject {
         ...(data.sdpMid !== undefined && { sdpMid: data.sdpMid }),
         ...(data.sdpMLineIndex !== undefined && { sdpMLineIndex: data.sdpMLineIndex }),
         ...('reason' in data && data.reason !== undefined && { reason: data.reason }),
+        ...(attemptId !== undefined && data.type !== 'connection_rejected' && { attemptId }),
       });
     } catch {
       if (this.connections.get(data.targetDeviceId) === targetWs) {
         this.connections.delete(data.targetDeviceId);
       }
       // Send to target failed — same failure mode as target-not-found [SB-1000]
-      this.sendPeerUnavailable(ws, data.targetDeviceId);
+      this.sendPeerUnavailable(ws, data.targetDeviceId, attemptId);
     }
   }
 
@@ -1449,9 +1484,13 @@ export class SignalingDO implements DurableObject {
    * Guarded: if the sender's own socket is also dead, there is nothing left
    * to notify — never let that propagate out of the message handler.
    */
-  private sendPeerUnavailable(ws: WebSocket, deviceId: string): void {
+  private sendPeerUnavailable(ws: WebSocket, deviceId: string, attemptId?: string): void {
     try {
-      wsSend(ws, { type: 'peer_unavailable', deviceId });
+      wsSend(ws, {
+        type: 'peer_unavailable',
+        deviceId,
+        ...(attemptId !== undefined && { attemptId }),
+      });
     } catch {
       // Sender gone too — nothing to do
     }
