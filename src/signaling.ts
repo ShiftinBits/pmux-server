@@ -19,7 +19,7 @@ import type {
   PairRejectMessage,
   PairResultMessage,
 } from '@pocketmux/shared';
-import { verifyEd25519Signature, createJWT, verifyJWT } from './auth';
+import { verifyEd25519Signature, createJWT, verifyJWT, TokenExpiredError } from './auth';
 import { generateTurnCredentials, TURN_REFRESH_AGE_MS, TURN_MAX_SERVE_AGE_MS } from './turn';
 import {
   rateLimitResponse,
@@ -1292,7 +1292,13 @@ export class SignalingDO implements DurableObject {
 
         wsSend(ws, { type: 'auth', status: 'ok' });
       }
-    } catch {
+    } catch (err) {
+      if (err instanceof TokenExpiredError) {
+        // [SB-1004] Distinct code so clients can refresh their JWT; text and close code stay back-compat.
+        wsSend(ws, { type: 'error', error: 'Authentication failed', code: 'token_expired' });
+        ws.close(4001, 'token_expired');
+        return;
+      }
       wsSend(ws, { type: 'error', error: 'Authentication failed' });
       ws.close(4001, 'Authentication failed');
     }

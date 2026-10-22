@@ -144,6 +144,14 @@ export async function createJWT(
   return `${signingInput}.${base64urlEncode(signature)}`;
 }
 
+/** Thrown by verifyJWT when a token is otherwise valid but past its expiry [SB-1004]. */
+export class TokenExpiredError extends Error {
+  constructor() {
+    super('Invalid JWT: token expired');
+    this.name = 'TokenExpiredError';
+  }
+}
+
 /**
  * Verify and decode a JWT.
  *
@@ -193,7 +201,7 @@ export async function verifyJWT(token: string, secret: string): Promise<JWTPaylo
   // Check expiry
   const now = Math.floor(Date.now() / 1000);
   if (decoded.exp <= now) {
-    throw new Error('Invalid JWT: token expired');
+    throw new TokenExpiredError();
   }
 
   // Check iat is not in the future (allow configured clock skew)

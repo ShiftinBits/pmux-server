@@ -78,6 +78,29 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(ws.closeCode).toBe(4001);
     });
 
+    it('signals token_expired for an expired JWT [SB-1004]', async () => {
+      doInstance.registerDevice('agent-exp', 'pubkey-agent-exp', 'host');
+      const realNow = Date.now();
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(realNow - 2 * 60 * 60 * 1000);
+      const token = await createJWT('agent-exp', 'host', JWT_SECRET);
+      nowSpy.mockRestore();
+      const ws = new MockWebSocket();
+
+      await doInstance.webSocketMessage(
+        ws as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token })
+      );
+
+      expect(ws.lastMessage()).toEqual({
+        type: 'error',
+        error: 'Authentication failed',
+        code: 'token_expired',
+      });
+      expect(ws.closed).toBe(true);
+      expect(ws.closeCode).toBe(4001);
+      expect(ws.closeReason).toBe('token_expired');
+    });
+
     it('rejects auth message with missing token [SB-361]', async () => {
       const ws = new MockWebSocket();
 
