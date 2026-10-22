@@ -37,6 +37,9 @@ interface TurnCacheEntry {
   fetchedAt: number;
 }
 
+/** Maximum attempts to find an unused pairing code before giving up. */
+const MAX_PAIRING_CODE_ATTEMPTS = 10;
+
 /** Maximum device name length in characters. */
 const MAX_DEVICE_NAME_LENGTH = 64;
 
@@ -468,7 +471,9 @@ export class SignalingDO implements DurableObject {
   // --- Pairing session management ---
 
   /**
-   * Create a pairing session. Returns a 6-character alphanumeric code.
+   * Create a pairing session. Returns a 6-character alphanumeric code, or null
+   * when no unused code was found within MAX_PAIRING_CODE_ATTEMPTS; in that
+   * case the host's existing session and any held /pair/complete are untouched.
    * Stored in SQLite so it survives DO hibernation.
    */
   createPairingSession(
@@ -476,10 +481,27 @@ export class SignalingDO implements DurableObject {
     hostX25519PublicKey: string,
     hostEdPublicKey: string,
     pairConfirm = false
-  ): string {
+  ): string | null {
     this.ensureSchema();
     // Clean up expired sessions
     this.cleanExpiredPairings();
+
+    // Pick a free code before mutating anything. The host's own row is about to
+    // be replaced, so it does not count as a collision.
+    let code: string | null = null;
+    for (let attempt = 0; attempt < MAX_PAIRING_CODE_ATTEMPTS; attempt++) {
+      const candidate = generatePairingCode();
+      const taken = this.sql
+        .exec('SELECT 1 FROM pairing_sessions WHERE code = ? AND host_device_id != ?', candidate, hostDeviceId)
+        .toArray();
+      if (taken.length === 0) {
+        code = candidate;
+        break;
+      }
+    }
+    if (code === null) {
+      return null;
+    }
 
     // Invalidate any existing sessions for this host (prevents multiple valid codes)
     this.sql.exec('DELETE FROM pairing_sessions WHERE host_device_id = ?', hostDeviceId);
@@ -488,11 +510,6 @@ export class SignalingDO implements DurableObject {
     this.sql.exec('DELETE FROM pending_pair_complete WHERE host_device_id = ?', hostDeviceId);
     // Likewise a /pair/complete still held for a confirming host [SB-1348].
     this.settlePendingPair(hostDeviceId, pairSupersededResponse());
-
-    let code: string;
-    do {
-      code = generatePairingCode();
-    } while (this.sql.exec('SELECT 1 FROM pairing_sessions WHERE code = ?', code).toArray().length > 0);
 
     this.sql.exec(
       'INSERT INTO pairing_sessions (code, host_device_id, host_x25519_public_key, host_ed_public_key, expires_at, pair_confirm) VALUES (?, ?, ?, ?, ?, ?)',
@@ -1500,6 +1517,10 @@ export class SignalingDO implements DurableObject {
       body.ed25519PublicKey,
       pairConfirm
     );
+    if (pairingCode === null) {
+      console.warn('[pair] no free pairing code after retries');
+      return jsonResponse({ error: 'Pairing temporarily unavailable' }, 503);
+    }
 
     return jsonResponse(pairConfirm ? { pairingCode, pairConfirm } : { pairingCode });
   }
