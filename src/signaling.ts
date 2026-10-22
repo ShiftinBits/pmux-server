@@ -830,21 +830,16 @@ export class SignalingDO implements DurableObject {
       return;
     }
 
-    // A stale-but-open host socket that speaks again was hidden from mobile presence
-    // by isWebSocketFresh(); announce it once it is live again [SB-1004]
+    // A host whose sockets were all stale was hidden from mobile presence by
+    // isWebSocketFresh(); note it so it can be re-announced once live [SB-1004]
     const priorAtt = ws.deserializeAttachment() as WsAttachment | null;
-    const hostRecovered =
-      priorAtt?.authenticated === true && priorAtt.deviceType === 'host' && !this.isWebSocketFresh(ws);
+    const hostWasHidden =
+      priorAtt?.authenticated === true &&
+      priorAtt.deviceType === 'host' &&
+      !this.findFreshWebSocket(priorAtt.deviceId);
 
     // Update lastMessageTime on every received message (for idle timeout tracking)
     this.touchWebSocket(ws);
-
-    if (hostRecovered && priorAtt) {
-      const msg: HostOnlineMessage = { type: 'host_online', deviceId: priorAtt.deviceId };
-      const name = this.getDevice(priorAtt.deviceId)?.name;
-      if (name) msg.name = name;
-      this.notifyPairedMobile(priorAtt.deviceId, msg);
-    }
 
     let data: SignalingClientMessage;
     try {
@@ -852,6 +847,14 @@ export class SignalingDO implements DurableObject {
     } catch {
       wsSend(ws, { type: 'error', error: 'Invalid JSON' });
       return;
+    }
+
+    // Re-auth announces host_online itself in handleWsAuth
+    if (hostWasHidden && priorAtt && data.type !== 'auth') {
+      const msg: HostOnlineMessage = { type: 'host_online', deviceId: priorAtt.deviceId };
+      const name = this.getDevice(priorAtt.deviceId)?.name;
+      if (name) msg.name = name;
+      this.notifyPairedMobile(priorAtt.deviceId, msg);
     }
 
     if (!data.type) {
@@ -1017,6 +1020,7 @@ export class SignalingDO implements DurableObject {
       if (ws === cached) continue;
       const att = ws.deserializeAttachment() as WsAttachment | null;
       if (att?.authenticated && att.deviceId === deviceId && this.isWebSocketFresh(ws)) {
+        this.connections.set(deviceId, ws);
         return ws;
       }
     }
@@ -1340,9 +1344,10 @@ export class SignalingDO implements DurableObject {
    * Only allows signaling between paired devices.
    */
   private async handleConnectRequest(ws: WebSocket, sender: WsAttachment, targetDeviceId: string): Promise<void> {
-    // Check pairing FIRST (before WS lookup) — don't reveal device existence to unpaired callers
-    const hostId = sender.deviceType === 'host' ? sender.deviceId : targetDeviceId;
-    const mobileId = sender.deviceType === 'mobile' ? sender.deviceId : targetDeviceId;
+    // Check pairing FIRST (before WS lookup) — don't reveal device existence to unpaired callers.
+    // The sender is always a mobile: webSocketMessage rejects connect_request from hosts [SB-1360].
+    const hostId = targetDeviceId;
+    const mobileId = sender.deviceId;
     if (!this.isPaired(hostId, mobileId)) {
       wsSend(ws, { type: 'connection_rejected', reason: 'not_paired' });
       return;
@@ -1355,7 +1360,7 @@ export class SignalingDO implements DurableObject {
     const targetWs = this.findFreshWebSocket(targetDeviceId);
     if (!targetWs) {
       // Paired but offline → send host_offline so mobile can schedule reconnect
-      if (sender.deviceType === 'mobile') this.clearSignalingSession(hostId);
+      this.clearSignalingSession(hostId);
       wsSend(ws, { type: 'host_offline', deviceId: targetDeviceId });
       return;
     }
@@ -1374,16 +1379,14 @@ export class SignalingDO implements DurableObject {
     }
 
     // Relayed — track until the host replies so a silent host times out [SB-1001]
-    if (sender.deviceType === 'mobile') {
-      const expiresAt = Date.now() + SIGNALING_SESSION_TIMEOUT_MS;
-      this.sql.exec(
-        'INSERT OR REPLACE INTO signaling_sessions (host_device_id, mobile_device_id, expires_at) VALUES (?, ?, ?)',
-        hostId,
-        mobileId,
-        expiresAt
-      );
-      await this.scheduleAlarmBy(expiresAt);
-    }
+    const expiresAt = Date.now() + SIGNALING_SESSION_TIMEOUT_MS;
+    this.sql.exec(
+      'INSERT OR REPLACE INTO signaling_sessions (host_device_id, mobile_device_id, expires_at) VALUES (?, ?, ?)',
+      hostId,
+      mobileId,
+      expiresAt
+    );
+    await this.scheduleAlarmBy(expiresAt);
   }
 
   /**
