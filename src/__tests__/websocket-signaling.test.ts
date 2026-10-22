@@ -9,6 +9,11 @@ const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 /** Mocked Date.now() for asserting presence ts. */
 const FIXED_NOW = 1_800_000_000_000;
 
+/** Mock Date.now() to return t. */
+const at = (t: number): void => {
+  vi.spyOn(Date, 'now').mockReturnValue(t);
+};
+
 let doInstance: SignalingDO;
 let mockState: MockDOState;
 
@@ -299,30 +304,32 @@ describe('WebSocket signaling [T1.8]', () => {
     });
 
     it('stamps ts on host_online when the host authenticates [SB-1375]', async () => {
-      vi.spyOn(Date, 'now').mockReturnValue(FIXED_NOW);
+      at(FIXED_NOW);
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
       doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host');
       doInstance.createPairing('agent-1', 'mobile-1');
       mobileWs.sent.length = 0;
 
+      at(FIXED_NOW + 1_000);
       await connectAndAuth('agent-1', 'host');
 
       const onlineMessages = mobileWs.messagesOfType('host_online');
       expect(onlineMessages).toHaveLength(1);
-      expect(onlineMessages[0]!['ts']).toBe(FIXED_NOW);
+      expect(onlineMessages[0]!['ts']).toBe(FIXED_NOW + 1_000);
     });
 
     it('stamps ts on the presence snapshot host_online [SB-1375]', async () => {
-      vi.spyOn(Date, 'now').mockReturnValue(FIXED_NOW);
+      at(FIXED_NOW);
       await connectAndAuth('agent-1', 'host');
       doInstance.registerDevice('mobile-1', 'pubkey-mobile-1', 'mobile');
       doInstance.createPairing('agent-1', 'mobile-1');
 
+      at(FIXED_NOW + 1_000);
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
 
       const onlineMessages = mobileWs.messagesOfType('host_online');
       expect(onlineMessages).toHaveLength(1);
-      expect(onlineMessages[0]!['ts']).toBe(FIXED_NOW);
+      expect(onlineMessages[0]!['ts']).toBe(FIXED_NOW + 1_000);
     });
   });
 
@@ -684,17 +691,18 @@ describe('WebSocket signaling [T1.8]', () => {
     });
 
     it('stamps ts on host_offline when the host disconnects [SB-1375]', async () => {
-      vi.spyOn(Date, 'now').mockReturnValue(FIXED_NOW);
+      at(FIXED_NOW);
       const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
       doInstance.createPairing('agent-1', 'mobile-1');
       mobileWs.sent.length = 0;
 
+      at(FIXED_NOW + 1_000);
       await doInstance.webSocketClose(hostWs as unknown as WebSocket, 1000, 'normal closure', true);
 
       const offlineMessages = mobileWs.messagesOfType('host_offline');
       expect(offlineMessages).toHaveLength(1);
-      expect(offlineMessages[0]!['ts']).toBe(FIXED_NOW);
+      expect(offlineMessages[0]!['ts']).toBe(FIXED_NOW + 1_000);
     });
   });
 
@@ -760,11 +768,12 @@ describe('WebSocket signaling [T1.8]', () => {
     });
 
     it('stamps ts on the host_offline reply for an offline host [SB-1375]', async () => {
-      vi.spyOn(Date, 'now').mockReturnValue(FIXED_NOW);
+      at(FIXED_NOW);
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
       doInstance.createPairing('agent-1', 'mobile-1');
       mobileWs.sent.length = 0;
 
+      at(FIXED_NOW + 1_000);
       await doInstance.webSocketMessage(
         mobileWs as unknown as WebSocket,
         JSON.stringify({ type: 'connect_request', targetDeviceId: 'agent-1' })
@@ -772,7 +781,7 @@ describe('WebSocket signaling [T1.8]', () => {
 
       const offlineMessages = mobileWs.messagesOfType('host_offline');
       expect(offlineMessages).toHaveLength(1);
-      expect(offlineMessages[0]!['ts']).toBe(FIXED_NOW);
+      expect(offlineMessages[0]!['ts']).toBe(FIXED_NOW + 1_000);
     });
 
     it('sends host_offline when the target host is stale (asleep, not yet reaped)', async () => {
@@ -1385,18 +1394,19 @@ describe('WebSocket signaling [T1.8]', () => {
     });
 
     it('stamps ts on host_offline on webSocketError [SB-1375]', async () => {
-      vi.spyOn(Date, 'now').mockReturnValue(FIXED_NOW);
+      at(FIXED_NOW);
       vi.spyOn(console, 'error').mockImplementation(() => {});
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
       const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
       doInstance.createPairing('agent-1', 'mobile-1');
       mobileWs.sent.length = 0;
 
+      at(FIXED_NOW + 1_000);
       await doInstance.webSocketError(hostWs as unknown as WebSocket, new Error('connection reset'));
 
       const offlineMessages = mobileWs.messagesOfType('host_offline');
       expect(offlineMessages).toHaveLength(1);
-      expect(offlineMessages[0]!['ts']).toBe(FIXED_NOW);
+      expect(offlineMessages[0]!['ts']).toBe(FIXED_NOW + 1_000);
     });
 
     it('handles unknown message type', async () => {
@@ -1586,7 +1596,7 @@ describe('WebSocket signaling [T1.8]', () => {
     });
 
     it('stamps ts on the re-announced host_online [SB-1375]', async () => {
-      vi.spyOn(Date, 'now').mockReturnValue(FIXED_NOW);
+      at(FIXED_NOW);
       const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
       doInstance.createPairing('agent-1', 'mobile-1');
@@ -1599,11 +1609,12 @@ describe('WebSocket signaling [T1.8]', () => {
       });
       mobileWs.sent.length = 0;
 
+      at(FIXED_NOW + 1_000);
       await doInstance.webSocketMessage(hostWs as unknown as WebSocket, JSON.stringify({ type: 'presence' }));
 
       const onlineMessages = mobileWs.messagesOfType('host_online');
       expect(onlineMessages).toHaveLength(1);
-      expect(onlineMessages[0]!['ts']).toBe(FIXED_NOW);
+      expect(onlineMessages[0]!['ts']).toBe(FIXED_NOW + 1_000);
     });
 
     it('does not re-announce when another socket of the host is still fresh [SB-1004]', async () => {
@@ -1940,28 +1951,30 @@ describe('signaling session timeout [SB-1001]', () => {
     expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
   });
 
-  it('creates no session when relaying connect_request to the host fails', async () => {
+  it('fails fast without a session when relaying connect_request to the host fails', async () => {
     hostWs.send = () => { throw new Error('WebSocket closed'); };
 
     await connectRequest();
     expect(mockState.scheduledAlarm).toBeNull();
+    const unavailable = mobileWs.messagesOfType('peer_unavailable');
+    expect(unavailable).toHaveLength(1);
+    expect(unavailable[0]!['deviceId']).toBe('agent-1');
+    expect(unavailable[0]).not.toHaveProperty('attemptId');
 
+    // No session — expiry adds nothing
     at(T0 + 12_001);
     await doInstance.alarm();
 
-    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(1);
   });
 });
 
 describe('connect attempt ID [SB-1375]', () => {
   const T0 = 1_800_000_000_000;
   const ATTEMPT = '0123456789abcdef0123456789abcdef';
+  const OTHER_ATTEMPT = 'fedcba9876543210fedcba9876543210';
   let hostWs: MockWebSocket;
   let mobileWs: MockWebSocket;
-
-  const at = (t: number): void => {
-    vi.spyOn(Date, 'now').mockReturnValue(t);
-  };
 
   const send = async (ws: MockWebSocket, msg: Record<string, unknown>): Promise<void> => {
     await doInstance.webSocketMessage(ws as unknown as WebSocket, JSON.stringify(msg));
@@ -1981,10 +1994,6 @@ describe('connect attempt ID [SB-1375]', () => {
     mobileWs.sent.length = 0;
   });
 
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
   describe('connect_request', () => {
     it('stores a valid attemptId and forwards it to the host', async () => {
       await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId: ATTEMPT });
@@ -1999,7 +2008,9 @@ describe('connect attempt ID [SB-1375]', () => {
       ['missing', undefined],
       ['uppercase hex', ATTEMPT.toUpperCase()],
       ['non-hex', 'XYZ'],
+      ['31 chars', ATTEMPT.slice(0, 31)],
       ['33 chars', `${ATTEMPT}0`],
+      ['32 chars with a non-hex char', `${ATTEMPT.slice(0, 31)}g`],
       ['a number', 12345],
     ])('drops a %s attemptId without rejecting the request', async (_label, attemptId) => {
       await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId });
@@ -2017,6 +2028,23 @@ describe('connect attempt ID [SB-1375]', () => {
 
       expect(storedAttemptId()).toBeNull();
     });
+
+    it('drops the earlier session and fails the new attempt when relaying to the host fails', async () => {
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId: OTHER_ATTEMPT });
+      hostWs.send = () => { throw new Error('WebSocket closed'); };
+
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId: ATTEMPT });
+
+      expect(storedAttemptId()).toBeUndefined();
+      const unavailable = mobileWs.messagesOfType('peer_unavailable');
+      expect(unavailable).toHaveLength(1);
+      expect(unavailable[0]!['attemptId']).toBe(ATTEMPT);
+
+      // The earlier attempt's session no longer expires with its stale ID
+      at(T0 + 12_001);
+      await doInstance.alarm();
+      expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(1);
+    });
   });
 
   describe('relay', () => {
@@ -2032,6 +2060,22 @@ describe('connect attempt ID [SB-1375]', () => {
       await send(hostWs, { type, sdp: 'v=0', candidate: 'c', targetDeviceId: 'mobile-1' });
 
       const relayed = mobileWs.messagesOfType(type);
+      expect(relayed).toHaveLength(1);
+      expect(relayed[0]).not.toHaveProperty('attemptId');
+    });
+
+    it('relays the mobile attemptId on sdp_answer', async () => {
+      await send(mobileWs, { type: 'sdp_answer', sdp: 'v=0', targetDeviceId: 'agent-1', attemptId: ATTEMPT });
+
+      const relayed = hostWs.messagesOfType('sdp_answer');
+      expect(relayed).toHaveLength(1);
+      expect(relayed[0]!['attemptId']).toBe(ATTEMPT);
+    });
+
+    it('omits attemptId on sdp_answer when the mobile sends none', async () => {
+      await send(mobileWs, { type: 'sdp_answer', sdp: 'v=0', targetDeviceId: 'agent-1' });
+
+      const relayed = hostWs.messagesOfType('sdp_answer');
       expect(relayed).toHaveLength(1);
       expect(relayed[0]).not.toHaveProperty('attemptId');
     });
@@ -2110,6 +2154,37 @@ describe('connect attempt ID [SB-1375]', () => {
       expect(toMobile[0]).not.toHaveProperty('attemptId');
       expect(toHost).toHaveLength(1);
       expect(toHost[0]).not.toHaveProperty('attemptId');
+    });
+
+    it('keeps the current session when the host offers for an older attempt', async () => {
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId: ATTEMPT });
+      await send(hostWs, { type: 'sdp_offer', sdp: 'v=0', targetDeviceId: 'mobile-1', attemptId: OTHER_ATTEMPT });
+
+      expect(storedAttemptId()).toBe(ATTEMPT);
+
+      at(T0 + 12_001);
+      await doInstance.alarm();
+
+      const toMobile = mobileWs.messagesOfType('peer_unavailable');
+      expect(toMobile).toHaveLength(1);
+      expect(toMobile[0]!['attemptId']).toBe(ATTEMPT);
+    });
+
+    it.each([
+      ['a matching offer', ATTEMPT, ATTEMPT],
+      ['an untagged offer', ATTEMPT, undefined],
+      ['a tagged offer for an untagged request', undefined, ATTEMPT],
+    ])('clears the session on %s', async (_label, requestAttempt, offerAttempt) => {
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId: requestAttempt });
+      await send(hostWs, { type: 'sdp_offer', sdp: 'v=0', targetDeviceId: 'mobile-1', attemptId: offerAttempt });
+
+      expect(storedAttemptId()).toBeUndefined();
+
+      at(T0 + 12_001);
+      await doInstance.alarm();
+
+      expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+      expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(0);
     });
   });
 

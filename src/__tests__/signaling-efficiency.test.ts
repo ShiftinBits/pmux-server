@@ -298,11 +298,12 @@ describe('Signaling server efficiency [T3.10]', () => {
       att.lastMessageTime = now - 6 * 60 * 1000;
       hostWs.serializeAttachment(att);
 
+      vi.spyOn(Date, 'now').mockReturnValue(now + 1_000);
       await doInstance.alarm();
 
       const offlineMessages = mobileWs.messagesOfType('host_offline');
       expect(offlineMessages).toHaveLength(1);
-      expect(offlineMessages[0]?.['ts']).toBe(now);
+      expect(offlineMessages[0]?.['ts']).toBe(now + 1_000);
     });
 
     it('does not send host_offline for idle mobile WS closed by alarm', async () => {

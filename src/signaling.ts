@@ -907,12 +907,7 @@ export class SignalingDO implements DurableObject {
           wsSend(ws, { type: 'error', error: 'connect_request is only accepted from a mobile device' });
           break;
         }
-        await this.handleConnectRequest(
-          ws,
-          attachment,
-          data.targetDeviceId,
-          validateAttemptId(data.attemptId)
-        );
+        await this.handleConnectRequest(ws, attachment, data.targetDeviceId, data.attemptId);
         break;
 
       case 'sdp_offer':
@@ -1134,10 +1129,18 @@ export class SignalingDO implements DurableObject {
   /**
    * Drop a host's pending signaling session [SB-1001]. Called wherever the host
    * answers or host_offline is sent, so a timeout never follows host_offline.
+   * Given an attemptId, a session tagged with a different attempt is kept, so a
+   * late answer to an older attempt can't cancel the current one's timeout.
    */
-  private clearSignalingSession(hostDeviceId: string): void {
+  private clearSignalingSession(hostDeviceId: string, attemptId?: string): void {
     this.ensureSchema();
-    this.sql.exec('DELETE FROM signaling_sessions WHERE host_device_id = ?', hostDeviceId);
+    const attempt = attemptId ?? null;
+    this.sql.exec(
+      'DELETE FROM signaling_sessions WHERE host_device_id = ? AND (? IS NULL OR attempt_id IS NULL OR attempt_id = ?)',
+      hostDeviceId,
+      attempt,
+      attempt
+    );
   }
 
   /**
@@ -1162,9 +1165,17 @@ export class SignalingDO implements DurableObject {
       // Unpaired since the request — the devices must learn nothing of each other
       if (!this.isPaired(hostId, mobileId)) continue;
 
-      const attempt = row['attempt_id'] != null && { attemptId: row['attempt_id'] };
-      this.notifyDevice(mobileId, { type: 'peer_unavailable', deviceId: hostId, ...attempt });
-      this.notifyDevice(hostId, { type: 'peer_unavailable', deviceId: mobileId, ...attempt });
+      const attemptId = row['attempt_id'] as string | null;
+      this.notifyDevice(mobileId, {
+        type: 'peer_unavailable',
+        deviceId: hostId,
+        ...(attemptId !== null && { attemptId }),
+      });
+      this.notifyDevice(hostId, {
+        type: 'peer_unavailable',
+        deviceId: mobileId,
+        ...(attemptId !== null && { attemptId }),
+      });
     }
   }
 
@@ -1367,8 +1378,11 @@ export class SignalingDO implements DurableObject {
     ws: WebSocket,
     sender: WsAttachment,
     targetDeviceId: string,
-    attemptId: string | undefined
+    rawAttemptId: unknown
   ): Promise<void> {
+    // Stored, forwarded and echoed on peer_unavailable; invalid IDs are dropped
+    const attemptId = validateAttemptId(rawAttemptId);
+
     // Check pairing FIRST (before WS lookup) — don't reveal device existence to unpaired callers.
     // The sender is always a mobile: webSocketMessage rejects connect_request from hosts [SB-1360].
     const hostId = targetDeviceId;
@@ -1402,6 +1416,10 @@ export class SignalingDO implements DurableObject {
       if (this.connections.get(targetDeviceId) === targetWs) {
         this.connections.delete(targetDeviceId);
       }
+      // Unreachable host — drop any earlier attempt's session, whose expiry
+      // would carry a stale attemptId, and fail this attempt now
+      this.clearSignalingSession(hostId);
+      this.sendPeerUnavailable(ws, targetDeviceId, attemptId);
       return;
     }
 
@@ -1437,12 +1455,14 @@ export class SignalingDO implements DurableObject {
     // Relayed through and reflected on peer_unavailable; invalid IDs are dropped [SB-1375]
     const attemptId = validateAttemptId(data.attemptId);
 
-    // Host answered the connect_request — signaling session complete [SB-1001]
-    if (
-      sender.deviceType === 'host' &&
-      (data.type === 'sdp_offer' || data.type === 'connection_rejected')
-    ) {
-      this.clearSignalingSession(hostId);
+    // Host answered the connect_request — signaling session complete [SB-1001].
+    // An offer only completes its own attempt; connection_rejected is untagged.
+    if (sender.deviceType === 'host') {
+      if (data.type === 'sdp_offer') {
+        this.clearSignalingSession(hostId, attemptId);
+      } else if (data.type === 'connection_rejected') {
+        this.clearSignalingSession(hostId);
+      }
     }
 
     // A stale socket (e.g. a sleeping host not yet reaped) is as unreachable
