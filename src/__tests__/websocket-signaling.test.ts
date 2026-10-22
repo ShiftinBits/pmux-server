@@ -6,6 +6,14 @@ import type { SignalingDO } from '../signaling';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
+/** Mocked Date.now() for asserting presence ts. */
+const FIXED_NOW = 1_800_000_000_000;
+
+/** Mock Date.now() to return t. */
+const at = (t: number): void => {
+  vi.spyOn(Date, 'now').mockReturnValue(t);
+};
+
 let doInstance: SignalingDO;
 let mockState: MockDOState;
 
@@ -13,6 +21,10 @@ beforeEach(async () => {
   const result = await createTestDO();
   doInstance = result.doInstance;
   mockState = result.mockState;
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 /**
@@ -289,6 +301,35 @@ describe('WebSocket signaling [T1.8]', () => {
       );
 
       expect(mobileWs.messagesOfType('host_online')).toHaveLength(0);
+    });
+
+    it('stamps ts on host_online when the host authenticates [SB-1375]', async () => {
+      at(FIXED_NOW);
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.registerDevice('agent-1', 'pubkey-agent-1', 'host');
+      doInstance.createPairing('agent-1', 'mobile-1');
+      mobileWs.sent.length = 0;
+
+      at(FIXED_NOW + 1_000);
+      await connectAndAuth('agent-1', 'host');
+
+      const onlineMessages = mobileWs.messagesOfType('host_online');
+      expect(onlineMessages).toHaveLength(1);
+      expect(onlineMessages[0]!['ts']).toBe(FIXED_NOW + 1_000);
+    });
+
+    it('stamps ts on the presence snapshot host_online [SB-1375]', async () => {
+      at(FIXED_NOW);
+      await connectAndAuth('agent-1', 'host');
+      doInstance.registerDevice('mobile-1', 'pubkey-mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      at(FIXED_NOW + 1_000);
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+
+      const onlineMessages = mobileWs.messagesOfType('host_online');
+      expect(onlineMessages).toHaveLength(1);
+      expect(onlineMessages[0]!['ts']).toBe(FIXED_NOW + 1_000);
     });
   });
 
@@ -649,6 +690,20 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
     });
 
+    it('stamps ts on host_offline when the host disconnects [SB-1375]', async () => {
+      at(FIXED_NOW);
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+      mobileWs.sent.length = 0;
+
+      at(FIXED_NOW + 1_000);
+      await doInstance.webSocketClose(hostWs as unknown as WebSocket, 1000, 'normal closure', true);
+
+      const offlineMessages = mobileWs.messagesOfType('host_offline');
+      expect(offlineMessages).toHaveLength(1);
+      expect(offlineMessages[0]!['ts']).toBe(FIXED_NOW + 1_000);
+    });
   });
 
   describe('connect_request relay', () => {
@@ -710,6 +765,23 @@ describe('WebSocket signaling [T1.8]', () => {
       // Should NOT receive a generic error
       const errors = mobileWs.messagesOfType('error');
       expect(errors).toHaveLength(0);
+    });
+
+    it('stamps ts on the host_offline reply for an offline host [SB-1375]', async () => {
+      at(FIXED_NOW);
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+      mobileWs.sent.length = 0;
+
+      at(FIXED_NOW + 1_000);
+      await doInstance.webSocketMessage(
+        mobileWs as unknown as WebSocket,
+        JSON.stringify({ type: 'connect_request', targetDeviceId: 'agent-1' })
+      );
+
+      const offlineMessages = mobileWs.messagesOfType('host_offline');
+      expect(offlineMessages).toHaveLength(1);
+      expect(offlineMessages[0]!['ts']).toBe(FIXED_NOW + 1_000);
     });
 
     it('sends host_offline when the target host is stale (asleep, not yet reaped)', async () => {
@@ -1321,6 +1393,22 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(offlineMessages[0]!['deviceId']).toBe('agent-1');
     });
 
+    it('stamps ts on host_offline on webSocketError [SB-1375]', async () => {
+      at(FIXED_NOW);
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      doInstance.createPairing('agent-1', 'mobile-1');
+      mobileWs.sent.length = 0;
+
+      at(FIXED_NOW + 1_000);
+      await doInstance.webSocketError(hostWs as unknown as WebSocket, new Error('connection reset'));
+
+      const offlineMessages = mobileWs.messagesOfType('host_offline');
+      expect(offlineMessages).toHaveLength(1);
+      expect(offlineMessages[0]!['ts']).toBe(FIXED_NOW + 1_000);
+    });
+
     it('handles unknown message type', async () => {
       const { ws } = await connectAndAuth('agent-1', 'host');
       ws.sent.length = 0;
@@ -1505,6 +1593,28 @@ describe('WebSocket signaling [T1.8]', () => {
       );
 
       expect(mobileWs.messagesOfType('host_online')).toHaveLength(1);
+    });
+
+    it('stamps ts on the re-announced host_online [SB-1375]', async () => {
+      at(FIXED_NOW);
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      hostWs.serializeAttachment({
+        deviceId: 'agent-1',
+        deviceType: 'host',
+        authenticated: true,
+        lastMessageTime: FIXED_NOW - 10 * 60 * 1000,
+      });
+      mobileWs.sent.length = 0;
+
+      at(FIXED_NOW + 1_000);
+      await doInstance.webSocketMessage(hostWs as unknown as WebSocket, JSON.stringify({ type: 'presence' }));
+
+      const onlineMessages = mobileWs.messagesOfType('host_online');
+      expect(onlineMessages).toHaveLength(1);
+      expect(onlineMessages[0]!['ts']).toBe(FIXED_NOW + 1_000);
     });
 
     it('does not re-announce when another socket of the host is still fresh [SB-1004]', async () => {
@@ -1841,15 +1951,255 @@ describe('signaling session timeout [SB-1001]', () => {
     expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
   });
 
-  it('creates no session when relaying connect_request to the host fails', async () => {
+  it('fails fast without a session when relaying connect_request to the host fails', async () => {
     hostWs.send = () => { throw new Error('WebSocket closed'); };
 
     await connectRequest();
     expect(mockState.scheduledAlarm).toBeNull();
+    const unavailable = mobileWs.messagesOfType('peer_unavailable');
+    expect(unavailable).toHaveLength(1);
+    expect(unavailable[0]!['deviceId']).toBe('agent-1');
+    expect(unavailable[0]).not.toHaveProperty('attemptId');
 
+    // No session — expiry adds nothing
     at(T0 + 12_001);
     await doInstance.alarm();
 
-    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+    expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(1);
+  });
+});
+
+describe('connect attempt ID [SB-1375]', () => {
+  const T0 = 1_800_000_000_000;
+  const ATTEMPT = '0123456789abcdef0123456789abcdef';
+  const OTHER_ATTEMPT = 'fedcba9876543210fedcba9876543210';
+  let hostWs: MockWebSocket;
+  let mobileWs: MockWebSocket;
+
+  const send = async (ws: MockWebSocket, msg: Record<string, unknown>): Promise<void> => {
+    await doInstance.webSocketMessage(ws as unknown as WebSocket, JSON.stringify(msg));
+  };
+
+  const storedAttemptId = (): unknown =>
+    doInstance['sql']
+      .exec('SELECT attempt_id FROM signaling_sessions WHERE host_device_id = ?', 'agent-1')
+      .toArray()[0]?.['attempt_id'];
+
+  beforeEach(async () => {
+    at(T0);
+    ({ ws: hostWs } = await connectAndAuth('agent-1', 'host'));
+    ({ ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile'));
+    doInstance.createPairing('agent-1', 'mobile-1');
+    hostWs.sent.length = 0;
+    mobileWs.sent.length = 0;
+  });
+
+  describe('connect_request', () => {
+    it('stores a valid attemptId and forwards it to the host', async () => {
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId: ATTEMPT });
+
+      expect(storedAttemptId()).toBe(ATTEMPT);
+      const requests = hostWs.messagesOfType('connect_request');
+      expect(requests).toHaveLength(1);
+      expect(requests[0]!['attemptId']).toBe(ATTEMPT);
+    });
+
+    it.each([
+      ['missing', undefined],
+      ['uppercase hex', ATTEMPT.toUpperCase()],
+      ['non-hex', 'XYZ'],
+      ['31 chars', ATTEMPT.slice(0, 31)],
+      ['33 chars', `${ATTEMPT}0`],
+      ['32 chars with a non-hex char', `${ATTEMPT.slice(0, 31)}g`],
+      ['a number', 12345],
+    ])('drops a %s attemptId without rejecting the request', async (_label, attemptId) => {
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId });
+
+      expect(storedAttemptId()).toBeNull();
+      const requests = hostWs.messagesOfType('connect_request');
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).not.toHaveProperty('attemptId');
+      expect(mobileWs.messagesOfType('error')).toHaveLength(0);
+    });
+
+    it('replaces the stored attemptId on a repeat connect_request', async () => {
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId: ATTEMPT });
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1' });
+
+      expect(storedAttemptId()).toBeNull();
+    });
+
+    it('drops the earlier session and fails the new attempt when relaying to the host fails', async () => {
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId: OTHER_ATTEMPT });
+      hostWs.send = () => { throw new Error('WebSocket closed'); };
+
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId: ATTEMPT });
+
+      expect(storedAttemptId()).toBeUndefined();
+      const unavailable = mobileWs.messagesOfType('peer_unavailable');
+      expect(unavailable).toHaveLength(1);
+      expect(unavailable[0]!['attemptId']).toBe(ATTEMPT);
+
+      // The earlier attempt's session no longer expires with its stale ID
+      at(T0 + 12_001);
+      await doInstance.alarm();
+      expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(1);
+    });
+  });
+
+  describe('relay', () => {
+    it.each(['sdp_offer', 'ice_candidate'])('relays the host attemptId on %s', async (type) => {
+      await send(hostWs, { type, sdp: 'v=0', candidate: 'c', targetDeviceId: 'mobile-1', attemptId: ATTEMPT });
+
+      const relayed = mobileWs.messagesOfType(type);
+      expect(relayed).toHaveLength(1);
+      expect(relayed[0]!['attemptId']).toBe(ATTEMPT);
+    });
+
+    it.each(['sdp_offer', 'ice_candidate'])('omits attemptId on %s when the host sends none', async (type) => {
+      await send(hostWs, { type, sdp: 'v=0', candidate: 'c', targetDeviceId: 'mobile-1' });
+
+      const relayed = mobileWs.messagesOfType(type);
+      expect(relayed).toHaveLength(1);
+      expect(relayed[0]).not.toHaveProperty('attemptId');
+    });
+
+    it('relays the mobile attemptId on sdp_answer', async () => {
+      await send(mobileWs, { type: 'sdp_answer', sdp: 'v=0', targetDeviceId: 'agent-1', attemptId: ATTEMPT });
+
+      const relayed = hostWs.messagesOfType('sdp_answer');
+      expect(relayed).toHaveLength(1);
+      expect(relayed[0]!['attemptId']).toBe(ATTEMPT);
+    });
+
+    it('omits attemptId on sdp_answer when the mobile sends none', async () => {
+      await send(mobileWs, { type: 'sdp_answer', sdp: 'v=0', targetDeviceId: 'agent-1' });
+
+      const relayed = hostWs.messagesOfType('sdp_answer');
+      expect(relayed).toHaveLength(1);
+      expect(relayed[0]).not.toHaveProperty('attemptId');
+    });
+
+    it('drops an invalid attemptId from a relayed message', async () => {
+      await send(hostWs, { type: 'sdp_offer', sdp: 'v=0', targetDeviceId: 'mobile-1', attemptId: 'XYZ' });
+
+      expect(mobileWs.messagesOfType('sdp_offer')[0]).not.toHaveProperty('attemptId');
+    });
+
+    it('never relays attemptId on connection_rejected', async () => {
+      await send(hostWs, {
+        type: 'connection_rejected',
+        reason: 'already_connected',
+        targetDeviceId: 'mobile-1',
+        attemptId: ATTEMPT,
+      });
+
+      const rejections = mobileWs.messagesOfType('connection_rejected');
+      expect(rejections).toHaveLength(1);
+      expect(rejections[0]).not.toHaveProperty('attemptId');
+    });
+
+    it('reflects the sender attemptId on peer_unavailable when the target is not connected', async () => {
+      // Mobile's only socket is stale — as unreachable as a missing one
+      const att = mobileWs.deserializeAttachment() as Record<string, unknown>;
+      att.lastMessageTime = T0 - 10 * 60 * 1000;
+      mobileWs.serializeAttachment(att);
+
+      await send(hostWs, { type: 'sdp_offer', sdp: 'v=0', targetDeviceId: 'mobile-1', attemptId: ATTEMPT });
+      await send(hostWs, { type: 'ice_candidate', candidate: 'c', targetDeviceId: 'mobile-1' });
+
+      const unavailable = hostWs.messagesOfType('peer_unavailable');
+      expect(unavailable).toHaveLength(2);
+      expect(unavailable[0]!['attemptId']).toBe(ATTEMPT);
+      expect(unavailable[1]).not.toHaveProperty('attemptId');
+    });
+
+    it('reflects the sender attemptId on peer_unavailable when the send fails', async () => {
+      mobileWs.send = () => { throw new Error('WebSocket closed'); };
+
+      await send(hostWs, { type: 'sdp_offer', sdp: 'v=0', targetDeviceId: 'mobile-1', attemptId: ATTEMPT });
+      await send(hostWs, { type: 'sdp_offer', sdp: 'v=0', targetDeviceId: 'mobile-1' });
+
+      const unavailable = hostWs.messagesOfType('peer_unavailable');
+      expect(unavailable).toHaveLength(2);
+      expect(unavailable[0]!['attemptId']).toBe(ATTEMPT);
+      expect(unavailable[1]).not.toHaveProperty('attemptId');
+    });
+  });
+
+  describe('session expiry', () => {
+    it('includes the stored attemptId on both peer_unavailable notices', async () => {
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId: ATTEMPT });
+
+      at(T0 + 12_001);
+      await doInstance.alarm();
+
+      const toMobile = mobileWs.messagesOfType('peer_unavailable');
+      const toHost = hostWs.messagesOfType('peer_unavailable');
+      expect(toMobile).toHaveLength(1);
+      expect(toMobile[0]!['attemptId']).toBe(ATTEMPT);
+      expect(toHost).toHaveLength(1);
+      expect(toHost[0]!['attemptId']).toBe(ATTEMPT);
+    });
+
+    it('omits attemptId when the session has none', async () => {
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1' });
+
+      at(T0 + 12_001);
+      await doInstance.alarm();
+
+      const toMobile = mobileWs.messagesOfType('peer_unavailable');
+      const toHost = hostWs.messagesOfType('peer_unavailable');
+      expect(toMobile).toHaveLength(1);
+      expect(toMobile[0]).not.toHaveProperty('attemptId');
+      expect(toHost).toHaveLength(1);
+      expect(toHost[0]).not.toHaveProperty('attemptId');
+    });
+
+    it('keeps the current session when the host offers for an older attempt', async () => {
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId: ATTEMPT });
+      await send(hostWs, { type: 'sdp_offer', sdp: 'v=0', targetDeviceId: 'mobile-1', attemptId: OTHER_ATTEMPT });
+
+      expect(storedAttemptId()).toBe(ATTEMPT);
+
+      at(T0 + 12_001);
+      await doInstance.alarm();
+
+      const toMobile = mobileWs.messagesOfType('peer_unavailable');
+      expect(toMobile).toHaveLength(1);
+      expect(toMobile[0]!['attemptId']).toBe(ATTEMPT);
+    });
+
+    it.each([
+      ['a matching offer', ATTEMPT, ATTEMPT],
+      ['an untagged offer', ATTEMPT, undefined],
+      ['a tagged offer for an untagged request', undefined, ATTEMPT],
+    ])('clears the session on %s', async (_label, requestAttempt, offerAttempt) => {
+      await send(mobileWs, { type: 'connect_request', targetDeviceId: 'agent-1', attemptId: requestAttempt });
+      await send(hostWs, { type: 'sdp_offer', sdp: 'v=0', targetDeviceId: 'mobile-1', attemptId: offerAttempt });
+
+      expect(storedAttemptId()).toBeUndefined();
+
+      at(T0 + 12_001);
+      await doInstance.alarm();
+
+      expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+      expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+    });
+  });
+
+  it('migrates a signaling_sessions table created before attempt_id', async () => {
+    const { doInstance: do2 } = await createTestDO();
+    const sql = do2['sql'];
+    sql.exec(`CREATE TABLE signaling_sessions (
+      host_device_id TEXT PRIMARY KEY,
+      mobile_device_id TEXT NOT NULL,
+      expires_at INTEGER NOT NULL
+    )`);
+
+    do2.registerDevice('agent-2', 'pubkey-agent-2', 'host'); // runs ensureSchema
+
+    const cols = sql.exec('PRAGMA table_info(signaling_sessions)').toArray().map((c) => c['name']);
+    expect(cols).toContain('attempt_id');
   });
 });
