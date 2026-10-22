@@ -1446,6 +1446,65 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(unavailable).toHaveLength(1);
       expect(unavailable[0]!['deviceId']).toBe('mobile-1');
     });
+
+    it('relays to another fresh socket when the cached target socket is quiet [SB-1004]', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: freshMobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      const { ws: quietMobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      quietMobileWs.serializeAttachment({
+        deviceId: 'mobile-1',
+        deviceType: 'mobile',
+        authenticated: true,
+        lastMessageTime: Date.now() - 10 * 60 * 1000,
+      });
+      doInstance.setConnection('mobile-1', quietMobileWs as unknown as WebSocket);
+
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'sdp_offer', sdp: 'v=0\r\noffer', targetDeviceId: 'mobile-1' })
+      );
+
+      expect(freshMobileWs.messagesOfType('sdp_offer')).toHaveLength(1);
+      expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+    });
+
+    it('treats a socket without lastMessageTime as fresh [SB-1004]', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      mobileWs.serializeAttachment({ deviceId: 'mobile-1', deviceType: 'mobile', authenticated: true });
+
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'sdp_offer', sdp: 'v=0\r\noffer', targetDeviceId: 'mobile-1' })
+      );
+
+      expect(mobileWs.messagesOfType('sdp_offer')).toHaveLength(1);
+    });
+
+    it('re-announces host_online when a stale host socket sends again [SB-1004]', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      hostWs.serializeAttachment({
+        deviceId: 'agent-1',
+        deviceType: 'host',
+        authenticated: true,
+        lastMessageTime: Date.now() - 10 * 60 * 1000,
+      });
+      mobileWs.sent.length = 0;
+
+      await doInstance.webSocketMessage(
+        hostWs as unknown as WebSocket,
+        JSON.stringify({ type: 'sdp_offer', sdp: 'v=0\r\noffer', targetDeviceId: 'mobile-1' })
+      );
+
+      expect(mobileWs.messagesOfType('host_online')).toHaveLength(1);
+    });
   });
 
   describe('connect_request sender type [SB-1360]', () => {

@@ -830,8 +830,21 @@ export class SignalingDO implements DurableObject {
       return;
     }
 
+    // A stale-but-open host socket that speaks again was hidden from mobile presence
+    // by isWebSocketFresh(); announce it once it is live again [SB-1004]
+    const priorAtt = ws.deserializeAttachment() as WsAttachment | null;
+    const hostRecovered =
+      priorAtt?.authenticated === true && priorAtt.deviceType === 'host' && !this.isWebSocketFresh(ws);
+
     // Update lastMessageTime on every received message (for idle timeout tracking)
     this.touchWebSocket(ws);
+
+    if (hostRecovered && priorAtt) {
+      const msg: HostOnlineMessage = { type: 'host_online', deviceId: priorAtt.deviceId };
+      const name = this.getDevice(priorAtt.deviceId)?.name;
+      if (name) msg.name = name;
+      this.notifyPairedMobile(priorAtt.deviceId, msg);
+    }
 
     let data: SignalingClientMessage;
     try {
@@ -989,7 +1002,26 @@ export class SignalingDO implements DurableObject {
   private isWebSocketFresh(ws: WebSocket): boolean {
     const att = ws.deserializeAttachment() as WsAttachment | null;
     const last = att?.lastMessageTime ?? 0;
-    return last > 0 && Date.now() - last <= WS_IDLE_TIMEOUT_MS;
+    // A missing timestamp means "never reap" in the alarm, so it is fresh here too
+    return last === 0 || Date.now() - last <= WS_IDLE_TIMEOUT_MS;
+  }
+
+  /**
+   * Find a fresh socket for a device. Prefers the cached socket, then falls back
+   * to any other authenticated socket of the same device [SB-1004].
+   */
+  private findFreshWebSocket(deviceId: string): WebSocket | undefined {
+    const cached = this.findWebSocket(deviceId);
+    if (cached && this.isWebSocketFresh(cached)) return cached;
+    if (!this.state.getWebSockets) return undefined;
+    for (const ws of this.state.getWebSockets()) {
+      if (ws === cached) continue;
+      const att = ws.deserializeAttachment() as WsAttachment | null;
+      if (att?.authenticated && att.deviceId === deviceId && this.isWebSocketFresh(ws)) {
+        return ws;
+      }
+    }
+    return undefined;
   }
 
   // --- DO alarm handler (idle WS cleanup + expired pairing purge) ---
@@ -1272,8 +1304,7 @@ export class SignalingDO implements DurableObject {
       if (payload.deviceType === 'mobile') {
         const pairedHosts = this.getHostsForMobile(payload.deviceId);
         for (const hostDeviceId of pairedHosts) {
-          const hostWs = this.findWebSocket(hostDeviceId);
-          if (hostWs && this.isWebSocketFresh(hostWs)) {
+          if (this.findFreshWebSocket(hostDeviceId)) {
             const device = this.getDevice(hostDeviceId);
             const msg: HostOnlineMessage = { type: 'host_online', deviceId: hostDeviceId };
             if (device?.name) {
@@ -1322,8 +1353,8 @@ export class SignalingDO implements DurableObject {
     // yet reaped by the idle sweep) is treated as offline so the mobile gets an
     // immediate host_offline instead of a connect_request that never reaches a
     // frozen host.
-    const targetWs = this.findWebSocket(targetDeviceId);
-    if (!targetWs || !this.isWebSocketFresh(targetWs)) {
+    const targetWs = this.findFreshWebSocket(targetDeviceId);
+    if (!targetWs) {
       // Paired but offline → send host_offline so mobile can schedule reconnect
       if (sender.deviceType === 'mobile') this.clearSignalingSession(hostId);
       wsSend(ws, { type: 'host_offline', deviceId: targetDeviceId });
@@ -1381,10 +1412,10 @@ export class SignalingDO implements DurableObject {
       this.clearSignalingSession(hostId);
     }
 
-    const targetWs = this.findWebSocket(data.targetDeviceId);
     // A stale socket (e.g. a sleeping host not yet reaped) is as unreachable
-    // as a missing one [SB-1360]
-    if (!targetWs || !this.isWebSocketFresh(targetWs)) {
+    // as a missing one, but any fresh socket of the device will do [SB-1360]
+    const targetWs = this.findFreshWebSocket(data.targetDeviceId);
+    if (!targetWs) {
       // Target disconnected mid-negotiation [SB-1000] — tell the sender so it
       // can fail fast or retry instead of stalling until its watchdog fires.
       this.sendPeerUnavailable(ws, data.targetDeviceId);
