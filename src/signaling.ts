@@ -1002,8 +1002,7 @@ export class SignalingDO implements DurableObject {
   private isWebSocketFresh(ws: WebSocket): boolean {
     const att = ws.deserializeAttachment() as WsAttachment | null;
     const last = att?.lastMessageTime ?? 0;
-    // A missing timestamp means "never reap" in the alarm, so it is fresh here too
-    return last === 0 || Date.now() - last <= WS_IDLE_TIMEOUT_MS;
+    return last > 0 && Date.now() - last <= WS_IDLE_TIMEOUT_MS;
   }
 
   /**

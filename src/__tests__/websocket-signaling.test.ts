@@ -1470,7 +1470,7 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(0);
     });
 
-    it('treats a socket without lastMessageTime as fresh [SB-1004]', async () => {
+    it('treats a socket without lastMessageTime as not fresh (fail closed) [SB-1360]', async () => {
       const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
       doInstance.createPairing('agent-1', 'mobile-1');
@@ -1482,7 +1482,8 @@ describe('WebSocket signaling [T1.8]', () => {
         JSON.stringify({ type: 'sdp_offer', sdp: 'v=0\r\noffer', targetDeviceId: 'mobile-1' })
       );
 
-      expect(mobileWs.messagesOfType('sdp_offer')).toHaveLength(1);
+      expect(mobileWs.messagesOfType('sdp_offer')).toHaveLength(0);
+      expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(1);
     });
 
     it('re-announces host_online when a stale host socket sends again [SB-1004]', async () => {
