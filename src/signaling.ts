@@ -122,6 +122,12 @@ export interface WsAttachment {
   authenticated: boolean;
   /** Epoch ms of last received message (for idle timeout). */
   lastMessageTime?: number;
+  /**
+   * Set when the DO closed this socket (idle sweep or error). A closing socket
+   * stays in getWebSockets() until the peer acks, so this keeps it out of
+   * routing, presence and counts, and its late frames are ignored [SB-1393].
+   */
+  closed?: boolean;
 }
 
 /** Interval (ms) between alarm-based cleanup sweeps. */
@@ -645,7 +651,7 @@ export class SignalingDO implements DurableObject {
     const freshest = new Map<string, number>();
     for (const ws of this.state.getWebSockets()) {
       const att = ws.deserializeAttachment() as WsAttachment | null;
-      if (att?.authenticated && att.deviceId) {
+      if (att?.authenticated && att.deviceId && isLive(ws, att)) {
         const last = att.lastMessageTime ?? 0;
         if (!this.connections.has(att.deviceId) || last > (freshest.get(att.deviceId) ?? 0)) {
           this.connections.set(att.deviceId, ws);
@@ -838,6 +844,10 @@ export class SignalingDO implements DurableObject {
    * Called by the runtime when a hibernated WebSocket receives a message.
    */
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    // A late frame on a socket the DO already closed must not revive it: no
+    // touch, no host_online re-announce, no reply (send would throw) [SB-1393]
+    if (!isLive(ws, ws.deserializeAttachment() as WsAttachment | null)) return;
+
     if (typeof message !== 'string') return;
 
     if (message.length > MAX_WS_MESSAGE_SIZE) {
@@ -932,7 +942,8 @@ export class SignalingDO implements DurableObject {
    */
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
     const attachment = ws.deserializeAttachment() as WsAttachment | null;
-    if (!attachment?.authenticated) return;
+    // A socket the DO closed was already cleaned up where it was closed [SB-1393]
+    if (!attachment?.authenticated || attachment.closed) return;
 
     // Only remove from cache if this WS is the one currently stored.
     // A device may have multiple concurrent WebSockets (e.g., mobile uses one
@@ -967,7 +978,9 @@ export class SignalingDO implements DurableObject {
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
     const attachment = ws.deserializeAttachment() as WsAttachment | null;
     console.error('[ws-error] deviceId=%s error=%o', attachment?.deviceId, error);
-    if (attachment?.authenticated) {
+    // Skip cleanup already done when the DO closed this socket [SB-1393]
+    if (attachment?.authenticated && !attachment.closed) {
+      this.markClosed(ws);
       if (this.connections.get(attachment.deviceId) === ws) {
         this.connections.delete(attachment.deviceId);
       }
@@ -1005,6 +1018,15 @@ export class SignalingDO implements DurableObject {
     }
   }
 
+  /** Flag a socket the DO is closing so nothing treats it as live again [SB-1393]. */
+  private markClosed(ws: WebSocket): void {
+    const att = ws.deserializeAttachment() as WsAttachment | null;
+    if (att) {
+      att.closed = true;
+      ws.serializeAttachment(att);
+    }
+  }
+
   /**
    * A WebSocket is "fresh" if its last received message is within the idle
    * timeout. A sleeping/frozen host stops sending heartbeats, but its socket
@@ -1017,7 +1039,7 @@ export class SignalingDO implements DurableObject {
   private isWebSocketFresh(ws: WebSocket): boolean {
     const att = ws.deserializeAttachment() as WsAttachment | null;
     const last = att?.lastMessageTime ?? 0;
-    return last > 0 && Date.now() - last <= WS_IDLE_TIMEOUT_MS;
+    return isLive(ws, att) && last > 0 && Date.now() - last <= WS_IDLE_TIMEOUT_MS;
   }
 
   /**
@@ -1052,11 +1074,13 @@ export class SignalingDO implements DurableObject {
     if (this.state.getWebSockets) {
       for (const ws of this.state.getWebSockets()) {
         const att = ws.deserializeAttachment() as WsAttachment | null;
-        if (!att) continue;
+        // Already reaped and still lingering: don't close, count or notify again [SB-1393]
+        if (!att || att.closed) continue;
 
         const lastMsg = att.lastMessageTime ?? 0;
         if (lastMsg > 0 && now - lastMsg > WS_IDLE_TIMEOUT_MS) {
-          // Close idle WebSocket
+          // Mark first, as webSocketError does, then close the idle WebSocket
+          this.markClosed(ws);
           try {
             ws.close(1000, 'idle timeout');
           } catch {
@@ -1213,7 +1237,7 @@ export class SignalingDO implements DurableObject {
     for (const ws of this.state.getWebSockets()) {
       if (ws === excludeWs) continue;
       const att = ws.deserializeAttachment() as WsAttachment | null;
-      if (att?.authenticated && att.deviceId === deviceId) count++;
+      if (att?.authenticated && att.deviceId === deviceId && isLive(ws, att)) count++;
     }
     return count;
   }
@@ -1227,6 +1251,10 @@ export class SignalingDO implements DurableObject {
   private async handleWsAuth(ws: WebSocket, token: string, name?: string): Promise<void> {
     try {
       const payload = await verifyJWT(token, this.env.JWT_SECRET);
+
+      // The socket may have been closed during the await; don't overwrite its
+      // closed attachment with a fresh authenticated one [SB-1393]
+      if (!isLive(ws, ws.deserializeAttachment() as WsAttachment | null)) return;
 
       // Check WebSocket connection limit per device. Count from getWebSockets()
       // (the runtime source of truth) rather than the in-memory wsConnectionCounts
@@ -2145,4 +2173,13 @@ function pairCancelledResponse(): Response {
 /** Send a JSON message over a WebSocket. */
 function wsSend(ws: WebSocket, data: unknown): void {
   ws.send(JSON.stringify(data));
+}
+
+/**
+ * Whether a socket can still be used: not closed by the DO and not CLOSING or
+ * CLOSED (readyState 2/3). An unknown readyState counts as live so a runtime
+ * quirk can never take every socket offline [SB-1393].
+ */
+function isLive(ws: WebSocket, att: WsAttachment | null): boolean {
+  return !att?.closed && !(ws.readyState >= 2);
 }
