@@ -452,6 +452,151 @@ describe('Signaling server efficiency [T3.10]', () => {
       expect(ws.closed).toBe(false);
     });
   });
+
+  // A sleeping host's overdue heartbeat can land on a socket the alarm already
+  // closed (macOS DarkWake). That socket must stay dead [SB-1393].
+  describe('sockets the DO closed stay closed [SB-1393]', () => {
+    const asWs = (ws: MockWebSocket): WebSocket => ws as unknown as WebSocket;
+    const presence = JSON.stringify({ type: 'presence' });
+    const connectRequest = JSON.stringify({ type: 'connect_request', targetDeviceId: 'sleepy-host' });
+
+    function backdate(ws: MockWebSocket): void {
+      const att = ws.deserializeAttachment() as Record<string, unknown>;
+      att.lastMessageTime = Date.now() - 6 * 60 * 1000;
+      ws.serializeAttachment(att);
+    }
+
+    /** Pair a host and mobile, then let the alarm reap the idle host socket. */
+    async function reapPairedHost(): Promise<{ hostWs: MockWebSocket; mobileWs: MockWebSocket }> {
+      const { ws: hostWs } = await connectAndAuth('sleepy-host', 'host');
+      const { ws: mobileWs } = await connectAndAuth('sleepy-mobile', 'mobile');
+      doInstance.createPairing('sleepy-host', 'sleepy-mobile');
+      backdate(hostWs);
+      await doInstance.alarm();
+      expect(hostWs.closed).toBe(true);
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+      hostWs.sent = [];
+      mobileWs.sent = [];
+      return { hostWs, mobileWs };
+    }
+
+    it('ignores a late presence frame: no host_online, no touch, no reply', async () => {
+      const { hostWs, mobileWs } = await reapPairedHost();
+      const before = (hostWs.deserializeAttachment() as Record<string, unknown>)['lastMessageTime'];
+
+      await doInstance.webSocketMessage(asWs(hostWs), presence);
+
+      expect(mobileWs.messagesOfType('host_online')).toHaveLength(0);
+      expect(hostWs.sent).toHaveLength(0);
+      expect((hostWs.deserializeAttachment() as Record<string, unknown>)['lastMessageTime']).toBe(before);
+    });
+
+    it('does not throw when the closed socket refuses sends', async () => {
+      const { hostWs } = await reapPairedHost();
+      hostWs.send = () => {
+        throw new TypeError("Can't call WebSocket send() after close().");
+      };
+
+      await expect(doInstance.webSocketMessage(asWs(hostWs), presence)).resolves.toBeUndefined();
+    });
+
+    it('keeps the host offline for the auth snapshot and connect_request after a late frame', async () => {
+      const { hostWs } = await reapPairedHost();
+      await doInstance.webSocketMessage(asWs(hostWs), presence);
+
+      const { ws: mobileWs } = await connectAndAuth('sleepy-mobile', 'mobile');
+      expect(mobileWs.messagesOfType('host_online')).toHaveLength(0);
+
+      await doInstance.webSocketMessage(asWs(mobileWs), connectRequest);
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+      expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+      expect(hostWs.messagesOfType('connect_request')).toHaveLength(0);
+    });
+
+    it('routes to the live socket when the cache holds an alarm-closed one', async () => {
+      const { hostWs, mobileWs } = await reapPairedHost();
+      const { ws: liveWs } = await connectAndAuth('sleepy-host', 'host');
+      await doInstance.webSocketMessage(asWs(hostWs), presence);
+      doInstance.setConnection('sleepy-host', asWs(hostWs));
+
+      await doInstance.webSocketMessage(asWs(mobileWs), connectRequest);
+
+      expect(liveWs.messagesOfType('connect_request')).toHaveLength(1);
+      expect(hostWs.messagesOfType('connect_request')).toHaveLength(0);
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(0);
+    });
+
+    it('sends host_offline when the last live socket closes beside an alarm-closed one', async () => {
+      const { mobileWs } = await reapPairedHost();
+      const { ws: liveWs } = await connectAndAuth('sleepy-host', 'host');
+      mobileWs.sent = [];
+
+      liveWs.close(1000, 'bye');
+      await doInstance.webSocketClose(asWs(liveWs), 1000, 'bye', true);
+
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+    });
+
+    it('does not reprocess an alarm-closed socket on later sweeps', async () => {
+      const { hostWs, mobileWs } = await reapPairedHost();
+      const closeSpy = vi.spyOn(hostWs, 'close');
+
+      await doInstance.alarm();
+
+      expect(closeSpy).not.toHaveBeenCalled();
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(0);
+    });
+
+    it('sends exactly one host_offline when two idle host sockets are reaped in one sweep', async () => {
+      const { ws: a } = await connectAndAuth('sleepy-host', 'host');
+      const { ws: b } = await connectAndAuth('sleepy-host', 'host');
+      const { ws: mobileWs } = await connectAndAuth('sleepy-mobile', 'mobile');
+      doInstance.createPairing('sleepy-host', 'sleepy-mobile');
+      backdate(a);
+      backdate(b);
+
+      await doInstance.alarm();
+
+      expect(a.closed && b.closed).toBe(true);
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+    });
+
+    it('treats runtime close/error events after an alarm reap as already handled', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { hostWs, mobileWs } = await reapPairedHost();
+
+      await doInstance.webSocketClose(asWs(hostWs), 1000, 'idle timeout', true);
+      await doInstance.webSocketError(asWs(hostWs), new Error('reset'));
+
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(0);
+    });
+
+    it('does not decrement the WS count twice for an alarm-reaped socket', async () => {
+      const { ws: reaped } = await connectAndAuth('sleepy-host', 'host');
+      await connectAndAuth('sleepy-host', 'host');
+      backdate(reaped);
+      await doInstance.alarm();
+      expect(doInstance.getWsConnectionCount('sleepy-host')).toBe(1);
+
+      await doInstance.webSocketClose(asWs(reaped), 1000, 'idle timeout', true);
+
+      expect(doInstance.getWsConnectionCount('sleepy-host')).toBe(1);
+    });
+
+    it('stops routing to a socket after webSocketError', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { ws: hostWs } = await connectAndAuth('sleepy-host', 'host');
+      const { ws: mobileWs } = await connectAndAuth('sleepy-mobile', 'mobile');
+      doInstance.createPairing('sleepy-host', 'sleepy-mobile');
+
+      await doInstance.webSocketError(asWs(hostWs), new Error('reset'));
+      mobileWs.sent = [];
+      await doInstance.webSocketMessage(asWs(mobileWs), connectRequest);
+
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+      expect(hostWs.messagesOfType('connect_request')).toHaveLength(0);
+    });
+  });
 });
 
 describe('Worker root redirect', () => {

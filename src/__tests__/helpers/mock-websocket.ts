@@ -18,6 +18,9 @@ export class MockWebSocket {
   /** Close reason if ws.close() was called. */
   closeReason?: string;
 
+  /** WebSocket readyState: OPEN (1) until close() moves it to CLOSING (2). */
+  readyState = 1;
+
   private attachment: unknown = null;
 
   send(message: string): void {
@@ -26,6 +29,7 @@ export class MockWebSocket {
 
   close(code?: number, reason?: string): void {
     this.closed = true;
+    this.readyState = 2;
     this.closeCode = code;
     this.closeReason = reason;
   }
