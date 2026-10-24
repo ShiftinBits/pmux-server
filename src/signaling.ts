@@ -1079,13 +1079,13 @@ export class SignalingDO implements DurableObject {
 
         const lastMsg = att.lastMessageTime ?? 0;
         if (lastMsg > 0 && now - lastMsg > WS_IDLE_TIMEOUT_MS) {
-          // Close idle WebSocket
+          // Mark first, as webSocketError does, then close the idle WebSocket
+          this.markClosed(ws);
           try {
             ws.close(1000, 'idle timeout');
           } catch {
             // May already be closed
           }
-          this.markClosed(ws);
           if (att.authenticated && att.deviceId) {
             if (this.connections.get(att.deviceId) === ws) {
               this.connections.delete(att.deviceId);
@@ -1251,6 +1251,10 @@ export class SignalingDO implements DurableObject {
   private async handleWsAuth(ws: WebSocket, token: string, name?: string): Promise<void> {
     try {
       const payload = await verifyJWT(token, this.env.JWT_SECRET);
+
+      // The socket may have been closed during the await; don't overwrite its
+      // closed attachment with a fresh authenticated one [SB-1393]
+      if (!isLive(ws, ws.deserializeAttachment() as WsAttachment | null)) return;
 
       // Check WebSocket connection limit per device. Count from getWebSockets()
       // (the runtime source of truth) rather than the in-memory wsConnectionCounts

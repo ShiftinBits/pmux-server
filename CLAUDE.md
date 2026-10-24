@@ -74,7 +74,7 @@ Headers `pmux-signature` + `pmux-timestamp` (unix seconds, ±60s); `/v1/*` also 
 | In-memory maps | WebSocket connection cache, per-device WS counts | `connections`, rebuilt after hibernation |
 | In-memory map | Held `/pair/complete` requests awaiting `pair_accept`/`pair_reject` (30s) | `pendingPairs`, keyed by host; the in-flight request keeps the DO awake |
 | DO KV + in-memory | TURN credential cache | key `turn_cache`, mirrored in `turnCache` |
-| WS attachments | `{deviceId, deviceType, authenticated, lastMessageTime, closed?}` (survives hibernation; `closed` = the DO closed it, so it is ignored for routing, presence, counts and late frames [SB-1393]) | `serializeAttachment()` |
+| WS attachments | `{deviceId, deviceType, authenticated, lastMessageTime, closed?}` (survives hibernation; `closed` = the idle sweep or `webSocketError` closed it, so it is ignored for routing, presence, counts and late frames [SB-1393]) | `serializeAttachment()` |
 
 Schema changes: `CREATE TABLE IF NOT EXISTS` + idempotent `ALTER` in `ensureSchema()` (guarded by a `PRAGMA table_info` column check; the older RENAME uses try/catch); no schema-version table. **Units differ:** `devices`/`pairings` `created_at` are seconds; every `expires_at` and `pending_pair_complete.created_at` are ms.
 

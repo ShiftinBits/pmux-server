@@ -503,6 +503,10 @@ describe('Signaling server efficiency [T3.10]', () => {
     it('keeps the host offline for the auth snapshot and connect_request after a late frame', async () => {
       const { hostWs } = await reapPairedHost();
       await doInstance.webSocketMessage(asWs(hostWs), presence);
+      // Like the runtime: relaying into the closed socket would throw → peer_unavailable
+      hostWs.send = () => {
+        throw new TypeError("Can't call WebSocket send() after close().");
+      };
 
       const { ws: mobileWs } = await connectAndAuth('sleepy-mobile', 'mobile');
       expect(mobileWs.messagesOfType('host_online')).toHaveLength(0);
@@ -510,6 +514,30 @@ describe('Signaling server efficiency [T3.10]', () => {
       await doInstance.webSocketMessage(asWs(mobileWs), connectRequest);
       expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
       expect(mobileWs.messagesOfType('peer_unavailable')).toHaveLength(0);
+    });
+
+    it('keeps an alarm-closed socket dead when it reports OPEN again (hibernation rehydrate)', async () => {
+      const { hostWs, mobileWs } = await reapPairedHost();
+      // Only the attachment flag survives hibernation; readyState may read OPEN
+      hostWs.readyState = 1;
+
+      await doInstance.webSocketMessage(asWs(hostWs), presence);
+      await doInstance.webSocketMessage(asWs(mobileWs), connectRequest);
+
+      expect(mobileWs.messagesOfType('host_online')).toHaveLength(0);
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+      expect(hostWs.messagesOfType('connect_request')).toHaveLength(0);
+    });
+
+    it('does not route to a CLOSING socket the DO did not flag', async () => {
+      const { ws: hostWs } = await connectAndAuth('sleepy-host', 'host');
+      const { ws: mobileWs } = await connectAndAuth('sleepy-mobile', 'mobile');
+      doInstance.createPairing('sleepy-host', 'sleepy-mobile');
+      hostWs.readyState = 2;
+
+      await doInstance.webSocketMessage(asWs(mobileWs), connectRequest);
+
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
       expect(hostWs.messagesOfType('connect_request')).toHaveLength(0);
     });
 
@@ -557,30 +585,67 @@ describe('Signaling server efficiency [T3.10]', () => {
 
       await doInstance.alarm();
 
-      expect(a.closed && b.closed).toBe(true);
+      expect(a.closed).toBe(true);
+      expect(b.closed).toBe(true);
       expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
     });
 
-    it('treats runtime close/error events after an alarm reap as already handled', async () => {
-      vi.spyOn(console, 'error').mockImplementation(() => {});
+    it('treats the runtime close event after an alarm reap as already handled', async () => {
       const { hostWs, mobileWs } = await reapPairedHost();
 
       await doInstance.webSocketClose(asWs(hostWs), 1000, 'idle timeout', true);
+
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(0);
+    });
+
+    it('treats a runtime error event after an alarm reap as already handled', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { hostWs, mobileWs } = await reapPairedHost();
+
       await doInstance.webSocketError(asWs(hostWs), new Error('reset'));
 
       expect(mobileWs.messagesOfType('host_offline')).toHaveLength(0);
     });
 
-    it('does not decrement the WS count twice for an alarm-reaped socket', async () => {
-      const { ws: reaped } = await connectAndAuth('sleepy-host', 'host');
-      await connectAndAuth('sleepy-host', 'host');
-      backdate(reaped);
-      await doInstance.alarm();
-      expect(doInstance.getWsConnectionCount('sleepy-host')).toBe(1);
+    it.each(['close', 'error'] as const)(
+      'does not decrement the WS count twice when %s follows an alarm reap',
+      async (event) => {
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        const { ws: reaped } = await connectAndAuth('sleepy-host', 'host');
+        await connectAndAuth('sleepy-host', 'host');
+        backdate(reaped);
+        await doInstance.alarm();
+        expect(doInstance.getWsConnectionCount('sleepy-host')).toBe(1);
 
-      await doInstance.webSocketClose(asWs(reaped), 1000, 'idle timeout', true);
+        if (event === 'close') {
+          await doInstance.webSocketClose(asWs(reaped), 1000, 'idle timeout', true);
+        } else {
+          await doInstance.webSocketError(asWs(reaped), new Error('reset'));
+        }
 
+        expect(doInstance.getWsConnectionCount('sleepy-host')).toBe(1);
+      }
+    );
+
+    it('rebuilds the connection cache and counts without the alarm-closed socket', async () => {
+      await reapPairedHost();
+      const { ws: liveWs } = await connectAndAuth('sleepy-host', 'host');
+      doInstance.removeConnection('sleepy-host');
+      doInstance.clearWsConnectionCounts();
+
+      expect(doInstance.getConnection('sleepy-host')).toBe(liveWs);
       expect(doInstance.getWsConnectionCount('sleepy-host')).toBe(1);
+    });
+
+    it('does not re-authenticate a socket that was closed while its JWT was verifying', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { ws: hostWs, token } = await connectAndAuth('sleepy-host', 'host');
+      const auth = doInstance.webSocketMessage(asWs(hostWs), JSON.stringify({ type: 'auth', token }));
+      await doInstance.webSocketError(asWs(hostWs), new Error('reset'));
+      await auth;
+
+      expect((hostWs.deserializeAttachment() as Record<string, unknown>)['closed']).toBe(true);
+      expect(doInstance.getWsConnectionCount('sleepy-host')).toBe(0);
     });
 
     it('stops routing to a socket after webSocketError', async () => {
