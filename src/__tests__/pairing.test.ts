@@ -43,6 +43,21 @@ describe('POST /pair/initiate', () => {
     expect((data['pairingCode'] as string).length).toBe(6);
   });
 
+  it('schedules the unpaired-host purge when it registers a new host', async () => {
+    const { doInstance: d, mockState } = await createTestDOFull();
+    const before = Date.now();
+    const body = await signedPairInitiateBodyWithChallenge(d, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
+    await d.fetch(new Request('http://localhost/pair/initiate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }));
+
+    expect(mockState.scheduledAlarm).not.toBeNull();
+    expect(mockState.scheduledAlarm!).toBeLessThanOrEqual(Date.now() + 86_400_000 + 30_000);
+    expect(mockState.scheduledAlarm!).toBeGreaterThanOrEqual(before + 86_400_000);
+  });
+
   it('registers the agent device', async () => {
     const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
     await postJSON('/pair/initiate', body);

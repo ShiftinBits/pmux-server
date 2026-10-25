@@ -2230,3 +2230,87 @@ describe('connect attempt ID [SB-1375]', () => {
     expect(cols).toContain('attempt_id');
   });
 });
+
+describe('unpaired host purge', () => {
+  const T0 = 1_800_000_000_000;
+  const DAY_S = 86_400;
+  const old = Math.floor(T0 / 1000) - DAY_S - 10;
+
+  const backdate = (id: string, createdAt = old): void => {
+    doInstance['sql'].exec('UPDATE devices SET created_at = ? WHERE id = ?', createdAt, id);
+  };
+  const exists = (id: string): boolean => doInstance.getDevice(id) !== null;
+
+  beforeEach(() => {
+    at(T0);
+  });
+
+  it('purges an old never-paired host and keeps everything else', async () => {
+    doInstance.registerDevice('stale-host', 'pk1', 'host');
+    doInstance.registerDevice('paired-host', 'pk2', 'host');
+    doInstance.registerDevice('paired-mobile', 'pk3', 'mobile');
+    doInstance.createPairing('paired-host', 'paired-mobile');
+    doInstance.registerDevice('recent-host', 'pk4', 'host');
+    doInstance.registerDevice('session-host', 'pk5', 'host');
+    doInstance['sql'].exec(
+      'INSERT INTO pairing_sessions (code, host_device_id, host_x25519_public_key, host_ed_public_key, expires_at, pair_confirm) VALUES (?, ?, ?, ?, ?, 0)',
+      'ABCDEF', 'session-host', 'x', 'e', T0 + 60_000
+    );
+    doInstance.registerDevice('held-host', 'pk6', 'host');
+    doInstance['pendingPairs'].set('held-host', {} as never);
+    doInstance.registerDevice('old-mobile', 'pk8', 'mobile');
+    for (const id of ['stale-host', 'paired-host', 'paired-mobile', 'session-host', 'held-host', 'old-mobile']) {
+      backdate(id);
+    }
+    const { ws } = await connectAndAuth('live-host', 'host');
+    backdate('live-host');
+    ws.serializeAttachment({ ...(ws.deserializeAttachment() as object), lastMessageTime: T0 });
+
+    await doInstance.alarm();
+
+    expect(exists('stale-host')).toBe(false);
+    for (const id of ['paired-host', 'paired-mobile', 'recent-host', 'session-host', 'held-host', 'live-host', 'old-mobile']) {
+      expect(exists(id)).toBe(true);
+    }
+  });
+
+  it('reschedules with no sockets while an unpaired host remains, never earlier than one interval', async () => {
+    doInstance.registerDevice('host-a', 'pk1', 'host');
+    const created = Math.floor(T0 / 1000);
+    await doInstance.alarm();
+
+    expect(mockState.scheduledAlarm).toBe(created * 1000 + DAY_S * 1000 + 30_000);
+  });
+
+  it('clamps the reschedule for a skipped host to now + one interval', async () => {
+    doInstance.registerDevice('held-host', 'pk1', 'host');
+    doInstance['pendingPairs'].set('held-host', {} as never);
+    backdate('held-host');
+
+    await doInstance.alarm();
+
+    expect(exists('held-host')).toBe(true);
+    expect(mockState.scheduledAlarm).toBe(T0 + 30_000);
+  });
+
+  it('purges a backdated never-paired host when the scheduled alarm fires', async () => {
+    doInstance.registerDevice('host-a', 'pk1', 'host');
+    await doInstance.alarm();
+    const fireAt = mockState.scheduledAlarm!;
+
+    at(fireAt);
+    await doInstance.alarm();
+
+    expect(exists('host-a')).toBe(false);
+  });
+
+  it('does not reschedule with no unpaired hosts and no sockets', async () => {
+    doInstance.registerDevice('paired-host', 'pk2', 'host');
+    doInstance.registerDevice('paired-mobile', 'pk3', 'mobile');
+    doInstance.createPairing('paired-host', 'paired-mobile');
+
+    await doInstance.alarm();
+
+    expect(mockState.scheduledAlarm).toBeNull();
+  });
+});

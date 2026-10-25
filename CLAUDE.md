@@ -76,6 +76,8 @@ Headers `pmux-signature` + `pmux-timestamp` (unix seconds, ±60s); `/v1/*` also 
 | DO KV + in-memory | TURN credential cache | key `turn_cache`, mirrored in `turnCache` |
 | WS attachments | `{deviceId, deviceType, authenticated, lastMessageTime, closed?}` (survives hibernation; `closed` = the idle sweep or `webSocketError` closed it, so it is ignored for routing, presence, counts and late frames [SB-1393]) | `serializeAttachment()` |
 
+Host rows that never paired are purged after 1 day (`UNPAIRED_HOST_TTL_S`) by `alarm()`, skipping hosts with a `pairing_sessions` row, a `pendingPairs` entry or a live authenticated socket. The alarm is scheduled at new-host `/pair/initiate` and rescheduled while unpaired hosts remain.
+
 Schema changes: `CREATE TABLE IF NOT EXISTS` + idempotent `ALTER` in `ensureSchema()` (guarded by a `PRAGMA table_info` column check; the older RENAME uses try/catch); no schema-version table. **Units differ:** `devices`/`pairings` `created_at` are seconds; every `expires_at` and `pending_pair_complete.created_at` are ms.
 
 ## Conventions
@@ -114,4 +116,4 @@ Vitest, no Miniflare/workerd — tests call `doInstance.fetch()` and the WS hand
 - **WS relay**: `sdp_offer`/`sdp_answer`/`ice_candidate`/`connection_rejected` relay only whitelisted fields; unpaired senders are dropped silently (`connect_request` instead gets `connection_rejected` `not_paired`). Relay failure → `peer_unavailable` to sender.
 - **Alarm lifecycle**: every 30s (`ALARM_INTERVAL_MS`) while sockets remain; closes sockets idle >90s (`WS_IDLE_TIMEOUT_MS`), cleans expired pairing codes, expires `signaling_sessions`. Scheduled on WS upgrade (`scheduleAlarmIfNeeded()`), pulled earlier (never later) by `scheduleAlarmBy()`. Unanswered `connect_request` → `peer_unavailable` to both ends after 12s; session also cleared wherever `host_offline` is sent [SB-1001].
 - **Idle timeout is coupled to the agent heartbeat**: 90s = 3× the agent's 30s heartbeat, but only 2× at its 45s keepalive clamp cap (zero dropped-heartbeat margin). Don't raise that cap or lower the timeout without checking the other side.
-- **TURN credential cache**: requested with 24h TTL, shared by all devices, refetched once older than 1h. Concurrent refetches share one in-flight request (5s timeout); on Realtime API failure, cached creds up to 12h old are served instead of a 502. Persisted to DO KV (`turn_cache`) — the one server-owned secret stored besides pairings; no user data [SB-1003].
+- **TURN credential cache**: requested with 24h TTL, shared by all paired devices (`/turn/credentials` returns 403 `Device not paired` for a host with no mobile or a mobile with no host), refetched once older than 1h. Concurrent refetches share one in-flight request (5s timeout); on Realtime API failure, cached creds up to 12h old are served instead of a 502. Persisted to DO KV (`turn_cache`) — the one server-owned secret stored besides pairings; no user data [SB-1003].

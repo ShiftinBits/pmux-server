@@ -133,6 +133,9 @@ export interface WsAttachment {
 /** Interval (ms) between alarm-based cleanup sweeps. */
 const ALARM_INTERVAL_MS = 30_000; // 30 seconds
 
+/** Age (seconds) after which a host that never paired is purged. */
+const UNPAIRED_HOST_TTL_S = 86_400; // 1 day
+
 /**
  * Maximum idle time (ms) before a WebSocket is closed.
  *
@@ -183,8 +186,8 @@ export class SignalingDO implements DurableObject {
   private wsConnectionCounts = new Map<string, number>();
 
   // TURN credential cache, mirrored to DO KV storage (TURN_CACHE_KEY) so it survives
-  // hibernation. Shared by all devices: any authenticated device can already obtain
-  // valid credentials, and they are time-limited and relay-only.
+  // hibernation. Shared by all paired devices: they are time-limited
+  // and relay-only.
   private turnCache: TurnCacheEntry | null = null;
   private turnFetch: Promise<TurnCredentials> | null = null;
 
@@ -792,7 +795,7 @@ export class SignalingDO implements DurableObject {
         case '/turn/credentials': {
           const limited = await this.checkLimit(this.env.TURN_LIMITER, `turn:${deviceId || clientIp}`, 60);
           if (limited) return limited;
-          return this.handleTurnCredentials();
+          return this.handleTurnCredentials(deviceId, request.headers.get('X-Device-Type'));
         }
         case '/pairing': {
           const limited = await this.checkLimit(this.env.PAIR_LIMITER, `pairing:${deviceId || clientIp}`, 60);
@@ -1078,6 +1081,13 @@ export class SignalingDO implements DurableObject {
 
   // --- DO alarm handler (idle WS cleanup + expired pairing purge) ---
 
+  private isPairedDevice(deviceId: string, deviceType: string | null): boolean {
+    if (!deviceId) return false;
+    if (deviceType === 'host') return this.getPairedMobile(deviceId) !== null;
+    if (deviceType === 'mobile') return this.getHostsForMobile(deviceId).length > 0;
+    return false;
+  }
+
   /**
    * Called by the runtime on the scheduled alarm.
    * Closes idle WebSockets and purges expired pairing codes.
@@ -1085,6 +1095,7 @@ export class SignalingDO implements DurableObject {
   async alarm(): Promise<void> {
     const now = Date.now();
     let activeCount = 0;
+    const liveDeviceIds = new Set<string>();
 
     if (this.state.getWebSockets) {
       for (const ws of this.state.getWebSockets()) {
@@ -1121,12 +1132,15 @@ export class SignalingDO implements DurableObject {
           }
         } else {
           activeCount++;
+          if (att.authenticated && att.deviceId && isLive(ws, att)) liveDeviceIds.add(att.deviceId);
         }
       }
     }
 
     // Purge expired pairing codes
     this.cleanExpiredPairings();
+
+    this.purgeUnpairedHosts(now, liveDeviceIds);
 
     // Time out connect_requests the host never answered [SB-1001]
     this.expireSignalingSessions(now);
@@ -1138,8 +1152,42 @@ export class SignalingDO implements DurableObject {
       .exec('SELECT MIN(expires_at) AS next FROM signaling_sessions')
       .toArray()[0]?.['next'];
     if (typeof pending === 'number') next = Math.min(next, pending);
+    // Keep the unpaired-host purge scheduled; clamp so a host that was skipped
+    // (live socket, pending pairing) can't re-fire the alarm in a hot loop.
+    const oldest = this.sql
+      .exec(
+        "SELECT MIN(created_at) AS oldest FROM devices WHERE device_type = 'host' AND id NOT IN (SELECT host_device_id FROM pairings)"
+      )
+      .toArray()[0]?.['oldest'];
+    if (typeof oldest === 'number') {
+      const due = oldest * 1000 + UNPAIRED_HOST_TTL_S * 1000 + ALARM_INTERVAL_MS;
+      next = Math.min(next, Math.max(due, Date.now() + ALARM_INTERVAL_MS));
+    }
     if (next !== Infinity) {
       await this.state.storage.setAlarm(next);
+    }
+  }
+
+  /**
+   * Delete host rows that never paired and are older than UNPAIRED_HOST_TTL_S.
+   * Hosts with a pairing session, a held confirming /pair/complete or a live
+   * authenticated socket are kept (e.g. a host mid `pmux pair` after unpair).
+   */
+  private purgeUnpairedHosts(now: number, liveDeviceIds: Set<string>): void {
+    const cutoff = Math.floor(now / 1000) - UNPAIRED_HOST_TTL_S;
+    const rows = this.sql
+      .exec(
+        `SELECT id FROM devices WHERE device_type = 'host' AND created_at < ?
+           AND id NOT IN (SELECT host_device_id FROM pairings)
+           AND id NOT IN (SELECT host_device_id FROM pairing_sessions)
+           AND id NOT IN (SELECT host_device_id FROM pending_pair_complete)`,
+        cutoff
+      )
+      .toArray();
+    for (const row of rows) {
+      const id = row['id'] as string;
+      if (this.pendingPairs.has(id) || liveDeviceIds.has(id)) continue;
+      this.sql.exec('DELETE FROM devices WHERE id = ?', id);
     }
   }
 
@@ -1653,6 +1701,7 @@ export class SignalingDO implements DurableObject {
     // Register the host device if not already registered, or update name
     if (!existing) {
       this.registerDevice(body.deviceId, body.ed25519PublicKey, 'host', body.name);
+      await this.scheduleAlarmBy(Date.now() + UNPAIRED_HOST_TTL_S * 1000 + ALARM_INTERVAL_MS);
     } else if (body.name !== undefined) {
       // Signature already verified against stored key, safe to update name
       this.updateDeviceName(body.deviceId, body.name);
@@ -2076,7 +2125,10 @@ export class SignalingDO implements DurableObject {
    * share one request, and a failed refetch falls back to cached credentials up to
    * TURN_MAX_SERVE_AGE_MS old.
    */
-  private async handleTurnCredentials(): Promise<Response> {
+  private async handleTurnCredentials(deviceId: string, deviceType: string | null): Promise<Response> {
+    if (!this.isPairedDevice(deviceId, deviceType)) {
+      return jsonResponse({ error: 'Device not paired' }, 403);
+    }
     if (!this.turnCache) {
       const stored = await this.state.storage.get<TurnCacheEntry>(TURN_CACHE_KEY);
       this.turnCache ??= stored ?? null;
