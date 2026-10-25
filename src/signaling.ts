@@ -740,6 +740,15 @@ export class SignalingDO implements DurableObject {
   };
 
   async fetch(request: Request): Promise<Response> {
+    try {
+      return await this.route(request);
+    } catch (err) {
+      console.error('[do] unhandled error path=%s', new URL(request.url).pathname, err);
+      return jsonResponse({ error: 'Internal error' }, 500);
+    }
+  }
+
+  private async route(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const clientIp = request.headers.get('X-Client-IP') ?? '127.0.0.1';
     const deviceId = request.headers.get('X-Device-Id') ?? '';
@@ -856,6 +865,20 @@ export class SignalingDO implements DurableObject {
       return;
     }
 
+    // Malformed frames do not count as activity: parse and shape-check first
+    let data: SignalingClientMessage;
+    try {
+      data = JSON.parse(message) as SignalingClientMessage;
+    } catch {
+      wsSend(ws, { type: 'error', error: 'Invalid JSON' });
+      return;
+    }
+    const parsed: unknown = data;
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      wsSend(ws, { type: 'error', error: 'Invalid message' });
+      return;
+    }
+
     // A host whose sockets were all stale was hidden from mobile presence by
     // isWebSocketFresh(); note it so it can be re-announced once live [SB-1004]
     const priorAtt = ws.deserializeAttachment() as WsAttachment | null;
@@ -866,14 +889,6 @@ export class SignalingDO implements DurableObject {
 
     // Update lastMessageTime on every received message (for idle timeout tracking)
     this.touchWebSocket(ws);
-
-    let data: SignalingClientMessage;
-    try {
-      data = JSON.parse(message) as SignalingClientMessage;
-    } catch {
-      wsSend(ws, { type: 'error', error: 'Invalid JSON' });
-      return;
-    }
 
     // Re-auth announces host_online itself in handleWsAuth
     if (hostWasHidden && priorAtt && data.type !== 'auth') {
@@ -1603,6 +1618,11 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Name must be a string of 1-64 characters with no control characters' }, 400);
     }
 
+    // Checked before consumeChallenge so a 400 does not burn the nonce
+    if (!isBase64OfLength(body.x25519PublicKey, 32)) {
+      return jsonResponse({ error: 'Invalid x25519PublicKey' }, 400);
+    }
+
     // Consume the nonce challenge (single-use, validates expiry and device binding)
     if (!this.consumeChallenge(body.nonce, body.deviceId)) {
       return jsonResponse({ error: 'Invalid or expired challenge' }, 401);
@@ -1610,13 +1630,18 @@ export class SignalingDO implements DurableObject {
 
     // Verify signature against stored key (if device exists) or request body key
     const existing = this.getDevice(body.deviceId);
+    // For an existing host the body key is stored as host_ed_public_key without
+    // being the verify key, so it must be well-formed on its own
+    if (existing && !isBase64OfLength(body.ed25519PublicKey, 32)) {
+      return jsonResponse({ error: 'Invalid ed25519PublicKey' }, 400);
+    }
     const verifyKey = existing ? existing.ed25519PublicKey : body.ed25519PublicKey;
     const message = new TextEncoder().encode(body.deviceId + '|' + body.nonce);
-    const publicKeyBytes = base64ToBytes(verifyKey);
-    const signatureBytes = base64ToBytes(body.signature);
 
     let valid: boolean;
     try {
+      const publicKeyBytes = base64ToBytes(verifyKey);
+      const signatureBytes = base64ToBytes(body.signature);
       valid = await verifyEd25519Signature(publicKeyBytes, message, signatureBytes);
     } catch {
       return jsonResponse({ error: 'Invalid signature format' }, 401);
@@ -1953,11 +1978,11 @@ export class SignalingDO implements DurableObject {
 
     // Verify the signature: sign(privateKey, deviceId + "|" + nonce)
     const message = new TextEncoder().encode(body.deviceId + '|' + body.nonce);
-    const publicKeyBytes = base64ToBytes(device.ed25519PublicKey);
-    const signatureBytes = base64ToBytes(body.signature);
 
     let valid: boolean;
     try {
+      const publicKeyBytes = base64ToBytes(device.ed25519PublicKey);
+      const signatureBytes = base64ToBytes(body.signature);
       valid = await verifyEd25519Signature(publicKeyBytes, message, signatureBytes);
     } catch {
       return jsonResponse({ error: 'Invalid signature format' }, 401);
@@ -2138,6 +2163,15 @@ function base64ToBytes(str: string): Uint8Array {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
+}
+
+function isBase64OfLength(value: unknown, length: number): boolean {
+  if (typeof value !== 'string') return false;
+  try {
+    return atob(value).length === length;
+  } catch {
+    return false;
+  }
 }
 
 function jsonResponse(data: unknown, status = 200): Response {

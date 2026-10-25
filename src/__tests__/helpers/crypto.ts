@@ -21,6 +21,9 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+/** A well-formed 32-byte base64 X25519 public key for /pair/initiate bodies. */
+export const HOST_X25519_KEY = bytesToBase64(new Uint8Array(32).fill(7));
+
 export async function signEd25519(privateKey: CryptoKey, message: Uint8Array): Promise<Uint8Array> {
   const sig = await crypto.subtle.sign('Ed25519', privateKey, message);
   return new Uint8Array(sig);

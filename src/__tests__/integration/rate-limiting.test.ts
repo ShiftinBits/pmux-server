@@ -11,7 +11,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createTestDO } from '../helpers/mock-do';
-import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge } from '../helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY } from '../helpers/crypto';
 import type { SignalingDO } from '../../signaling';
 
 // Limits mirror the native Workers Rate Limiting bindings (wrangler.toml).
@@ -65,7 +65,7 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Send requests up to the limit
       for (let i = 0; i < limit; i++) {
-        const body = await signedInitiateBody(`agent-${i}`, `x25519-key-${i}`);
+        const body = await signedInitiateBody(`agent-${i}`, HOST_X25519_KEY);
         const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
       }
@@ -74,7 +74,7 @@ describe('Rate limiting integration [T3.11]', () => {
       const { status, data, response } = await postJSON('/pair/initiate', {
         deviceId: 'agent-overflow',
         ed25519PublicKey: 'pub-key-overflow',
-        x25519PublicKey: 'x25519-key-overflow',
+        x25519PublicKey: HOST_X25519_KEY,
       });
 
       expect(status).toBe(429);
@@ -91,14 +91,14 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Send 5 requests
       for (let i = 0; i < 5; i++) {
-        const body = await signedInitiateBody(`agent-persist-${i}`, `x25519-key-${i}`);
+        const body = await signedInitiateBody(`agent-persist-${i}`, HOST_X25519_KEY);
         const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
       }
 
       // Send remaining requests to hit the limit
       for (let i = 5; i < limit; i++) {
-        const body = await signedInitiateBody(`agent-persist-${i}`, `x25519-key-${i}`);
+        const body = await signedInitiateBody(`agent-persist-${i}`, HOST_X25519_KEY);
         const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
       }
@@ -107,7 +107,7 @@ describe('Rate limiting integration [T3.11]', () => {
       const { status } = await postJSON('/pair/initiate', {
         deviceId: 'agent-persist-overflow',
         ed25519PublicKey: 'pub-key-overflow',
-        x25519PublicKey: 'x25519-key-overflow',
+        x25519PublicKey: HOST_X25519_KEY,
       });
       expect(status).toBe(429);
     });
@@ -119,7 +119,7 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Exhaust limit for IP A
       for (let i = 0; i < limit; i++) {
-        const body = await signedInitiateBody(`agent-a-${i}`, `x25519-key-a-${i}`);
+        const body = await signedInitiateBody(`agent-a-${i}`, HOST_X25519_KEY);
         const { status } = await postJSON('/pair/initiate', body, { 'X-Client-IP': '10.0.0.1' });
         expect(status).toBe(200);
       }
@@ -130,19 +130,19 @@ describe('Rate limiting integration [T3.11]', () => {
         {
           deviceId: 'agent-a-blocked',
           ed25519PublicKey: 'pub-key-a-blocked',
-          x25519PublicKey: 'x25519-key-a-blocked',
+          x25519PublicKey: HOST_X25519_KEY,
         },
         { 'X-Client-IP': '10.0.0.1' }
       );
       expect(blockedA.status).toBe(429);
 
       // IP B is still allowed
-      const bodyB = await signedInitiateBody('agent-b-1', 'x25519-key-b-1');
+      const bodyB = await signedInitiateBody('agent-b-1', HOST_X25519_KEY);
       const allowedB = await postJSON('/pair/initiate', bodyB, { 'X-Client-IP': '10.0.0.2' });
       expect(allowedB.status).toBe(200);
 
       // IP C is also allowed
-      const bodyC = await signedInitiateBody('agent-c-1', 'x25519-key-c-1');
+      const bodyC = await signedInitiateBody('agent-c-1', HOST_X25519_KEY);
       const allowedC = await postJSON('/pair/initiate', bodyC, { 'X-Client-IP': '10.0.0.3' });
       expect(allowedC.status).toBe(200);
     });
@@ -154,7 +154,7 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Exhaust /pair/initiate limit
       for (let i = 0; i < limit; i++) {
-        const body = await signedInitiateBody(`agent-sep-${i}`, `x25519-key-sep-${i}`);
+        const body = await signedInitiateBody(`agent-sep-${i}`, HOST_X25519_KEY);
         await postJSON('/pair/initiate', body);
       }
 
@@ -162,7 +162,7 @@ describe('Rate limiting integration [T3.11]', () => {
       const blocked = await postJSON('/pair/initiate', {
         deviceId: 'agent-sep-overflow',
         ed25519PublicKey: 'pub-key-sep-overflow',
-        x25519PublicKey: 'x25519-key-sep-overflow',
+        x25519PublicKey: HOST_X25519_KEY,
       });
       expect(blocked.status).toBe(429);
 
@@ -179,13 +179,13 @@ describe('Rate limiting integration [T3.11]', () => {
     it('/pairing has its own counter, independent of /pair/initiate', async () => {
       // Exhaust /pair/initiate for this IP
       for (let i = 0; i < PAIR_LIMIT; i++) {
-        const body = await signedInitiateBody(`agent-pg-${i}`, `x25519-key-pg-${i}`);
+        const body = await signedInitiateBody(`agent-pg-${i}`, HOST_X25519_KEY);
         await postJSON('/pair/initiate', body);
       }
       const blockedInitiate = await postJSON('/pair/initiate', {
         deviceId: 'agent-pg-overflow',
         ed25519PublicKey: 'pub',
-        x25519PublicKey: 'x25519',
+        x25519PublicKey: HOST_X25519_KEY,
       });
       expect(blockedInitiate.status).toBe(429);
 
@@ -235,7 +235,7 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Fill the limit
       for (let i = 0; i < limit; i++) {
-        const body = await signedInitiateBody(`agent-format-${i}`, `x25519-key-format-${i}`);
+        const body = await signedInitiateBody(`agent-format-${i}`, HOST_X25519_KEY);
         await postJSON('/pair/initiate', body);
       }
 
@@ -243,7 +243,7 @@ describe('Rate limiting integration [T3.11]', () => {
       const { status, data, response } = await postJSON('/pair/initiate', {
         deviceId: 'agent-format-overflow',
         ed25519PublicKey: 'pub-key-overflow',
-        x25519PublicKey: 'x25519-key-overflow',
+        x25519PublicKey: HOST_X25519_KEY,
       });
 
       expect(status).toBe(429);

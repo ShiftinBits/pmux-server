@@ -1595,6 +1595,33 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(mobileWs.messagesOfType('host_online')).toHaveLength(1);
     });
 
+    it.each([
+      ['null', 'null'],
+      ['a number', '42'],
+      ['a string literal', '"hello"'],
+      ['an array', '[]'],
+    ])('rejects %s frames without touching or re-announcing', async (_label, frame) => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      const staleTime = Date.now() - 10 * 60 * 1000;
+      hostWs.serializeAttachment({
+        deviceId: 'agent-1',
+        deviceType: 'host',
+        authenticated: true,
+        lastMessageTime: staleTime,
+      });
+      mobileWs.sent.length = 0;
+      hostWs.sent.length = 0;
+
+      await expect(doInstance.webSocketMessage(hostWs as unknown as WebSocket, frame)).resolves.toBeUndefined();
+
+      expect(hostWs.messagesOfType('error')).toHaveLength(1);
+      expect((hostWs.deserializeAttachment() as { lastMessageTime?: number }).lastMessageTime).toBe(staleTime);
+      expect(mobileWs.messagesOfType('host_online')).toHaveLength(0);
+    });
+
     it('stamps ts on the re-announced host_online [SB-1375]', async () => {
       at(FIXED_NOW);
       const { ws: hostWs } = await connectAndAuth('agent-1', 'host');

@@ -8,6 +8,7 @@ import {
   signEd25519,
   fetchChallenge,
   signedPairInitiateBodyWithChallenge,
+  HOST_X25519_KEY,
 } from './helpers/crypto';
 
 // Host-confirmed pairing: /pair/complete is held until the host answers [SB-1348]
@@ -41,7 +42,7 @@ async function setup(opts: { pairConfirm?: boolean; liveHost?: boolean; hostName
 
   async function initiateBody(): Promise<Record<string, unknown>> {
     const body = await signedPairInitiateBodyWithChallenge(
-      do2, AGENT_1, keys.keyPair, pubBase64, 'x25519-pub-key-agent', hostName
+      do2, AGENT_1, keys.keyPair, pubBase64, HOST_X25519_KEY, hostName
     );
     const res = await do2.fetch(request('/pair/initiate', { ...body, ...(pairConfirm && { pairConfirm: true }) }));
     expect(res.status).toBe(200);
@@ -124,7 +125,7 @@ describe('host-confirmed pairing (SB-1348)', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       hostDeviceId: AGENT_1,
-      hostX25519PublicKey: 'x25519-pub-key-agent',
+      hostX25519PublicKey: HOST_X25519_KEY,
       hostName: 'build-box',
     });
     expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(true);

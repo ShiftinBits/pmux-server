@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { createTestDO as createTestDOFull } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
-import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge, fetchChallenge, signEd25519 } from './helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge, fetchChallenge, signEd25519, HOST_X25519_KEY } from './helpers/crypto';
 import type { SignalingDO } from '../signaling';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
@@ -50,7 +50,7 @@ async function setupPairedDevices(doInstance: SignalingDO, hostName?: string) {
     HOST_1,
     hostKeys.keyPair,
     hostPubBase64,
-    'x25519-pub-key-host',
+    HOST_X25519_KEY,
     hostName
   );
   const initResult = await postJSON(doInstance, '/pair/initiate', initBody);
@@ -107,7 +107,7 @@ describe('DELETE /device', () => {
       HOST_1,
       hostKeys.keyPair,
       hostPubBase64,
-      'x25519-pub-key-host'
+      HOST_X25519_KEY
     );
     await postJSON(doInstance, '/pair/initiate', initBody);
     expect(doInstance.getDevice(HOST_1)).not.toBeNull();
