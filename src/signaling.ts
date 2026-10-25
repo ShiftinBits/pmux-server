@@ -2134,6 +2134,9 @@ export class SignalingDO implements DurableObject {
     if (!hostDeviceId) {
       return jsonResponse({ error: 'Missing device ID' }, 400);
     }
+    if (request.headers.get('X-Device-Type') !== 'host') {
+      return jsonResponse({ error: 'Only a host can remove a pairing' }, 403);
+    }
 
     // A held confirming-path request must not commit after the unpair
     this.settlePendingPair(hostDeviceId, pairCancelledResponse());
@@ -2165,6 +2168,9 @@ export class SignalingDO implements DurableObject {
     const hostDeviceId = request.headers.get('X-Device-Id') ?? '';
     if (!hostDeviceId) {
       return jsonResponse({ error: 'Missing device ID' }, 400);
+    }
+    if (request.headers.get('X-Device-Type') !== 'host') {
+      return jsonResponse({ error: 'Only a host can remove a device' }, 403);
     }
 
     // A held confirming-path request must not commit after the uninstall

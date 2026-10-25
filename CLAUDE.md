@@ -50,8 +50,8 @@ Single global Durable Object instance — `env.SIGNALING.idFromName('global')` i
 | `/auth/pair/initiate` | `/pair/initiate` | POST | Ed25519 + challenge | `PAIR_LIMITER` | `pair/initiate:IP` |
 | `/auth/pair/complete` | `/pair/complete` | POST | pairing code | `PAIR_LIMITER` | `pair/complete:IP` |
 | `/auth/token` | `/token` | POST | Ed25519 + challenge | `TOKEN_LIMITER` | `token:IP` (body untrusted pre-auth) |
-| `/auth/pairing` | `/pairing` | DELETE | JWT (`pmux unpair`) | `PAIR_LIMITER` | `pairing:deviceId` |
-| `/auth/device` | `/device` | DELETE | JWT (`pmux uninstall`) | `PAIR_LIMITER` | `device:deviceId` |
+| `/auth/pairing` | `/pairing` | DELETE | JWT, host only (`pmux unpair`) | `PAIR_LIMITER` | `pairing:deviceId` |
+| `/auth/device` | `/device` | DELETE | JWT, host only (`pmux uninstall`) | `PAIR_LIMITER` | `device:deviceId` |
 | `/turn/credentials` | same | GET | JWT | `TURN_LIMITER` | `turn:deviceId` |
 | `/ws` | same | upgrade | in-band `{type:'auth', token}` | `WS_LIMITER` | `ws:IP` |
 

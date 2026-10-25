@@ -29,11 +29,12 @@ async function postJSON(
 /** Helper: send DELETE /device with X-Device-Id header. */
 async function deleteDevice(
   doInstance: SignalingDO,
-  deviceId: string
+  deviceId: string,
+  deviceType = 'host'
 ): Promise<{ status: number; data: Record<string, unknown> }> {
   const req = new Request('http://localhost/device', {
     method: 'DELETE',
-    headers: { 'X-Device-Id': deviceId },
+    headers: { 'X-Device-Id': deviceId, 'X-Device-Type': deviceType },
   });
   const res = await doInstance.fetch(req);
   const data = (await res.json()) as Record<string, unknown>;
@@ -189,6 +190,34 @@ describe('DELETE /device', () => {
 
     expect(res.status).toBe(400);
     expect(data['error']).toContain('Missing device ID');
+  });
+
+  it('returns 403 for a mobile caller and leaves all rows intact', async () => {
+    const { doInstance } = await createTestDOFull();
+    await setupPairedDevices(doInstance);
+
+    const dev = await deleteDevice(doInstance, 'mobile-1', 'mobile');
+    expect(dev.status).toBe(403);
+    expect(dev.data['error']).toBe('Only a host can remove a device');
+
+    const pairingReq = new Request('http://localhost/pairing', {
+      method: 'DELETE',
+      headers: { 'X-Device-Id': HOST_1, 'X-Device-Type': 'mobile' },
+    });
+    const pairingRes = await doInstance.fetch(pairingReq);
+    const pairingData = (await pairingRes.json()) as Record<string, unknown>;
+    expect(pairingRes.status).toBe(403);
+    expect(pairingData['error']).toBe('Only a host can remove a pairing');
+
+    const noTypeReq = new Request('http://localhost/device', {
+      method: 'DELETE',
+      headers: { 'X-Device-Id': HOST_1 },
+    });
+    expect((await doInstance.fetch(noTypeReq)).status).toBe(403);
+
+    expect(doInstance.getDevice('mobile-1')).not.toBeNull();
+    expect(doInstance.getDevice(HOST_1)).not.toBeNull();
+    expect(doInstance.isPaired(HOST_1, 'mobile-1')).toBe(true);
   });
 
   it('rejects non-DELETE methods with 405', async () => {

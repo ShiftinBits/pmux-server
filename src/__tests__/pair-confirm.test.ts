@@ -410,7 +410,7 @@ describe('host-confirmed pairing (SB-1348)', () => {
 
     const del = await do2.fetch(new Request(`http://localhost${path}`, {
       method: 'DELETE',
-      headers: { 'X-Device-Id': AGENT_1 },
+      headers: { 'X-Device-Id': AGENT_1, 'X-Device-Type': 'host' },
     }));
     expect(del.status).toBe(200);
 

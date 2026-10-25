@@ -1177,7 +1177,7 @@ describe('DELETE /pairing', () => {
     // DELETE /pairing (simulates worker injecting X-Device-Id from JWT)
     const delReq = new Request('http://localhost/pairing', {
       method: 'DELETE',
-      headers: { 'X-Device-Id': AGENT_1 },
+      headers: { 'X-Device-Id': AGENT_1, 'X-Device-Type': 'host' },
     });
     const delRes = await do2.fetch(delReq);
     const delData = await delRes.json() as Record<string, unknown>;
@@ -1228,7 +1228,7 @@ describe('DELETE /pairing', () => {
     // DELETE /pairing
     const delReq = new Request('http://localhost/pairing', {
       method: 'DELETE',
-      headers: { 'X-Device-Id': AGENT_1 },
+      headers: { 'X-Device-Id': AGENT_1, 'X-Device-Type': 'host' },
     });
     await do2.fetch(delReq);
 
@@ -1257,7 +1257,7 @@ describe('DELETE /pairing', () => {
     // DELETE without completing pairing
     const delReq = new Request('http://localhost/pairing', {
       method: 'DELETE',
-      headers: { 'X-Device-Id': AGENT_1 },
+      headers: { 'X-Device-Id': AGENT_1, 'X-Device-Type': 'host' },
     });
     const delRes = await do2.fetch(delReq);
     const delData = await delRes.json() as Record<string, unknown>;
