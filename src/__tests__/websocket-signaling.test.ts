@@ -711,9 +711,9 @@ describe('WebSocket signaling [T1.8]', () => {
     });
 
     it('emits host_offline when the last host WS closes (post-hibernation stale count)', async () => {
-      // After DO hibernation, wsConnectionCounts is reset to empty. This test
-      // verifies that host_offline is still sent correctly even when the in-memory
-      // count is stale (0), because we rely on getWebSockets() as the source of truth.
+      // After DO hibernation the in-memory socket sets are empty. This test
+      // verifies that host_offline is still sent correctly, because the first
+      // lookup after a wake rebuilds them from getWebSockets().
       doInstance.registerDevice('agent-stale', 'pubkey-agent-stale', 'host');
       doInstance.registerDevice('mobile-stale', 'pubkey-mobile-stale', 'mobile');
       doInstance.createPairing('agent-stale', 'mobile-stale');
@@ -735,13 +735,13 @@ describe('WebSocket signaling [T1.8]', () => {
 
       mobileWs.sent.length = 0;
 
-      // Simulate DO hibernation: clear in-memory wsConnectionCounts (counts reset to 0)
+      // Simulate DO hibernation: clear the in-memory socket sets
       doInstance.clearWsConnectionCounts();
 
       // Host WS closes (e.g., fires after DO wakes from hibernation)
       await doInstance.webSocketClose(hostWs as unknown as WebSocket, 1000, 'connection lost', true);
 
-      // Mobile SHOULD see host_offline even with stale (zeroed) in-memory count
+      // Mobile SHOULD see host_offline even though the sets were emptied
       expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
     });
 
@@ -1308,11 +1308,11 @@ describe('WebSocket signaling [T1.8]', () => {
         expect(ws.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
       }
 
-      // Simulate DO hibernation: the in-memory count map is wiped, but the 5
-      // sockets remain live in getWebSockets(). The stale map would read 0.
+      // Simulate DO hibernation: the in-memory socket sets are wiped, but the 5
+      // sockets remain live in getWebSockets()
       doInstance.clearWsConnectionCounts();
 
-      // 6th connection must STILL be rejected (count read from source of truth)
+      // 6th connection must STILL be rejected (sets rebuilt from getWebSockets())
       const ws6 = new MockWebSocket();
       await doInstance.webSocketMessage(
         ws6 as unknown as WebSocket,
@@ -2364,5 +2364,44 @@ describe('unpaired host purge', () => {
     await doInstance.alarm();
 
     expect(mockState.scheduledAlarm).toBeNull();
+  });
+
+  it('keeps an old host that paired and then unpaired, and does not reschedule for it', async () => {
+    doInstance.registerDevice('unpaired-host', 'pk1', 'host');
+    doInstance.registerDevice('gone-mobile', 'pk2', 'mobile');
+    doInstance.createPairing('unpaired-host', 'gone-mobile');
+    doInstance.removePairing('unpaired-host');
+    doInstance.registerDevice('stale-host', 'pk3', 'host');
+    backdate('unpaired-host');
+    backdate('stale-host');
+
+    await doInstance.alarm();
+
+    expect(exists('unpaired-host')).toBe(true);
+    expect(exists('stale-host')).toBe(false);
+    expect(mockState.scheduledAlarm).toBeNull();
+  });
+
+  it('marks host rows that predate ever_paired as paired so they are never purged', async () => {
+    const { doInstance: do2 } = await createTestDO();
+    const sql = do2['sql'];
+    sql.exec(`CREATE TABLE devices (
+      id TEXT PRIMARY KEY,
+      ed25519_public_key TEXT NOT NULL UNIQUE,
+      device_type TEXT NOT NULL CHECK(device_type IN ('host', 'mobile')),
+      name TEXT,
+      created_at INTEGER NOT NULL
+    )`);
+    sql.exec(
+      "INSERT INTO devices (id, ed25519_public_key, device_type, name, created_at) VALUES ('legacy-host', 'pk1', 'host', NULL, ?)",
+      old
+    );
+
+    do2.registerDevice('new-host', 'pk2', 'host'); // runs ensureSchema
+    sql.exec('UPDATE devices SET created_at = ? WHERE id = ?', old, 'new-host');
+    await do2.alarm();
+
+    expect(do2.getDevice('legacy-host')).not.toBeNull();
+    expect(do2.getDevice('new-host')).toBeNull();
   });
 });

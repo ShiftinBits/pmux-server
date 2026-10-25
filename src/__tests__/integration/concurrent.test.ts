@@ -278,10 +278,10 @@ describe('Concurrent connections integration [T3.11]', () => {
       expect(doInstance.getWsConnectionCount('agent-ws-reopen')).toBe(5);
     });
 
-    it('rebuilds wsConnectionCounts after hibernation wake', async () => {
+    it('rebuilds the per-device socket count after hibernation wake', async () => {
       const token = await setupDevice('agent-ws-hibernate', 'host');
 
-      // Open 3 authenticated connections (builds up wsConnectionCounts).
+      // Open 3 authenticated connections (fills the per-device socket set).
       // Push each socket to acceptedWebSockets first (simulating the WebSocket
       // upgrade path), so getWebSockets() returns them after "hibernation".
       const sockets: MockWebSocket[] = [];
@@ -331,13 +331,7 @@ describe('Concurrent connections integration [T3.11]', () => {
       // Register the device in the fresh DO's SQL (required for auth check)
       freshDO.registerDevice('agent-ws-hibernate', 'pubkey-agent-ws-hibernate', 'host');
 
-      // Before rebuild, in-memory counts are 0 (hibernation wiped them)
-      expect(freshDO.getWsConnectionCount('agent-ws-hibernate')).toBe(0);
-
-      // Trigger rebuildConnectionCache() via getConnection()
-      freshDO.getConnection('agent-ws-hibernate');
-
-      // After rebuild, wsConnectionCounts should reflect the 3 hibernated sockets
+      // The first lookup rebuilds the socket set from the 3 hibernated sockets
       expect(freshDO.getWsConnectionCount('agent-ws-hibernate')).toBe(3);
 
       // Verify the limit is still enforced: open 2 more (to reach 5), then the 6th fails.

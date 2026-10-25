@@ -822,6 +822,32 @@ describe('socket cache rebuilt once per wake', () => {
       expect(scans).toHaveBeenCalledTimes(1);
     }
   );
+
+  // The runtime reports the socket as CLOSED by the time webSocketClose runs
+  // (auto-reply to close), so the wake rebuild already leaves it out
+  it.each(['close', 'error'] as const)(
+    'keeps the sibling counted when an already-closed socket\'s %s is the first event after a wake',
+    async (event) => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { ws: olderWs } = await connectAndAuth('eff-host', 'host');
+      const { ws: gone } = await connectAndAuth('eff-host', 'host');
+      const { ws: mobileWs } = await connectAndAuth('eff-mobile', 'mobile');
+      doInstance.createPairing('eff-host', 'eff-mobile');
+      doInstance.removeConnection('eff-host');
+      doInstance.clearWsConnectionCounts();
+      gone.readyState = 3;
+
+      if (event === 'close') {
+        await doInstance.webSocketClose(asWs(gone), 1000, 'bye', true);
+      } else {
+        await doInstance.webSocketError(asWs(gone), new Error('reset'));
+      }
+
+      expect(doInstance.getWsConnectionCount('eff-host')).toBe(1);
+      expect(doInstance.getConnection('eff-host')).toBe(olderWs);
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(0);
+    }
+  );
 });
 
 describe('Worker root redirect', () => {

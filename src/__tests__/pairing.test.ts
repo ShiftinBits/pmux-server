@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestDOCompat as createTestDO, createTestDO as createTestDOFull } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
-import { generateEd25519Keypair, bytesToBase64, signEd25519, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY } from './helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, signEd25519, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from './helpers/crypto';
 import type { SignalingDO } from '../signaling';
 
 // Valid 32-hex device ID for agent (format: hex(SHA-256(publicKey)[0:16]))
@@ -182,8 +182,8 @@ describe('POST /pair/initiate', () => {
     const completeFirst = await postJSON('/pair/complete', {
       pairingCode: firstCode,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile',
-      x25519PublicKey: 'x25519-pub-key-mobile',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
     });
     expect(completeFirst.status).toBe(404);
     expect(completeFirst.data['error']).toContain('Invalid or expired');
@@ -192,8 +192,8 @@ describe('POST /pair/initiate', () => {
     const completeSecond = await postJSON('/pair/complete', {
       pairingCode: secondCode,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile',
-      x25519PublicKey: 'x25519-pub-key-mobile',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
     });
     expect(completeSecond.status).toBe(200);
     expect(completeSecond.data['hostDeviceId']).toBe(AGENT_1);
@@ -203,7 +203,7 @@ describe('POST /pair/initiate', () => {
     const { status, data } = await postJSON('/pair/initiate', {
       deviceId: AGENT_1,
       ed25519PublicKey: ed25519PublicKeyBase64,
-      x25519PublicKey: 'x25519-pub-key-agent',
+      x25519PublicKey: testKey('x25519-pub-key-agent'),
     });
 
     expect(status).toBe(400);
@@ -306,10 +306,30 @@ describe('POST /pair/initiate input validation', () => {
     expect((await postJSON('/pair/initiate', body)).status).toBe(200);
   });
 
-  it('returns 400 for a malformed ed25519PublicKey on an existing host', async () => {
-    const { status, data } = await initiateWith({ ed25519PublicKey: 'not-a-key' }, true);
-    expect(status).toBe(400);
-    expect(data['error']).toBe('Invalid ed25519PublicKey');
+  it.each([
+    ['malformed', 'not-a-key'],
+    ['different well-formed', testKey('another-host-key')],
+  ])('returns 401 for a %s ed25519PublicKey on an existing host and issues no code', async (_label, value) => {
+    const { status, data } = await initiateWith({ ed25519PublicKey: value }, true);
+    expect(status).toBe(401);
+    expect(data['error']).toBe('ed25519PublicKey does not match the registered key');
+    const sql = (doInstance as unknown as { sql: { exec: (q: string, ...b: unknown[]) => { toArray(): unknown[] } } }).sql;
+    const keys = sql.exec('SELECT host_ed_public_key FROM pairing_sessions WHERE host_device_id = ?', AGENT_1).toArray();
+    expect(keys).toEqual([{ host_ed_public_key: ed25519PublicKeyBase64 }]);
+  });
+
+  it('returns 409 when a registered mobile initiates pairing', async () => {
+    const MOBILE_ID = 'c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3';
+    doInstance.registerDevice(MOBILE_ID, ed25519PublicKeyBase64, 'mobile');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, MOBILE_ID, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
+
+    const { status, data } = await postJSON('/pair/initiate', body);
+
+    expect(status).toBe(409);
+    expect(data['error']).toBe('Device conflict: device cannot be registered');
+    expect(doInstance.getDevice(MOBILE_ID)!.deviceType).toBe('mobile');
+    const sql = (doInstance as unknown as { sql: { exec: (q: string, ...b: unknown[]) => { toArray(): unknown[] } } }).sql;
+    expect(sql.exec('SELECT code FROM pairing_sessions WHERE host_device_id = ?', MOBILE_ID).toArray()).toEqual([]);
   });
 });
 
@@ -330,18 +350,55 @@ describe('DO fetch never rejects on malformed bodies', () => {
     {},
     { deviceId: 5, nonce: {}, signature: [], ed25519PublicKey: 1, x25519PublicKey: 2, pairingCode: 3, name: 4 },
     { deviceId: AGENT_1, nonce: 'n', signature: '!!!', ed25519PublicKey: '!!!', x25519PublicKey: '!!!', pairingCode: 'ABCDEF' },
+    // Well-formed keys, so only the non-string nonce/signature can trip a handler
+    { deviceId: AGENT_1, nonce: {}, signature: 7, ed25519PublicKey: HOST_X25519_KEY, x25519PublicKey: HOST_X25519_KEY, pairingCode: 'ABCDEF' },
   ];
 
-  it.each(routes)('%s %s resolves for every body shape', async (method, path) => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each(routes)('%s %s answers below 500 for every body shape without logging an error', async (method, path) => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     for (const body of bodies) {
       const response = await doInstance.fetch(new Request(`http://localhost${path}`, {
         method,
         headers: { 'Content-Type': 'application/json', 'X-Device-Id': AGENT_1, 'X-Device-Type': 'host' },
         body: JSON.stringify(body),
       }));
-      expect(response.status).toBeGreaterThanOrEqual(200);
-      expect(response.status).toBeLessThan(600);
+      expect(response.status, `body ${JSON.stringify(body)}`).toBeLessThan(500);
     }
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it('GET /turn/credentials answers below 500 without logging an error', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const response = await doInstance.fetch(new Request('http://localhost/turn/credentials', {
+      method: 'GET',
+      headers: { 'X-Device-Id': AGENT_1, 'X-Device-Type': 'host' },
+    }));
+    expect(response.status).toBeLessThan(500);
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([null, 42, 'str', []])('answers 400 Invalid JSON for a non-object body (%j)', async (body) => {
+    for (const path of ['/challenge', '/pair/initiate', '/pair/complete', '/token']) {
+      const { status, data } = await postJSON(path, body);
+      expect(status, path).toBe(400);
+      expect(data['error'], path).toBe('Invalid JSON');
+    }
+  });
+
+  it('turns a handler throw into 500 Internal error and logs it with the [do] tag', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(doInstance as unknown as { handleChallenge: () => Promise<Response> }, 'handleChallenge')
+      .mockRejectedValue(new Error('boom'));
+
+    const { status, data } = await postJSON('/challenge', { deviceId: AGENT_1 });
+
+    expect(status).toBe(500);
+    expect(data).toEqual({ error: 'Internal error' });
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('[do]'), '/challenge', expect.any(Error));
   });
 });
 
@@ -415,8 +472,8 @@ describe('POST /pair/complete', () => {
     const { status, data } = await postJSON('/pair/complete', {
       pairingCode,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile',
-      x25519PublicKey: 'x25519-pub-key-mobile',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
     });
 
     expect(status).toBe(200);
@@ -435,8 +492,8 @@ describe('POST /pair/complete', () => {
     await postJSON('/pair/complete', {
       pairingCode: initResult.data['pairingCode'],
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile',
-      x25519PublicKey: 'x25519-pub-key-mobile',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
     });
 
     // Verify pairing exists
@@ -444,12 +501,35 @@ describe('POST /pair/complete', () => {
     expect(doInstance.getPairedMobile(AGENT_1)).toBe('mobile-1');
   });
 
+  it.each([
+    ['ed25519PublicKey', 'non-base64', '!!!'],
+    ['ed25519PublicKey', 'wrong length', bytesToBase64(new Uint8Array(16))],
+    ['x25519PublicKey', 'non-base64', '!!!'],
+    ['x25519PublicKey', 'wrong length', bytesToBase64(new Uint8Array(33))],
+  ])('returns 400 for a %s that is %s without consuming the code', async (field, _label, value) => {
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
+    const pairingCode = (await postJSON('/pair/initiate', body)).data['pairingCode'] as string;
+    const complete = {
+      pairingCode,
+      deviceId: 'mobile-1',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
+    };
+
+    const bad = await postJSON('/pair/complete', { ...complete, [field]: value });
+
+    expect(bad.status).toBe(400);
+    expect(bad.data['error']).toBe('Invalid deviceId or public key');
+    expect(doInstance.getDevice('mobile-1')).toBeNull();
+    expect((await postJSON('/pair/complete', complete)).status).toBe(200);
+  });
+
   it('rejects invalid pairing code', async () => {
     const { status, data } = await postJSON('/pair/complete', {
       pairingCode: 'BADCODE',
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile',
-      x25519PublicKey: 'x25519-pub-key-mobile',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
     });
 
     expect(status).toBe(404);
@@ -466,8 +546,8 @@ describe('POST /pair/complete', () => {
     const first = await postJSON('/pair/complete', {
       pairingCode: code,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile-1',
-      x25519PublicKey: 'x25519-pub-key-mobile-1',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile-1'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile-1'),
     });
     expect(first.status).toBe(200);
 
@@ -475,8 +555,8 @@ describe('POST /pair/complete', () => {
     const second = await postJSON('/pair/complete', {
       pairingCode: code,
       deviceId: 'mobile-2',
-      ed25519PublicKey: 'ed25519-pub-key-mobile-2',
-      x25519PublicKey: 'x25519-pub-key-mobile-2',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile-2'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile-2'),
     });
     expect(second.status).toBe(404);
     expect(second.data['error']).toContain('Invalid or expired');
@@ -496,8 +576,8 @@ describe('POST /pair/complete', () => {
       const { status, data } = await postJSON('/pair/complete', {
         pairingCode: code,
         deviceId: 'mobile-1',
-        ed25519PublicKey: 'ed25519-pub-key-mobile',
-        x25519PublicKey: 'x25519-pub-key-mobile',
+        ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+        x25519PublicKey: testKey('x25519-pub-key-mobile'),
       });
 
       expect(status).toBe(404);
@@ -567,8 +647,8 @@ describe('POST /pair/complete', () => {
     const completeResult = await post('/pair/complete', {
       pairingCode,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile',
-      x25519PublicKey: 'x25519-pub-key-mobile',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
     });
     expect(completeResult.status).toBe(200);
 
@@ -579,7 +659,7 @@ describe('POST /pair/complete', () => {
     expect(agentMsgs).toHaveLength(1);
     expect(pairCliMsgs).toHaveLength(1);
     expect(agentMsgs[0]['mobileDeviceId']).toBe('mobile-1');
-    expect(pairCliMsgs[0]['mobileX25519PublicKey']).toBe('x25519-pub-key-mobile');
+    expect(pairCliMsgs[0]['mobileX25519PublicKey']).toBe(testKey('x25519-pub-key-mobile'));
   });
 
   describe('deferred pair_complete delivery (SB-1002)', () => {
@@ -625,8 +705,8 @@ describe('POST /pair/complete', () => {
       const completeResult = await post('/pair/complete', {
         pairingCode: initResult.data['pairingCode'] as string,
         deviceId: 'mobile-1',
-        ed25519PublicKey: 'ed25519-pub-key-mobile',
-        x25519PublicKey: 'x25519-pub-key-mobile',
+        ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+        x25519PublicKey: testKey('x25519-pub-key-mobile'),
         ...(mobileName !== undefined && { name: mobileName }),
         ...(pairMac !== undefined && { pairMac }),
       });
@@ -645,7 +725,7 @@ describe('POST /pair/complete', () => {
         const res = await post('/pair/complete', {
           pairingCode: reInit.data['pairingCode'] as string,
           deviceId,
-          ed25519PublicKey: `ed25519-pub-key-${deviceId}`,
+          ed25519PublicKey: testKey(`ed25519-pub-key-${deviceId}`),
           x25519PublicKey,
         });
         expect(res.status).toBe(200);
@@ -661,7 +741,7 @@ describe('POST /pair/complete', () => {
       const msgs = hostWs.messagesOfType('pair_complete');
       expect(msgs).toHaveLength(1);
       expect(msgs[0]['mobileDeviceId']).toBe('mobile-1');
-      expect(msgs[0]['mobileX25519PublicKey']).toBe('x25519-pub-key-mobile');
+      expect(msgs[0]['mobileX25519PublicKey']).toBe(testKey('x25519-pub-key-mobile'));
     });
 
     it('sends the auth reply before the deferred pair_complete', async () => {
@@ -792,8 +872,8 @@ describe('POST /pair/complete', () => {
       const res = await post('/pair/complete', {
         pairingCode: initResult.data['pairingCode'] as string,
         deviceId: 'mobile-bad',
-        ed25519PublicKey: 'ed25519-pub-key-bad',
-        x25519PublicKey: 'x25519-pub-key-bad',
+        ed25519PublicKey: testKey('ed25519-pub-key-bad'),
+        x25519PublicKey: testKey('x25519-pub-key-bad'),
         pairMac: badMac,
       });
       expect(res.status).toBe(400);
@@ -811,7 +891,7 @@ describe('POST /pair/complete', () => {
         created_at INTEGER NOT NULL
       )`);
 
-      do2.createPairingSession(AGENT_1, 'x25519-pub-key-agent', 'ed-pub-key-agent'); // runs ensureSchema
+      do2.createPairingSession(AGENT_1, testKey('x25519-pub-key-agent'), 'ed-pub-key-agent'); // runs ensureSchema
 
       const cols = sql.exec('PRAGMA table_info(pending_pair_complete)').toArray().map((c) => c['name']);
       expect(cols).toContain('mobile_pair_mac');
@@ -832,13 +912,13 @@ describe('POST /pair/complete', () => {
       const { authHostWs, repairWith } = await setupPairing(false);
 
       // Second pairing (mobile-2) completes before the host ever reconnects
-      await repairWith('mobile-2', 'x25519-pub-key-mobile-2');
+      await repairWith('mobile-2', testKey('x25519-pub-key-mobile-2'));
 
       const hostWs = await authHostWs();
       const msgs = hostWs.messagesOfType('pair_complete');
       expect(msgs).toHaveLength(1);
       expect(msgs[0]['mobileDeviceId']).toBe('mobile-2');
-      expect(msgs[0]['mobileX25519PublicKey']).toBe('x25519-pub-key-mobile-2');
+      expect(msgs[0]['mobileX25519PublicKey']).toBe(testKey('x25519-pub-key-mobile-2'));
     });
   });
 
@@ -868,8 +948,8 @@ describe('POST /pair/complete', () => {
     const complete1 = await post('/pair/complete', {
       pairingCode: code1,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile-1',
-      x25519PublicKey: 'x25519-pub-key-mobile-1',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile-1'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile-1'),
     });
     expect(complete1.status).toBe(200);
 
@@ -896,8 +976,8 @@ describe('POST /pair/complete', () => {
     const complete2 = await post('/pair/complete', {
       pairingCode: code2,
       deviceId: 'mobile-2',
-      ed25519PublicKey: 'ed25519-pub-key-mobile-2',
-      x25519PublicKey: 'x25519-pub-key-mobile-2',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile-2'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile-2'),
     });
     expect(complete2.status).toBe(200);
 
@@ -925,8 +1005,8 @@ describe('POST /pair/complete', () => {
     const { status } = await postJSON('/pair/complete', {
       pairingCode,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile',
-      x25519PublicKey: 'x25519-pub-key-mobile',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
       name: "Ryan's iPhone",
     });
 
@@ -971,8 +1051,8 @@ describe('POST /pair/complete', () => {
     const completeResult = await post('/pair/complete', {
       pairingCode,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile',
-      x25519PublicKey: 'x25519-pub-key-mobile',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
       name: "Ryan's iPhone",
     });
     expect(completeResult.status).toBe(200);
@@ -1016,8 +1096,8 @@ describe('POST /pair/complete', () => {
     await post('/pair/complete', {
       pairingCode,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile',
-      x25519PublicKey: 'x25519-pub-key-mobile',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
     });
 
     const pairMsgs = agentWs.messagesOfType('pair_complete');
@@ -1033,8 +1113,8 @@ describe('POST /pair/complete', () => {
     const { status } = await postJSON('/pair/complete', {
       pairingCode,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile',
-      x25519PublicKey: 'x25519-pub-key-mobile',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
       name: 'x'.repeat(65),
     });
 
@@ -1052,8 +1132,8 @@ describe('POST /pair/complete', () => {
     const { status } = await postJSON('/pair/complete', {
       pairingCode,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile',
-      x25519PublicKey: 'x25519-pub-key-mobile',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
       name: 'Evil\x1b[2JPhone',
     });
 
@@ -1090,8 +1170,8 @@ describe('POST /pair/complete', () => {
     await post('/pair/complete', {
       pairingCode: code1,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile-1',
-      x25519PublicKey: 'x25519-pub-key-mobile-1',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile-1'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile-1'),
     });
     expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(true);
 
@@ -1114,8 +1194,8 @@ describe('POST /pair/complete', () => {
     await post('/pair/complete', {
       pairingCode: code2,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile-1',
-      x25519PublicKey: 'x25519-pub-key-mobile-1b',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile-1'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile-1b'),
     });
 
     // Pairing should still exist
@@ -1140,7 +1220,7 @@ describe('POST /pair/complete', () => {
       pairingCode,
       deviceId: AGENT_1, // already registered as 'host'
       ed25519PublicKey: ed25519PublicKeyBase64,
-      x25519PublicKey: 'x25519-pub-key-agent',
+      x25519PublicKey: testKey('x25519-pub-key-agent'),
     });
 
     expect(status).toBe(409);
@@ -1177,8 +1257,8 @@ describe('DELETE /pairing', () => {
     await post('/pair/complete', {
       pairingCode: init.data['pairingCode'],
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile',
-      x25519PublicKey: 'x25519-pub-key-mobile',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
     });
     expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(true);
 
@@ -1219,8 +1299,8 @@ describe('DELETE /pairing', () => {
     await post('/pair/complete', {
       pairingCode: init.data['pairingCode'],
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile',
-      x25519PublicKey: 'x25519-pub-key-mobile',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile'),
     });
 
     // Connect mobile via WebSocket

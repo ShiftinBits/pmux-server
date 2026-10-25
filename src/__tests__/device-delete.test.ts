@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { createTestDO as createTestDOFull } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
-import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge, fetchChallenge, signEd25519, HOST_X25519_KEY } from './helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge, fetchChallenge, signEd25519, HOST_X25519_KEY, testKey } from './helpers/crypto';
 import type { SignalingDO } from '../signaling';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
@@ -60,8 +60,8 @@ async function setupPairedDevices(doInstance: SignalingDO, hostName?: string) {
   await postJSON(doInstance, '/pair/complete', {
     pairingCode,
     deviceId: 'mobile-1',
-    ed25519PublicKey: 'ed25519-pub-key-mobile',
-    x25519PublicKey: 'x25519-pub-key-mobile',
+    ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
+    x25519PublicKey: testKey('x25519-pub-key-mobile'),
   });
 
   return { hostKeys, hostPubBase64 };

@@ -14,7 +14,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDO } from '../helpers/mock-do';
 import { MockWebSocket } from '../helpers/mock-websocket';
 import { verifyJWT, createJWT } from '../../auth';
-import { generateEd25519Keypair, bytesToBase64, signEd25519, fetchChallenge, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY } from '../helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, signEd25519, fetchChallenge, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from '../helpers/crypto';
 import type { SignalingDO } from '../../signaling';
 import type { MockDOState } from '../helpers/mock-do';
 
@@ -106,7 +106,7 @@ describe('Full auth flow integration [T3.11]', () => {
       pairingCode,
       deviceId: MOBILE_INTEG,
       ed25519PublicKey: mobilePubBase64,
-      x25519PublicKey: 'mobile-x25519-pub',
+      x25519PublicKey: testKey('mobile-x25519-pub'),
     });
     expect(completeResult.status).toBe(200);
     expect(completeResult.data['hostDeviceId']).toBe(AGENT_INTEG);
@@ -169,7 +169,7 @@ describe('Full auth flow integration [T3.11]', () => {
     expect(hostWs.lastMessage()).toEqual({
       type: 'pair_complete',
       mobileDeviceId: MOBILE_INTEG,
-      mobileX25519PublicKey: 'mobile-x25519-pub',
+      mobileX25519PublicKey: testKey('mobile-x25519-pub'),
     });
 
     const mobileWs = new MockWebSocket();

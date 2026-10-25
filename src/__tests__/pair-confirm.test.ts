@@ -9,6 +9,7 @@ import {
   fetchChallenge,
   signedPairInitiateBodyWithChallenge,
   HOST_X25519_KEY,
+  testKey,
 } from './helpers/crypto';
 
 // Host-confirmed pairing: /pair/complete is held until the host answers [SB-1348]
@@ -66,8 +67,8 @@ async function setup(opts: { pairConfirm?: boolean; liveHost?: boolean; hostName
     return do2.fetch(request('/pair/complete', {
       pairingCode: code,
       deviceId,
-      ed25519PublicKey: overrides.ed25519PublicKey ?? `ed25519-pub-key-${deviceId}`,
-      x25519PublicKey: overrides.x25519PublicKey ?? `x25519-pub-key-${deviceId}`,
+      ed25519PublicKey: overrides.ed25519PublicKey ?? testKey(`ed25519-pub-key-${deviceId}`),
+      x25519PublicKey: overrides.x25519PublicKey ?? testKey(`x25519-pub-key-${deviceId}`),
       pairMac: 'bWFj',
     }));
   }
@@ -331,13 +332,13 @@ describe('host-confirmed pairing (SB-1348)', () => {
     {
       conflict: 'device-type',
       introduce: (do2: Awaited<ReturnType<typeof setup>>['do2']) => {
-        do2.registerDevice('mobile-1', 'ed25519-pub-key-mobile-1', 'host');
+        do2.registerDevice('mobile-1', testKey('ed25519-pub-key-mobile-1'), 'host');
       },
     },
     {
       conflict: 'Ed25519 key',
       introduce: (do2: Awaited<ReturnType<typeof setup>>['do2']) => {
-        do2.registerDevice('mobile-squatter', 'ed25519-pub-key-mobile-1', 'mobile');
+        do2.registerDevice('mobile-squatter', testKey('ed25519-pub-key-mobile-1'), 'mobile');
       },
     },
   ])('a $conflict conflict at accept answers 409 and keeps the old pairing', async ({ introduce }) => {
@@ -409,7 +410,7 @@ describe('host-confirmed pairing (SB-1348)', () => {
     // Codes are single-use, so plant a second session for the same host directly.
     do2['sql'].exec(
       'INSERT INTO pairing_sessions (code, host_device_id, host_x25519_public_key, host_ed_public_key, expires_at, pair_confirm) VALUES (?, ?, ?, ?, ?, 1)',
-      'ZZZZZZ', AGENT_1, 'x25519-pub-key-agent', 'unused', Date.now() + 60_000
+      'ZZZZZZ', AGENT_1, testKey('x25519-pub-key-agent'), 'unused', Date.now() + 60_000
     );
     const second = complete('ZZZZZZ', 'mobile-2');
     const res = await first;
@@ -462,8 +463,8 @@ describe('host-confirmed pairing (SB-1348)', () => {
     const body: Record<string, string> = {
       pairingCode: code,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'ed25519-pub-key-mobile-1',
-      x25519PublicKey: 'x25519-pub-key-mobile-1',
+      ed25519PublicKey: testKey('ed25519-pub-key-mobile-1'),
+      x25519PublicKey: testKey('x25519-pub-key-mobile-1'),
       [field]: value,
     };
     expect((await do2.fetch(request('/pair/complete', body))).status).toBe(400);
@@ -475,8 +476,8 @@ describe('host-confirmed pairing (SB-1348)', () => {
   });
 
   it.each([
-    { conflict: 'device-type', deviceId: 'mobile-1', key: 'ed25519-pub-key-mobile-1', type: 'host' as const },
-    { conflict: 'Ed25519 key', deviceId: 'mobile-squatter', key: 'ed25519-pub-key-mobile-1', type: 'mobile' as const },
+    { conflict: 'device-type', deviceId: 'mobile-1', key: testKey('ed25519-pub-key-mobile-1'), type: 'host' as const },
+    { conflict: 'Ed25519 key', deviceId: 'mobile-squatter', key: testKey('ed25519-pub-key-mobile-1'), type: 'mobile' as const },
   ])('rejects a $conflict conflict with 409 before evicting the old mobile', async ({ deviceId, key, type }) => {
     const { do2, code, complete } = await setup({ pairConfirm: false, liveHost: false });
     do2.registerDevice('mobile-old', 'ed25519-pub-key-mobile-old', 'mobile');
