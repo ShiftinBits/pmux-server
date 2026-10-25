@@ -180,4 +180,22 @@ describe('TURN credential cache', () => {
     expect(b.data['username']).toBe('first');
     expect(globalThis.fetch).toHaveBeenCalledTimes(2);
   });
+
+  it('still returns fresh credentials when persisting the cache fails', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(credsResponse('first'));
+    const { storage } = (doInstance as unknown as { state: DurableObjectState }).state;
+    vi.spyOn(storage, 'put').mockRejectedValueOnce(new Error('storage down'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const a = await getCreds();
+    const b = await getCreds();
+
+    expect(a.status).toBe(200);
+    expect(a.data['username']).toBe('first');
+    expect(warn).toHaveBeenCalledWith('[turn] Failed to persist TURN cache:', expect.any(Error));
+    expect(b.status).toBe(200);
+    expect(b.data['username']).toBe('first');
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
 });

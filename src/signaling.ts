@@ -2293,7 +2293,11 @@ export class SignalingDO implements DurableObject {
     try {
       const creds = await generateTurnCredentials(this.env);
       this.turnCache = { creds, fetchedAt: Date.now() };
-      await this.state.storage.put(TURN_CACHE_KEY, this.turnCache);
+      try {
+        await this.state.storage.put(TURN_CACHE_KEY, this.turnCache);
+      } catch (err) {
+        console.warn('[turn] Failed to persist TURN cache:', err);
+      }
       return creds;
     } finally {
       this.turnFetch = null;
