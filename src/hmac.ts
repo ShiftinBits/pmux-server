@@ -25,7 +25,7 @@
  * Uses Web Crypto API (Cloudflare Workers compatible).
  */
 
-import { textEncode } from './auth';
+import { getHmacKey, textEncode } from './auth';
 
 const CLOCK_SKEW_TOLERANCE_S = 60;
 
@@ -39,26 +39,6 @@ function bytesToHex(bytes: Uint8Array): string {
     .join('');
 }
 
-const hmacKeys = new Map<string, Promise<CryptoKey>>();
-
-function importHmacKey(secret: string): Promise<CryptoKey> {
-  let key = hmacKeys.get(secret);
-  if (!key) {
-    key = crypto.subtle.importKey(
-      'raw',
-      textEncode(secret),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['sign', 'verify']
-    );
-    hmacKeys.set(secret, key);
-    key.catch(() => {
-      if (hmacKeys.get(secret) === key) hmacKeys.delete(secret);
-    });
-  }
-  return key;
-}
-
 /**
  * Legacy: compute HMAC-SHA256(secret, "{timestamp}:{pathname}") as hex.
  * Used for unversioned API paths (backward-compatible with pre-nonce agents).
@@ -68,7 +48,7 @@ export async function computeSignature(
   timestamp: string,
   pathname: string
 ): Promise<string> {
-  const key = await importHmacKey(secret);
+  const key = await getHmacKey(secret);
   const message = `${timestamp}:${pathname}`;
   const sig = await crypto.subtle.sign('HMAC', key, textEncode(message));
   return bytesToHex(new Uint8Array(sig));
@@ -84,7 +64,7 @@ export async function computeSignatureV1(
   nonce: string,
   pathname: string
 ): Promise<string> {
-  const key = await importHmacKey(secret);
+  const key = await getHmacKey(secret);
   const message = `${timestamp}:${nonce}:${pathname}`;
   const sig = await crypto.subtle.sign('HMAC', key, textEncode(message));
   return bytesToHex(new Uint8Array(sig));
@@ -138,7 +118,7 @@ export async function validateClientSignature(
   }
 
   const pathname = new URL(request.url).pathname;
-  const key = await importHmacKey(secret);
+  const key = await getHmacKey(secret);
   const valid = await verifySignatureHex(key, signature, `${timestampHeader}:${pathname}`);
 
   return valid ? { valid: true } : { valid: false, error: 'invalid client signature' };
@@ -180,7 +160,7 @@ export async function validateClientSignatureV1(
   }
 
   const pathname = new URL(request.url).pathname;
-  const key = await importHmacKey(secret);
+  const key = await getHmacKey(secret);
   const valid = await verifySignatureHex(key, signature, `${timestampHeader}:${nonce}:${pathname}`);
 
   return valid ? { valid: true } : { valid: false, error: 'invalid client signature' };

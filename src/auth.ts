@@ -86,7 +86,7 @@ export async function verifyEd25519Signature(
 
 const hmacKeys = new Map<string, Promise<CryptoKey>>();
 
-function getHmacKey(secret: string): Promise<CryptoKey> {
+export function getHmacKey(secret: string): Promise<CryptoKey> {
   let key = hmacKeys.get(secret);
   if (!key) {
     key = crypto.subtle.importKey(

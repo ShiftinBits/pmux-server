@@ -133,8 +133,13 @@ export interface WsAttachment {
 /** Interval (ms) between alarm-based cleanup sweeps. */
 const ALARM_INTERVAL_MS = 30_000; // 30 seconds
 
-/** Age (seconds) after which a host that never paired is purged. */
+/** Age (seconds) after which a host with no pairing is purged. */
 const UNPAIRED_HOST_TTL_S = 86_400; // 1 day
+/** Host rows the unpaired-host purge may delete (age aside). */
+const PURGEABLE_HOST_WHERE = `device_type = 'host'
+  AND id NOT IN (SELECT host_device_id FROM pairings)
+  AND id NOT IN (SELECT host_device_id FROM pairing_sessions)
+  AND id NOT IN (SELECT host_device_id FROM pending_pair_complete)`;
 
 /**
  * Maximum idle time (ms) before a WebSocket is closed.
@@ -1245,10 +1250,11 @@ export class SignalingDO implements DurableObject {
     if (typeof pending === 'number') next = Math.min(next, pending);
     // Keep the unpaired-host purge scheduled; clamp so a host that was skipped
     // (live socket, pending pairing) can't re-fire the alarm in a hot loop.
+    // Rows with a pairing session or pending_pair_complete are left out: the
+    // session schedules its own expiry alarm, and pending_pair_complete has no
+    // TTL, so counting it would wake an idle DO every interval forever.
     const oldest = this.sql
-      .exec(
-        "SELECT MIN(created_at) AS oldest FROM devices WHERE device_type = 'host' AND id NOT IN (SELECT host_device_id FROM pairings)"
-      )
+      .exec(`SELECT MIN(created_at) AS oldest FROM devices WHERE ${PURGEABLE_HOST_WHERE}`)
       .toArray()[0]?.['oldest'];
     if (typeof oldest === 'number') {
       const due = oldest * 1000 + UNPAIRED_HOST_TTL_S * 1000 + ALARM_INTERVAL_MS;
@@ -1268,10 +1274,7 @@ export class SignalingDO implements DurableObject {
     const cutoff = Math.floor(now / 1000) - UNPAIRED_HOST_TTL_S;
     const rows = this.sql
       .exec(
-        `SELECT id FROM devices WHERE device_type = 'host' AND created_at < ?
-           AND id NOT IN (SELECT host_device_id FROM pairings)
-           AND id NOT IN (SELECT host_device_id FROM pairing_sessions)
-           AND id NOT IN (SELECT host_device_id FROM pending_pair_complete)`,
+        `SELECT id FROM devices WHERE ${PURGEABLE_HOST_WHERE} AND created_at < ?`,
         cutoff
       )
       .toArray();
@@ -1283,14 +1286,12 @@ export class SignalingDO implements DurableObject {
   }
 
   /**
-   * Schedule the cleanup alarm if not already scheduled.
-   * Called on first WebSocket connection.
+   * Ensure the idle sweep runs within ALARM_INTERVAL_MS. Called on each
+   * WebSocket connection; pulls forward a later alarm (e.g. the day-out
+   * unpaired-host purge) so idle sockets are still reaped.
    */
   private async scheduleAlarmIfNeeded(): Promise<void> {
-    const currentAlarm = await this.state.storage.getAlarm();
-    if (!currentAlarm) {
-      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
-    }
+    await this.scheduleAlarmBy(Date.now() + ALARM_INTERVAL_MS);
   }
 
   /**
@@ -2339,7 +2340,8 @@ function base64ToBytes(str: string): Uint8Array {
 function isBase64OfLength(value: unknown, length: number): boolean {
   if (typeof value !== 'string') return false;
   try {
-    return atob(value).length === length;
+    const binary = atob(value);
+    return binary.length === length && btoa(binary) === value;
   } catch {
     return false;
   }

@@ -2366,6 +2366,30 @@ describe('unpaired host purge', () => {
     expect(mockState.scheduledAlarm).toBeNull();
   });
 
+  it('does not reschedule for a host held only by a pending_pair_complete row', async () => {
+    doInstance.registerDevice('held-host', 'pk1', 'host');
+    doInstance['sql'].exec(
+      'INSERT INTO pending_pair_complete (host_device_id, mobile_device_id, mobile_x25519_public_key, mobile_name, created_at) VALUES (?, ?, ?, ?, ?)',
+      'held-host', 'mobile-x', 'x', null, T0
+    );
+    backdate('held-host');
+
+    await doInstance.alarm();
+
+    expect(exists('held-host')).toBe(true);
+    expect(mockState.scheduledAlarm).toBeNull();
+  });
+
+  it('a new socket pulls a day-out purge alarm forward to one interval', async () => {
+    doInstance.registerDevice('host-a', 'pk1', 'host');
+    await doInstance.alarm();
+    expect(mockState.scheduledAlarm).toBeGreaterThan(T0 + 30_000);
+
+    await doInstance['scheduleAlarmIfNeeded']();
+
+    expect(mockState.scheduledAlarm).toBe(T0 + 30_000);
+  });
+
   it('purges an old host that paired and then unpaired', async () => {
     doInstance.registerDevice('unpaired-host', 'pk1', 'host');
     doInstance.registerDevice('gone-mobile', 'pk2', 'mobile');

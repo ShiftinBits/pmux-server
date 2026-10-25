@@ -297,6 +297,8 @@ describe('POST /pair/initiate input validation', () => {
   it.each([
     ['non-base64', '!!!'],
     ['wrong length', bytesToBase64(new Uint8Array(16))],
+    ['unpadded', bytesToBase64(new Uint8Array(32)).replace(/=+$/, '')],
+    ['whitespace-padded', ` ${bytesToBase64(new Uint8Array(32))}`],
     ['non-string', 42],
   ])('returns 400 for a %s x25519PublicKey without burning the nonce', async (_label, value) => {
     const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
