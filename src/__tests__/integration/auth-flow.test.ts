@@ -164,7 +164,13 @@ describe('Full auth flow integration [T3.11]', () => {
       hostWs as unknown as WebSocket,
       JSON.stringify({ type: 'auth', token: agentJWT })
     );
-    expect(hostWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+    // The pair_complete persisted while the host was offline follows the auth reply
+    expect(hostWs.sent[0]).toEqual({ type: 'auth', status: 'ok' });
+    expect(hostWs.lastMessage()).toEqual({
+      type: 'pair_complete',
+      mobileDeviceId: MOBILE_INTEG,
+      mobileX25519PublicKey: 'mobile-x25519-pub',
+    });
 
     const mobileWs = new MockWebSocket();
     doInstance.setConnection(MOBILE_INTEG, mobileWs as unknown as WebSocket);

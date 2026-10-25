@@ -1648,14 +1648,9 @@ describe('WebSocket signaling [T1.8]', () => {
       const { ws: staleHostWs } = await connectAndAuth('agent-1', 'host');
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
       doInstance.createPairing('agent-1', 'mobile-1');
-      const freshHostWs = new MockWebSocket();
-      freshHostWs.serializeAttachment({
-        deviceId: 'agent-1',
-        deviceType: 'host',
-        authenticated: true,
-        lastMessageTime: Date.now(),
-      });
-      mockState.acceptedWebSockets.push(freshHostWs as unknown as WebSocket);
+      await connectAndAuth('agent-1', 'host');
+      // The cache holds the stale socket; the fresh sibling is only in the device's set
+      doInstance.setConnection('agent-1', staleHostWs as unknown as WebSocket);
 
       staleHostWs.serializeAttachment({
         deviceId: 'agent-1',

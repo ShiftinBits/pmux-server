@@ -185,6 +185,14 @@ export class SignalingDO implements DurableObject {
   // In-memory WebSocket connection count per device ID (for abuse prevention)
   private wsConnectionCounts = new Map<string, number>();
 
+  // Every authenticated socket per device ID, rebuilt from getWebSockets() once
+  // per wake and kept current on auth/close/error/idle-close
+  private deviceSockets = new Map<string, Set<WebSocket>>();
+
+  // Set only here: a hibernation wake re-runs the constructor, so the first
+  // lookup after a wake rebuilds the caches above exactly once
+  private cacheRebuilt = false;
+
   // TURN credential cache, mirrored to DO KV storage (TURN_CACHE_KEY) so it survives
   // hibernation. Shared by all paired devices: they are time-limited
   // and relay-only.
@@ -631,25 +639,50 @@ export class SignalingDO implements DurableObject {
   // --- WebSocket connection management ---
 
   /**
-   * Find a WebSocket by deviceId. Checks in-memory cache first,
-   * then scans hibernated WebSockets and rebuilds cache.
+   * Find a WebSocket by deviceId. Checks the 1:1 cache first, then falls back
+   * to the freshest live socket in the device's set (no rescan), caching it.
+   * webSocketClose leaves the cache empty when a sibling outlives the cached
+   * socket, so the fallback is what keeps that sibling routable.
    */
   private findWebSocket(deviceId: string): WebSocket | undefined {
+    this.ensureConnectionCache();
     const cached = this.connections.get(deviceId);
     if (cached) return cached;
 
-    // After hibernation wake, the in-memory cache is empty — rebuild it.
-    this.rebuildConnectionCache();
-    return this.connections.get(deviceId);
+    let best: WebSocket | undefined;
+    let bestTime = -1;
+    for (const ws of this.deviceSockets.get(deviceId) ?? []) {
+      const att = ws.deserializeAttachment() as WsAttachment | null;
+      if (!att?.authenticated || att.deviceId !== deviceId || !isLive(ws, att)) continue;
+      const last = att.lastMessageTime ?? 0;
+      if (last > bestTime) {
+        best = ws;
+        bestTime = last;
+      }
+    }
+    if (best) this.connections.set(deviceId, best);
+    return best;
   }
 
   /**
-   * Rebuild the in-memory connections cache from hibernated WebSockets.
-   * Called when the cache might be stale (e.g., after hibernation wake).
+   * Rebuild the in-memory socket caches from getWebSockets() once per wake.
+   * Every later lookup reads the per-device sets, which auth/close/error and
+   * the idle sweep keep current.
+   */
+  private ensureConnectionCache(): void {
+    if (this.cacheRebuilt) return;
+    this.cacheRebuilt = true;
+    this.rebuildConnectionCache();
+  }
+
+  /**
+   * Scan hibernated WebSockets into the connections cache, the per-device
+   * counts and the per-device socket sets. Only ensureConnectionCache() calls it.
    */
   private rebuildConnectionCache(): void {
     if (!this.state.getWebSockets) return;
     this.wsConnectionCounts.clear();
+    this.deviceSockets.clear();
     // When a device has several sockets, keep the freshest one [SB-1360]
     const freshest = new Map<string, number>();
     for (const ws of this.state.getWebSockets()) {
@@ -662,8 +695,34 @@ export class SignalingDO implements DurableObject {
         }
         const count = this.wsConnectionCounts.get(att.deviceId) ?? 0;
         this.wsConnectionCounts.set(att.deviceId, count + 1);
+        let sockets = this.deviceSockets.get(att.deviceId);
+        if (!sockets) {
+          sockets = new Set();
+          this.deviceSockets.set(att.deviceId, sockets);
+        }
+        sockets.add(ws);
       }
     }
+  }
+
+  /** Track an authenticated socket in its device's set. */
+  private addDeviceSocket(deviceId: string, ws: WebSocket): void {
+    this.ensureConnectionCache();
+    let sockets = this.deviceSockets.get(deviceId);
+    if (!sockets) {
+      sockets = new Set();
+      this.deviceSockets.set(deviceId, sockets);
+    }
+    sockets.add(ws);
+  }
+
+  /** Drop a socket from its device's set, removing the entry once it empties. */
+  private removeDeviceSocket(deviceId: string, ws: WebSocket): void {
+    this.ensureConnectionCache();
+    const sockets = this.deviceSockets.get(deviceId);
+    if (!sockets) return;
+    sockets.delete(ws);
+    if (sockets.size === 0) this.deviceSockets.delete(deviceId);
   }
 
   /**
@@ -678,18 +737,18 @@ export class SignalingDO implements DurableObject {
   }
 
   /**
-   * Send a message to ALL WebSocket connections for a specific device.
-   * Iterates hibernated WebSockets directly (not the 1:1 connections map)
-   * so that every connection receives the message — critical when a device
-   * has multiple concurrent connections (e.g., background agent + pair CLI).
+   * Send a message to ALL live WebSocket connections for a specific device.
+   * Iterates the device's socket set (not the 1:1 connections map) so that
+   * every connection receives the message — critical when a device has
+   * multiple concurrent connections (e.g., background agent + pair CLI).
    * Returns the number of connections the message was sent to.
    */
   private notifyDevice(deviceId: string, message: unknown): number {
+    this.ensureConnectionCache();
     let delivered = 0;
-    if (!this.state.getWebSockets) return delivered;
-    for (const ws of this.state.getWebSockets()) {
+    for (const ws of this.deviceSockets.get(deviceId) ?? []) {
       const att = ws.deserializeAttachment() as WsAttachment | null;
-      if (att?.authenticated && att.deviceId === deviceId) {
+      if (att?.authenticated && att.deviceId === deviceId && isLive(ws, att)) {
         try {
           wsSend(ws, message);
           delivered++;
@@ -719,9 +778,14 @@ export class SignalingDO implements DurableObject {
     return this.wsConnectionCounts.get(deviceId) ?? 0;
   }
 
-  /** Simulate DO hibernation by clearing in-memory connection counts (for testing). */
+  /**
+   * Simulate DO hibernation by clearing in-memory connection counts and socket
+   * sets, so the next lookup rebuilds them (for testing).
+   */
   clearWsConnectionCounts(): void {
     this.wsConnectionCounts.clear();
+    this.deviceSockets.clear();
+    this.cacheRebuilt = false;
   }
 
   /** Simulate DO hibernation by clearing the in-memory TURN credential cache (for testing). */
@@ -963,6 +1027,10 @@ export class SignalingDO implements DurableObject {
     // A socket the DO closed was already cleaned up where it was closed [SB-1393]
     if (!attachment?.authenticated || attachment.closed) return;
 
+    // First, so a rebuild this triggers (close as the first event after a
+    // wake) can't re-add the socket or skew the count below
+    this.removeDeviceSocket(attachment.deviceId, ws);
+
     // Only remove from cache if this WS is the one currently stored.
     // A device may have multiple concurrent WebSockets (e.g., mobile uses one
     // for presence on the host list and another for WebRTC signaling). If a
@@ -976,10 +1044,8 @@ export class SignalingDO implements DurableObject {
     this.decrementWsCount(attachment.deviceId);
 
     // If this was the last connection for a host, notify the paired mobile.
-    // Use getWebSockets() (runtime source of truth) rather than the in-memory
-    // wsConnectionCounts, which can be stale after DO hibernation. Exclude the
-    // closing WS from the count regardless of whether Cloudflare has already
-    // removed it from getWebSockets() by the time this handler fires.
+    // Count live sockets in the device's set (rebuilt from getWebSockets()
+    // once per wake), excluding the closing WS.
     if (attachment.deviceType === 'host') {
       const otherCount = this.countOtherActiveWsForDevice(attachment.deviceId, ws);
       if (otherCount === 0) {
@@ -998,14 +1064,16 @@ export class SignalingDO implements DurableObject {
     console.error('[ws-error] deviceId=%s error=%o', attachment?.deviceId, error);
     // Skip cleanup already done when the DO closed this socket [SB-1393]
     if (attachment?.authenticated && !attachment.closed) {
+      // Before markClosed, so a rebuild this triggers still counts the socket
+      // that the decrement below removes
+      this.removeDeviceSocket(attachment.deviceId, ws);
       this.markClosed(ws);
       if (this.connections.get(attachment.deviceId) === ws) {
         this.connections.delete(attachment.deviceId);
       }
       this.decrementWsCount(attachment.deviceId);
-      // If this was the last connection for a host, notify the paired mobile.
-      // Use getWebSockets() via countOtherActiveWsForDevice for the same
-      // reason as webSocketClose: in-memory counts are unreliable post-hibernation.
+      // If this was the last connection for a host, notify the paired mobile,
+      // counting the device's other live sockets as webSocketClose does.
       if (
         attachment.deviceType === 'host' &&
         this.countOtherActiveWsForDevice(attachment.deviceId, ws) === 0
@@ -1062,13 +1130,12 @@ export class SignalingDO implements DurableObject {
 
   /**
    * Find a fresh socket for a device. Prefers the cached socket, then falls back
-   * to any other authenticated socket of the same device [SB-1004].
+   * to any other fresh socket in the device's socket set [SB-1004].
    */
   private findFreshWebSocket(deviceId: string): WebSocket | undefined {
     const cached = this.findWebSocket(deviceId);
     if (cached && this.isWebSocketFresh(cached)) return cached;
-    if (!this.state.getWebSockets) return undefined;
-    for (const ws of this.state.getWebSockets()) {
+    for (const ws of this.deviceSockets.get(deviceId) ?? []) {
       if (ws === cached) continue;
       const att = ws.deserializeAttachment() as WsAttachment | null;
       if (att?.authenticated && att.deviceId === deviceId && this.isWebSocketFresh(ws)) {
@@ -1105,6 +1172,10 @@ export class SignalingDO implements DurableObject {
 
         const lastMsg = att.lastMessageTime ?? 0;
         if (lastMsg > 0 && now - lastMsg > WS_IDLE_TIMEOUT_MS) {
+          const authed = att.authenticated && !!att.deviceId;
+          // Before markClosed, as in webSocketError, so a rebuild this triggers
+          // still counts the socket that the decrement below removes
+          if (authed) this.removeDeviceSocket(att.deviceId, ws);
           // Mark first, as webSocketError does, then close the idle WebSocket
           this.markClosed(ws);
           try {
@@ -1112,15 +1183,15 @@ export class SignalingDO implements DurableObject {
           } catch {
             // May already be closed
           }
-          if (att.authenticated && att.deviceId) {
+          if (authed) {
             if (this.connections.get(att.deviceId) === ws) {
               this.connections.delete(att.deviceId);
             }
             this.decrementWsCount(att.deviceId);
             // Notify the paired mobile that the host is offline only when this
-            // is the last connection for the device. Use countOtherActiveWsForDevice
-            // (reads from getWebSockets(), not stale in-memory counts) so that
-            // multi-WS devices are handled correctly even after DO hibernation.
+            // is the last connection for the device, counting its other live
+            // sockets in the per-device set, so multi-WS devices are handled
+            // correctly even after DO hibernation.
             if (
               att.deviceType === 'host' &&
               this.countOtherActiveWsForDevice(att.deviceId, ws) === 0
@@ -1283,21 +1354,20 @@ export class SignalingDO implements DurableObject {
   }
 
   /**
-   * Count authenticated WebSocket connections for a device, excluding a
+   * Count live authenticated WebSocket connections for a device, excluding a
    * specific WebSocket (typically the one that is closing or erroring).
-   * Reads directly from the runtime's getWebSockets() — the source of truth
-   * for open connections — so it is not affected by stale in-memory counts
-   * that can occur after DO hibernation.
+   * Reads the device's socket set, rebuilt from the runtime's getWebSockets()
+   * once per wake and kept current on auth/close/error/idle-close, so it is
+   * correct straight after DO hibernation.
    *
    * Safe to use for the auth-time cap check (excludeWs = the socket being
-   * authenticated): the filter requires authenticated === true, so the
-   * not-yet-authenticated current socket is never counted, regardless of
-   * whether it already appears in getWebSockets().
+   * authenticated): a socket joins the set only once it authenticates, so the
+   * current socket is never counted.
    */
   private countOtherActiveWsForDevice(deviceId: string, excludeWs: WebSocket): number {
-    if (!this.state.getWebSockets) return 0;
+    this.ensureConnectionCache();
     let count = 0;
-    for (const ws of this.state.getWebSockets()) {
+    for (const ws of this.deviceSockets.get(deviceId) ?? []) {
       if (ws === excludeWs) continue;
       const att = ws.deserializeAttachment() as WsAttachment | null;
       if (att?.authenticated && att.deviceId === deviceId && isLive(ws, att)) count++;
@@ -1319,10 +1389,10 @@ export class SignalingDO implements DurableObject {
       // closed attachment with a fresh authenticated one [SB-1393]
       if (!isLive(ws, ws.deserializeAttachment() as WsAttachment | null)) return;
 
-      // Check WebSocket connection limit per device. Count from getWebSockets()
-      // (the runtime source of truth) rather than the in-memory wsConnectionCounts
-      // map, which is empty after DO hibernation and would let a device bypass the
-      // cap by timing connections to hit a hibernated DO [SB-993].
+      // Check WebSocket connection limit per device. Count from the per-device
+      // socket set, rebuilt from getWebSockets() on the first lookup after a
+      // wake, so a device can't bypass the cap by timing connections to hit a
+      // hibernated DO [SB-993].
       const currentCount = this.countOtherActiveWsForDevice(payload.deviceId, ws);
       if (currentCount >= MAX_WS_CONNECTIONS_PER_DEVICE) {
         console.warn(
@@ -1349,8 +1419,9 @@ export class SignalingDO implements DurableObject {
       };
       ws.serializeAttachment(attachment);
 
-      // Update in-memory cache and connection count
+      // Update in-memory cache, socket set and connection count
       this.connections.set(payload.deviceId, ws);
+      this.addDeviceSocket(payload.deviceId, ws);
       this.incrementWsCount(payload.deviceId);
 
       // Update device name if provided in auth message
@@ -1405,7 +1476,7 @@ export class SignalingDO implements DurableObject {
         if (pending) {
           if (pairedMobileId === pending['mobile_device_id']) {
             // Broadcast to ALL host connections (this newly authed socket is
-            // already in getWebSockets() with an authenticated attachment),
+            // already in the device's socket set),
             // matching the live-delivery invariant for agent + pair CLI.
             this.notifyDevice(payload.deviceId, {
               type: 'pair_complete',
@@ -1438,12 +1509,12 @@ export class SignalingDO implements DurableObject {
             wsSend(ws, msg);
           }
         }
-        // Re-assert this WS as the cached connection. The findWebSocket() calls
-        // above may trigger rebuildConnectionCache() after DO hibernation, which
-        // can overwrite this device's cache entry with a stale closing WebSocket
-        // (e.g., a presence WS from HostListScreen that is still in
-        // getWebSockets() but mid-close). Re-setting here guarantees the freshly
-        // authenticated WS is always the routable entry.
+        // Re-assert this WS as the cached connection. The socket caches are
+        // rebuilt at most once per wake, by the cap check above (before this
+        // socket authenticated), and the host lookups above re-cache only host
+        // entries. Re-setting here keeps the freshly authenticated WS the
+        // routable entry over an older sibling (e.g., a presence WS from
+        // HostListScreen that is mid-close).
         this.connections.set(payload.deviceId, ws);
 
         wsSend(ws, { type: 'auth', status: 'ok' });

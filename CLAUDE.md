@@ -71,7 +71,7 @@ Headers `pmux-signature` + `pmux-timestamp` (unix seconds, ±60s); `/v1/*` also 
 |-------|------|---------|
 | SQLite | `devices`, `pairings`, `pairing_sessions`, `pending_pair_complete`, `challenges`, `signaling_sessions` | `state.storage.sql`, created in `ensureSchema()` |
 | Rate Limiting binding | Per-endpoint request limits | native Workers Rate Limiting (`env.*_LIMITER`) |
-| In-memory maps | WebSocket connection cache, per-device WS counts | `connections`, rebuilt after hibernation |
+| In-memory maps | WebSocket connection cache, per-device WS counts and socket sets | `connections`, `wsConnectionCounts`, `deviceSockets`; rebuilt once per wake |
 | In-memory map | Held `/pair/complete` requests awaiting `pair_accept`/`pair_reject` (30s) | `pendingPairs`, keyed by host; the in-flight request keeps the DO awake |
 | DO KV + in-memory | TURN credential cache | key `turn_cache`, mirrored in `turnCache` |
 | WS attachments | `{deviceId, deviceType, authenticated, lastMessageTime, closed?}` (survives hibernation; `closed` = the idle sweep or `webSocketError` closed it, so it is ignored for routing, presence, counts and late frames [SB-1393]) | `serializeAttachment()` |
@@ -102,8 +102,8 @@ Vitest, no Miniflare/workerd — tests call `doInstance.fetch()` and the WS hand
 
 ## Gotchas
 
-- **Hibernation cache rebuild**: After DO wake, `connections` is empty. `rebuildConnectionCache()` scans `state.getWebSockets()`. See `findWebSocket()`.
-- **notifyDevice iterates ALL WebSockets**, not the 1:1 cache — a device may have multiple connections (agent + pair CLI). Critical for `pair_complete` delivery.
+- **Hibernation cache rebuild**: A wake re-runs the constructor, so `connections`, `wsConnectionCounts` and `deviceSockets` (every authenticated socket per device) start empty. The first lookup calls `ensureConnectionCache()`, which scans `state.getWebSockets()` once; after that nothing rescans. `handleWsAuth` adds to `deviceSockets` and `webSocketClose`/`webSocketError`/the idle sweep remove, each after `ensureConnectionCache()` and before marking or counting, so a close that is the first event after a wake isn't undone by the rebuild. A `connections` miss falls back to the freshest live socket in the device's set (`findWebSocket()`). Tests simulate a wake with `clearWsConnectionCounts()`, which leaves `connections` alone.
+- **notifyDevice iterates the device's whole socket set**, not the 1:1 cache — a device may have multiple connections (agent + pair CLI). Critical for `pair_complete` delivery. It skips dead sockets and returns the delivered count, which decides `pending_pair_complete` persistence.
 - **Two pairing paths** [SB-1348], chosen by `pairing_sessions.pair_confirm` (agent sends `pairConfirm: true` at initiate):
   - *Confirming:* `/pair/initiate` echoes `pairConfirm: true`. `/pair/complete` relays `pair_complete` and holds the request in `pendingPairs` (30s); a host socket that authenticates during the hold gets it right after its `auth` ok reply. The host answers `pair_accept`/`pair_reject`. Only an accept runs `commitPairing` (validate, then remove old pairing + register + create pairing in one `transactionSync`, then tell the evicted mobile), and only an accept gets `pair_result {ok}`. Otherwise the result is 403 (reject), 504 (timeout), 409 (superseded by a newer `/pair/initiate`, cancelled by DELETE `/pairing` or `/device`, or a device conflict — one generic message for every kind) or 500 (commit threw and rolled back; old pairing intact). Every outcome goes through `settlePendingPair`.
   - *Legacy:* commits immediately. An undelivered `pair_complete` goes to `pending_pair_complete` and is flushed on host WS auth.

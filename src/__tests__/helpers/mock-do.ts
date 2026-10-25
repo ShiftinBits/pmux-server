@@ -48,6 +48,8 @@ export function createMockRateLimit(limit: number): RateLimit & { counts: Map<st
 export interface MockDOState {
   acceptedWebSockets: WebSocket[];
   scheduledAlarm: number | null;
+  /** What the DO's state.getWebSockets() returns; spy on it to count scans. */
+  getWebSockets(): WebSocket[];
 }
 
 export async function createTestDO(): Promise<{ doInstance: SignalingDO; mockState: MockDOState }> {
@@ -63,6 +65,9 @@ export async function createTestDO(): Promise<{ doInstance: SignalingDO; mockSta
   const trackableState: MockDOState = {
     acceptedWebSockets,
     scheduledAlarm,
+    getWebSockets(): WebSocket[] {
+      return acceptedWebSockets;
+    },
   };
 
   const mockState = {
@@ -98,8 +103,9 @@ export async function createTestDO(): Promise<{ doInstance: SignalingDO; mockSta
     acceptWebSocket(ws: WebSocket): void {
       acceptedWebSockets.push(ws);
     },
+    // Delegates at call time so vi.spyOn(mockState, 'getWebSockets') sees every scan
     getWebSockets(): WebSocket[] {
-      return acceptedWebSockets;
+      return trackableState.getWebSockets();
     },
   };
 
