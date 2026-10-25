@@ -501,29 +501,6 @@ describe('POST /pair/complete', () => {
     expect(doInstance.getPairedMobile(AGENT_1)).toBe('mobile-1');
   });
 
-  it.each([
-    ['ed25519PublicKey', 'non-base64', '!!!'],
-    ['ed25519PublicKey', 'wrong length', bytesToBase64(new Uint8Array(16))],
-    ['x25519PublicKey', 'non-base64', '!!!'],
-    ['x25519PublicKey', 'wrong length', bytesToBase64(new Uint8Array(33))],
-  ])('returns 400 for a %s that is %s without consuming the code', async (field, _label, value) => {
-    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
-    const pairingCode = (await postJSON('/pair/initiate', body)).data['pairingCode'] as string;
-    const complete = {
-      pairingCode,
-      deviceId: 'mobile-1',
-      ed25519PublicKey: testKey('ed25519-pub-key-mobile'),
-      x25519PublicKey: testKey('x25519-pub-key-mobile'),
-    };
-
-    const bad = await postJSON('/pair/complete', { ...complete, [field]: value });
-
-    expect(bad.status).toBe(400);
-    expect(bad.data['error']).toBe('Invalid deviceId or public key');
-    expect(doInstance.getDevice('mobile-1')).toBeNull();
-    expect((await postJSON('/pair/complete', complete)).status).toBe(200);
-  });
-
   it('rejects invalid pairing code', async () => {
     const { status, data } = await postJSON('/pair/complete', {
       pairingCode: 'BADCODE',

@@ -2366,42 +2366,16 @@ describe('unpaired host purge', () => {
     expect(mockState.scheduledAlarm).toBeNull();
   });
 
-  it('keeps an old host that paired and then unpaired, and does not reschedule for it', async () => {
+  it('purges an old host that paired and then unpaired', async () => {
     doInstance.registerDevice('unpaired-host', 'pk1', 'host');
     doInstance.registerDevice('gone-mobile', 'pk2', 'mobile');
     doInstance.createPairing('unpaired-host', 'gone-mobile');
     doInstance.removePairing('unpaired-host');
-    doInstance.registerDevice('stale-host', 'pk3', 'host');
     backdate('unpaired-host');
-    backdate('stale-host');
 
     await doInstance.alarm();
 
-    expect(exists('unpaired-host')).toBe(true);
-    expect(exists('stale-host')).toBe(false);
+    expect(exists('unpaired-host')).toBe(false);
     expect(mockState.scheduledAlarm).toBeNull();
-  });
-
-  it('marks host rows that predate ever_paired as paired so they are never purged', async () => {
-    const { doInstance: do2 } = await createTestDO();
-    const sql = do2['sql'];
-    sql.exec(`CREATE TABLE devices (
-      id TEXT PRIMARY KEY,
-      ed25519_public_key TEXT NOT NULL UNIQUE,
-      device_type TEXT NOT NULL CHECK(device_type IN ('host', 'mobile')),
-      name TEXT,
-      created_at INTEGER NOT NULL
-    )`);
-    sql.exec(
-      "INSERT INTO devices (id, ed25519_public_key, device_type, name, created_at) VALUES ('legacy-host', 'pk1', 'host', NULL, ?)",
-      old
-    );
-
-    do2.registerDevice('new-host', 'pk2', 'host'); // runs ensureSchema
-    sql.exec('UPDATE devices SET created_at = ? WHERE id = ?', old, 'new-host');
-    await do2.alarm();
-
-    expect(do2.getDevice('legacy-host')).not.toBeNull();
-    expect(do2.getDevice('new-host')).toBeNull();
   });
 });

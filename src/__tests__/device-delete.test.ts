@@ -220,6 +220,22 @@ describe('DELETE /device', () => {
     expect(doInstance.isPaired(HOST_1, 'mobile-1')).toBe(true);
   });
 
+  it('returns 403 for a host JWT whose device ID is now a mobile row', async () => {
+    const { doInstance } = await createTestDOFull();
+    await setupPairedDevices(doInstance);
+
+    const dev = await deleteDevice(doInstance, 'mobile-1', 'host');
+    expect(dev.status).toBe(403);
+
+    const pairingRes = await doInstance.fetch(new Request('http://localhost/pairing', {
+      method: 'DELETE',
+      headers: { 'X-Device-Id': 'mobile-1', 'X-Device-Type': 'host' },
+    }));
+    expect(pairingRes.status).toBe(403);
+    expect(doInstance.getDevice('mobile-1')).not.toBeNull();
+    expect(doInstance.isPaired(HOST_1, 'mobile-1')).toBe(true);
+  });
+
   it('rejects non-DELETE methods with 405', async () => {
     const { doInstance } = await createTestDOFull();
 

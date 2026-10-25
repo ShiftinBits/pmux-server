@@ -247,19 +247,9 @@ export class SignalingDO implements DurableObject {
         ed25519_public_key TEXT NOT NULL UNIQUE,
         device_type TEXT NOT NULL CHECK(device_type IN ('host', 'mobile')),
         name TEXT,
-        created_at INTEGER NOT NULL,
-        ever_paired INTEGER NOT NULL DEFAULT 0
+        created_at INTEGER NOT NULL
       )
     `);
-
-    // Set once a host first pairs, so the unpaired-host purge skips a host
-    // that later unpairs. Rows that predate the column have an unknown
-    // history, so they are marked as paired and never purged.
-    const deviceCols = this.sql.exec('PRAGMA table_info(devices)').toArray();
-    if (!deviceCols.some((col) => col['name'] === 'ever_paired')) {
-      this.sql.exec('ALTER TABLE devices ADD COLUMN ever_paired INTEGER NOT NULL DEFAULT 0');
-      this.sql.exec('UPDATE devices SET ever_paired = 1');
-    }
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS pairings (
@@ -396,7 +386,6 @@ export class SignalingDO implements DurableObject {
       mobileDeviceId,
       now
     );
-    this.sql.exec('UPDATE devices SET ever_paired = 1 WHERE id = ?', hostDeviceId);
   }
 
   /**
@@ -1258,7 +1247,7 @@ export class SignalingDO implements DurableObject {
     // (live socket, pending pairing) can't re-fire the alarm in a hot loop.
     const oldest = this.sql
       .exec(
-        "SELECT MIN(created_at) AS oldest FROM devices WHERE device_type = 'host' AND ever_paired = 0 AND id NOT IN (SELECT host_device_id FROM pairings)"
+        "SELECT MIN(created_at) AS oldest FROM devices WHERE device_type = 'host' AND id NOT IN (SELECT host_device_id FROM pairings)"
       )
       .toArray()[0]?.['oldest'];
     if (typeof oldest === 'number') {
@@ -1271,16 +1260,15 @@ export class SignalingDO implements DurableObject {
   }
 
   /**
-   * Delete host rows that never paired (ever_paired = 0) and are older than
-   * UNPAIRED_HOST_TTL_S. A host that paired and later unpaired is kept, as is
-   * one with a pairing session, a held confirming /pair/complete or a live
-   * authenticated socket.
+   * Delete host rows with no pairing that are older than UNPAIRED_HOST_TTL_S,
+   * skipping a host with a pairing session, a held confirming /pair/complete
+   * or a live authenticated socket. `pmux pair` re-registers a purged host.
    */
   private purgeUnpairedHosts(now: number, liveDeviceIds: Set<string>): void {
     const cutoff = Math.floor(now / 1000) - UNPAIRED_HOST_TTL_S;
     const rows = this.sql
       .exec(
-        `SELECT id FROM devices WHERE device_type = 'host' AND ever_paired = 0 AND created_at < ?
+        `SELECT id FROM devices WHERE device_type = 'host' AND created_at < ?
            AND id NOT IN (SELECT host_device_id FROM pairings)
            AND id NOT IN (SELECT host_device_id FROM pairing_sessions)
            AND id NOT IN (SELECT host_device_id FROM pending_pair_complete)`,
@@ -1864,10 +1852,6 @@ export class SignalingDO implements DurableObject {
     ) {
       return jsonResponse({ error: 'Invalid deviceId or public key' }, 400);
     }
-    // Stored and relayed to the host as-is, so both must be 32-byte keys
-    if (!isBase64OfLength(body.ed25519PublicKey, 32) || !isBase64OfLength(body.x25519PublicKey, 32)) {
-      return jsonResponse({ error: 'Invalid deviceId or public key' }, 400);
-    }
 
     // pairMac is an opaque pass-through (the agent verifies it); optional so
     // older mobile builds still pair, and null counts as absent. Only bound the
@@ -2172,7 +2156,9 @@ export class SignalingDO implements DurableObject {
     if (!hostDeviceId) {
       return jsonResponse({ error: 'Missing device ID' }, 400);
     }
-    if (request.headers.get('X-Device-Type') !== 'host') {
+    // Both the JWT and the stored row must say host: a JWT issued before the
+    // ID was re-registered as a mobile must not act on that row.
+    if (request.headers.get('X-Device-Type') !== 'host' || this.getDevice(hostDeviceId)?.deviceType === 'mobile') {
       return jsonResponse({ error: 'Only a host can remove a pairing' }, 403);
     }
 
@@ -2212,7 +2198,9 @@ export class SignalingDO implements DurableObject {
     if (!hostDeviceId) {
       return jsonResponse({ error: 'Missing device ID' }, 400);
     }
-    if (request.headers.get('X-Device-Type') !== 'host') {
+    // Both the JWT and the stored row must say host: a JWT issued before the
+    // ID was re-registered as a mobile must not act on that row.
+    if (request.headers.get('X-Device-Type') !== 'host' || this.getDevice(hostDeviceId)?.deviceType === 'mobile') {
       return jsonResponse({ error: 'Only a host can remove a device' }, 403);
     }
 
