@@ -232,6 +232,142 @@ describe('DELETE /device', () => {
     expect(res.headers.get('Allow')).toBe('DELETE');
   });
 
+  describe('closes the sockets of removed device rows', () => {
+    const HOST_2 = 'c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2';
+
+    async function authWs(
+      doInstance: SignalingDO,
+      mockState: { acceptedWebSockets: WebSocket[] },
+      deviceId: string,
+      deviceType: 'host' | 'mobile'
+    ): Promise<MockWebSocket> {
+      const ws = new MockWebSocket();
+      mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
+      const token = await createJWT(deviceId, deviceType, JWT_SECRET);
+      await doInstance.webSocketMessage(ws as unknown as WebSocket, JSON.stringify({ type: 'auth', token }));
+      // A host's first auth also flushes the deferred pair_complete
+      expect(ws.messagesOfType('auth')).toEqual([{ type: 'auth', status: 'ok' }]);
+      ws.sent.length = 0;
+      return ws;
+    }
+
+    it("closes every host socket with 4004 and leaves the host unroutable", async () => {
+      const { doInstance, mockState } = await createTestDOFull();
+      await setupPairedDevices(doInstance);
+      const agentWs = await authWs(doInstance, mockState, HOST_1, 'host');
+      const cliWs = await authWs(doInstance, mockState, HOST_1, 'host');
+      expect(doInstance.getWsConnectionCount(HOST_1)).toBe(2);
+      doInstance['sql'].exec(
+        'INSERT INTO signaling_sessions (host_device_id, mobile_device_id, expires_at) VALUES (?, ?, ?)',
+        HOST_1, 'mobile-1', Date.now() + 10_000
+      );
+
+      await deleteDevice(doInstance, HOST_1);
+
+      for (const ws of [agentWs, cliWs]) {
+        expect(ws.closeCode).toBe(4004);
+        expect(ws.closeReason).toBe('Device removed');
+        expect(ws.deserializeAttachment()).toMatchObject({ closed: true });
+      }
+      expect(doInstance.getWsConnectionCount(HOST_1)).toBe(0);
+      expect(doInstance.getConnection(HOST_1)).toBeUndefined();
+      expect(doInstance['sql'].exec('SELECT 1 FROM signaling_sessions WHERE host_device_id = ?', HOST_1).toArray()).toHaveLength(0);
+    });
+
+    it('a later webSocketClose cleans up nothing twice and sends no host_offline', async () => {
+      const { doInstance, mockState } = await createTestDOFull();
+      await setupPairedDevices(doInstance);
+      // mobile-1 also pairs with HOST_2, so it survives and stays connected
+      doInstance.registerDevice(HOST_2, 'pubkey-host-2', 'host');
+      doInstance.createPairing(HOST_2, 'mobile-1');
+      const hostWs = await authWs(doInstance, mockState, HOST_1, 'host');
+      const mobileWs = await authWs(doInstance, mockState, 'mobile-1', 'mobile');
+
+      await deleteDevice(doInstance, HOST_1);
+      expect(hostWs.closeCode).toBe(4004);
+
+      // The host pairs again before the runtime reports the old close
+      doInstance.registerDevice(HOST_1, 'pubkey-host-1', 'host');
+      doInstance.createPairing(HOST_1, 'mobile-1');
+      const freshWs = await authWs(doInstance, mockState, HOST_1, 'host');
+      expect(doInstance.getWsConnectionCount(HOST_1)).toBe(1);
+      mobileWs.sent.length = 0;
+
+      await doInstance.webSocketClose(hostWs as unknown as WebSocket, 4004, 'Device removed', true);
+
+      expect(doInstance.getWsConnectionCount(HOST_1)).toBe(1);
+      expect(doInstance.getConnection(HOST_1)).toBe(freshWs);
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(0);
+    });
+
+    it('sends device_unpaired to the orphaned mobile, then closes its sockets', async () => {
+      const { doInstance, mockState } = await createTestDOFull();
+      await setupPairedDevices(doInstance);
+      const presenceWs = await authWs(doInstance, mockState, 'mobile-1', 'mobile');
+      const signalingWs = await authWs(doInstance, mockState, 'mobile-1', 'mobile');
+
+      await deleteDevice(doInstance, HOST_1);
+
+      // notifyDevice skips closed sockets, so delivery proves it went first
+      for (const ws of [presenceWs, signalingWs]) {
+        expect(ws.messagesOfType('device_unpaired')).toHaveLength(1);
+        expect(ws.closeCode).toBe(4004);
+      }
+      expect(doInstance.getWsConnectionCount('mobile-1')).toBe(0);
+      expect(doInstance.getConnection('mobile-1')).toBeUndefined();
+    });
+
+    it('keeps the sockets of a mobile still paired with another host', async () => {
+      const { doInstance, mockState } = await createTestDOFull();
+      await setupPairedDevices(doInstance);
+      doInstance.registerDevice(HOST_2, 'pubkey-host-2', 'host');
+      doInstance.createPairing(HOST_2, 'mobile-1');
+      const mobileWs = await authWs(doInstance, mockState, 'mobile-1', 'mobile');
+
+      await deleteDevice(doInstance, HOST_1);
+
+      expect(mobileWs.messagesOfType('device_unpaired')).toHaveLength(1);
+      expect(mobileWs.closed).toBe(false);
+      expect(doInstance.getWsConnectionCount('mobile-1')).toBe(1);
+    });
+
+    it('DELETE /pairing closes the orphaned mobile and keeps the host connected', async () => {
+      const { doInstance, mockState } = await createTestDOFull();
+      await setupPairedDevices(doInstance);
+      const hostWs = await authWs(doInstance, mockState, HOST_1, 'host');
+      const mobileWs = await authWs(doInstance, mockState, 'mobile-1', 'mobile');
+
+      const res = await doInstance.fetch(new Request('http://localhost/pairing', {
+        method: 'DELETE',
+        headers: { 'X-Device-Id': HOST_1, 'X-Device-Type': 'host' },
+      }));
+      expect(res.status).toBe(200);
+
+      expect(mobileWs.messagesOfType('device_unpaired')).toHaveLength(1);
+      expect(mobileWs.closeCode).toBe(4004);
+      expect(doInstance.getWsConnectionCount('mobile-1')).toBe(0);
+      expect(hostWs.closed).toBe(false);
+      expect(doInstance.getWsConnectionCount(HOST_1)).toBe(1);
+      expect(doInstance.getConnection(HOST_1)).toBe(hostWs);
+    });
+
+    it('DELETE /pairing keeps the sockets of a mobile still paired with another host', async () => {
+      const { doInstance, mockState } = await createTestDOFull();
+      await setupPairedDevices(doInstance);
+      doInstance.registerDevice(HOST_2, 'pubkey-host-2', 'host');
+      doInstance.createPairing(HOST_2, 'mobile-1');
+      const mobileWs = await authWs(doInstance, mockState, 'mobile-1', 'mobile');
+
+      await doInstance.fetch(new Request('http://localhost/pairing', {
+        method: 'DELETE',
+        headers: { 'X-Device-Id': HOST_1, 'X-Device-Type': 'host' },
+      }));
+
+      expect(mobileWs.messagesOfType('device_unpaired')).toHaveLength(1);
+      expect(mobileWs.closed).toBe(false);
+    });
+  });
+
   it('rate limits after 10 requests', async () => {
     const { doInstance } = await createTestDOFull();
 

@@ -910,6 +910,11 @@ describe('POST /pair/complete', () => {
     expect(unpairedMsgs).toHaveLength(1);
     expect(unpairedMsgs[0]!['hostDeviceId']).toBe(AGENT_1);
     expect(unpairedMsgs[0]!['reason']).toBe('replaced_by_new_pairing');
+
+    // Its orphaned row is gone, so its socket is closed after the notice
+    expect(do2.getDevice('mobile-1')).toBeNull();
+    expect(mobile1Ws.closeCode).toBe(4004);
+    expect(do2.getWsConnectionCount('mobile-1')).toBe(0);
   });
 
   it('stores mobile name from /pair/complete', async () => {
@@ -1119,6 +1124,9 @@ describe('POST /pair/complete', () => {
     // NO device_unpaired notification should have been sent
     const unpairedMsgs = mobile1Ws.messagesOfType('device_unpaired');
     expect(unpairedMsgs).toHaveLength(0);
+    // and its socket stays open
+    expect(mobile1Ws.closed).toBe(false);
+    expect(do2.getWsConnectionCount('mobile-1')).toBe(1);
   });
 
   it('returns 409 when a host device attempts to complete pairing as mobile', async () => {

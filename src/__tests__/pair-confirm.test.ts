@@ -212,6 +212,27 @@ describe('host-confirmed pairing (SB-1348)', () => {
     expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(true);
     expect(do2.isPaired(AGENT_1, 'mobile-old')).toBe(false);
     expect(oldWs.messagesOfType('device_unpaired')[0]).toMatchObject({ reason: 'replaced_by_new_pairing' });
+    // The orphaned row is gone, so its socket closes after the notice
+    expect(do2.getDevice('mobile-old')).toBeNull();
+    expect(oldWs.closeCode).toBe(4004);
+  });
+
+  it('keeps the sockets of a replaced mobile still paired with another host', async () => {
+    const { do2, code, hostWs, authWs, complete, send } = await setup();
+    do2.registerDevice('mobile-old', 'ed25519-pub-key-mobile-old', 'mobile');
+    do2.createPairing(AGENT_1, 'mobile-old');
+    do2.registerDevice('b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3', 'ed25519-pub-key-host-2', 'host');
+    do2.createPairing('b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3', 'mobile-old');
+    const oldWs = await authWs('mobile-old', 'mobile');
+
+    const pending = complete(code);
+    await relayed(hostWs!);
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    expect((await pending).status).toBe(200);
+
+    expect(oldWs.messagesOfType('device_unpaired')).toHaveLength(1);
+    expect(oldWs.closed).toBe(false);
+    expect(do2.getWsConnectionCount('mobile-old')).toBe(1);
   });
 
   it('answers 504 exactly at the timeout and a late pair_accept commits nothing', async () => {
@@ -238,9 +259,11 @@ describe('host-confirmed pairing (SB-1348)', () => {
   });
 
   it('ignores a decision for the wrong mobile or from a mobile-typed socket', async () => {
-    const { do2, code, hostWs, authWs, complete, send, heldCount } = await setup();
-    // A socket authed with a mobile JWT carrying the host's own device ID.
-    const spoofWs = await authWs(AGENT_1, 'mobile');
+    const { do2, code, hostWs, complete, send, heldCount } = await setup();
+    // A mobile-typed socket carrying the host's own device ID. Auth takes the
+    // type from the devices row, so plant the attachment directly.
+    const spoofWs = new MockWebSocket();
+    spoofWs.serializeAttachment({ deviceId: AGENT_1, deviceType: 'mobile', authenticated: true, lastMessageTime: Date.now() });
 
     const pending = complete(code);
     await relayed(hostWs!);
@@ -401,9 +424,9 @@ describe('host-confirmed pairing (SB-1348)', () => {
   });
 
   it.each([
-    { path: '/device', action: 'uninstall' },
-    { path: '/pairing', action: 'unpair' },
-  ])('host $action during the hold answers 409 and a late pair_accept commits nothing', async ({ path }) => {
+    { path: '/device', action: 'uninstall', hostClosed: true },
+    { path: '/pairing', action: 'unpair', hostClosed: false },
+  ])('host $action during the hold answers 409 and a late pair_accept commits nothing', async ({ path, hostClosed }) => {
     const { do2, code, hostWs, complete, send, heldCount } = await setup();
     const pending = complete(code);
     await relayed(hostWs!);
@@ -419,8 +442,13 @@ describe('host-confirmed pairing (SB-1348)', () => {
     expect(await res.json()).toEqual({ error: 'Pairing cancelled by the host' });
     expect(heldCount()).toBe(0);
 
+    // Uninstall deletes the host row, so its socket is closed and the late
+    // accept is ignored; after an unpair the open socket gets ok:false
+    expect(hostWs!.closeCode).toBe(hostClosed ? 4004 : undefined);
     await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
-    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: 'mobile-1', ok: false }]);
+    expect(hostWs!.messagesOfType('pair_result')).toEqual(
+      hostClosed ? [] : [{ type: 'pair_result', mobileDeviceId: 'mobile-1', ok: false }]
+    );
     expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(false);
     expect(do2.getDevice('mobile-1')).toBeNull();
   });

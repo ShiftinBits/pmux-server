@@ -250,11 +250,6 @@ describe('Concurrent connections integration [T3.11]', () => {
       const sockets: MockWebSocket[] = [];
       for (let i = 0; i < MAX_WS_CONNECTIONS_PER_DEVICE; i++) {
         const ws = new MockWebSocket();
-        ws.serializeAttachment({
-          deviceId: 'agent-ws-reopen',
-          deviceType: 'host',
-          authenticated: true,
-        });
         await doInstance.webSocketMessage(
           ws as unknown as WebSocket,
           JSON.stringify({ type: 'auth', token })

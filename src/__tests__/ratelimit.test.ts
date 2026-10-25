@@ -275,11 +275,6 @@ describe('WebSocket connection limits', () => {
     const sockets: MockWebSocket[] = [];
     for (let i = 0; i < MAX_WS_CONNECTIONS_PER_DEVICE; i++) {
       const ws = new MockWebSocket();
-      ws.serializeAttachment({
-        deviceId: 'agent-1',
-        deviceType: 'host',
-        authenticated: true,
-      });
       await doInstance.webSocketMessage(
         ws as unknown as WebSocket,
         JSON.stringify({ type: 'auth', token })

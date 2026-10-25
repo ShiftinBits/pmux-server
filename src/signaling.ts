@@ -186,7 +186,7 @@ export class SignalingDO implements DurableObject {
   private wsConnectionCounts = new Map<string, number>();
 
   // Every authenticated socket per device ID, rebuilt from getWebSockets() once
-  // per wake and kept current on auth/close/error/idle-close
+  // per wake and kept current on auth/close/error/idle-close/device removal
   private deviceSockets = new Map<string, Set<WebSocket>>();
 
   // Set only here: a hibernation wake re-runs the constructor, so the first
@@ -957,8 +957,9 @@ export class SignalingDO implements DurableObject {
     // Update lastMessageTime on every received message (for idle timeout tracking)
     this.touchWebSocket(ws);
 
-    // Re-auth announces host_online itself in handleWsAuth
-    if (hostWasHidden && priorAtt && data.type !== 'auth') {
+    // Any frame from an authenticated host counts as activity, including an
+    // auth frame (rejected below as a re-auth, so handleWsAuth never runs)
+    if (hostWasHidden && priorAtt) {
       const msg: HostOnlineMessage = { type: 'host_online', deviceId: priorAtt.deviceId, ts: Date.now() };
       const name = this.getDevice(priorAtt.deviceId)?.name;
       if (name) msg.name = name;
@@ -972,6 +973,12 @@ export class SignalingDO implements DurableObject {
 
     // Auth must be handled before any other message type
     if (data.type === 'auth') {
+      // One auth per socket: a second one must not relabel the socket's
+      // device or count it twice
+      if (priorAtt?.authenticated) {
+        wsSend(ws, { type: 'error', error: 'Already authenticated' });
+        return;
+      }
       if (typeof data.token !== 'string') {
         wsSend(ws, { type: 'error', error: 'Missing or invalid auth token' });
         ws.close(4001, 'Missing or invalid auth token');
@@ -1111,6 +1118,37 @@ export class SignalingDO implements DurableObject {
       att.closed = true;
       ws.serializeAttachment(att);
     }
+  }
+
+  /**
+   * Close every live socket of a device whose devices row was just deleted,
+   * with 4004, so no socket outlives its row. Does the close-site cleanup
+   * itself (cache, count, socket set, a host's signaling session) because
+   * markClosed makes webSocketClose skip these sockets. Sends no
+   * host_offline: every caller has already removed the pairing.
+   */
+  private closeDeviceSockets(deviceId: string, reason: string): void {
+    this.ensureConnectionCache();
+    let closedHost = false;
+    for (const ws of [...(this.deviceSockets.get(deviceId) ?? [])]) {
+      const att = ws.deserializeAttachment() as WsAttachment | null;
+      if (!att || !isLive(ws, att)) continue;
+      // Before markClosed, as in webSocketError, so a rebuild this triggers
+      // still counts the socket that the decrement below removes
+      this.removeDeviceSocket(deviceId, ws);
+      this.markClosed(ws);
+      try {
+        ws.close(4004, reason);
+      } catch {
+        // May already be closed
+      }
+      if (this.connections.get(deviceId) === ws) {
+        this.connections.delete(deviceId);
+      }
+      this.decrementWsCount(deviceId);
+      if (att.deviceType === 'host') closedHost = true;
+    }
+    if (closedHost) this.clearSignalingSession(deviceId);
   }
 
   /**
@@ -1357,8 +1395,8 @@ export class SignalingDO implements DurableObject {
    * Count live authenticated WebSocket connections for a device, excluding a
    * specific WebSocket (typically the one that is closing or erroring).
    * Reads the device's socket set, rebuilt from the runtime's getWebSockets()
-   * once per wake and kept current on auth/close/error/idle-close, so it is
-   * correct straight after DO hibernation.
+   * once per wake and kept current on auth/close/error/idle-close/device
+   * removal, so it is correct straight after DO hibernation.
    *
    * Safe to use for the auth-time cap check (excludeWs = the socket being
    * authenticated): a socket joins the set only once it authenticates, so the
@@ -1387,7 +1425,13 @@ export class SignalingDO implements DurableObject {
 
       // The socket may have been closed during the await; don't overwrite its
       // closed attachment with a fresh authenticated one [SB-1393]
-      if (!isLive(ws, ws.deserializeAttachment() as WsAttachment | null)) return;
+      const current = ws.deserializeAttachment() as WsAttachment | null;
+      if (!isLive(ws, current)) return;
+      // A concurrent auth frame on this socket finished first
+      if (current?.authenticated) {
+        wsSend(ws, { type: 'error', error: 'Already authenticated' });
+        return;
+      }
 
       // Check WebSocket connection limit per device. Count from the per-device
       // socket set, rebuilt from getWebSockets() on the first lookup after a
@@ -1411,9 +1455,10 @@ export class SignalingDO implements DurableObject {
         return;
       }
 
+      // The type comes from the stored row, not the token
       const attachment: WsAttachment = {
         deviceId: payload.deviceId,
-        deviceType: payload.deviceType,
+        deviceType: device.deviceType,
         authenticated: true,
         lastMessageTime: Date.now(),
       };
@@ -1427,7 +1472,7 @@ export class SignalingDO implements DurableObject {
       // Update device name if provided in auth message
       const validName = validateDeviceName(name);
 
-      if (validName && payload.deviceType === 'mobile') {
+      if (validName && device.deviceType === 'mobile') {
         const nameChanged = device.name !== validName;
         this.updateDeviceName(payload.deviceId, validName);
         if (nameChanged) {
@@ -1440,12 +1485,12 @@ export class SignalingDO implements DurableObject {
             });
           }
         }
-      } else if (validName && payload.deviceType === 'host') {
+      } else if (validName && device.deviceType === 'host') {
         this.updateDeviceName(payload.deviceId, validName);
       }
 
       // If host, notify the paired mobile of host_online (with name from DB)
-      if (payload.deviceType === 'host') {
+      if (device.deviceType === 'host') {
         const hostOnlineMsg: HostOnlineMessage = {
           type: 'host_online',
           deviceId: payload.deviceId,
@@ -1497,14 +1542,14 @@ export class SignalingDO implements DurableObject {
       }
 
       // If mobile, send current presence snapshot for all paired hosts that are connected.
-      if (payload.deviceType === 'mobile') {
+      if (device.deviceType === 'mobile') {
         const pairedHosts = this.getHostsForMobile(payload.deviceId);
         for (const hostDeviceId of pairedHosts) {
           if (this.findFreshWebSocket(hostDeviceId)) {
-            const device = this.getDevice(hostDeviceId);
+            const hostDevice = this.getDevice(hostDeviceId);
             const msg: HostOnlineMessage = { type: 'host_online', deviceId: hostDeviceId, ts: Date.now() };
-            if (device?.name) {
-              msg.name = device.name;
+            if (hostDevice?.name) {
+              msg.name = hostDevice.name;
             }
             wsSend(ws, msg);
           }
@@ -1989,6 +2034,10 @@ export class SignalingDO implements DurableObject {
         hostDeviceId,
         hostName: hostName ?? undefined,
       });
+      // Told first; then its sockets go if its row was removed as an orphan
+      if (this.getDevice(existingMobileId) === null) {
+        this.closeDeviceSockets(existingMobileId, 'Device removed');
+      }
     }
     return true;
   }
@@ -2156,6 +2205,11 @@ export class SignalingDO implements DurableObject {
     // Remove pairing (also cleans up orphaned mobile device)
     const removedMobileId = this.removePairing(hostDeviceId);
 
+    // The host row survives; an orphaned mobile's sockets must not
+    if (removedMobileId && this.getDevice(removedMobileId) === null) {
+      this.closeDeviceSockets(removedMobileId, 'Device removed');
+    }
+
     return jsonResponse({ removed: removedMobileId !== null });
   }
 
@@ -2179,6 +2233,7 @@ export class SignalingDO implements DurableObject {
     // Get host device name before removal (for the notification)
     const hostDevice = this.getDevice(hostDeviceId);
     const hostName = hostDevice?.name ?? undefined;
+    const mobileId = this.getPairedMobile(hostDeviceId);
 
     // Notify the paired mobile before removing records
     this.notifyPairedMobile(hostDeviceId, {
@@ -2190,6 +2245,12 @@ export class SignalingDO implements DurableObject {
 
     // Remove pairing + host device
     const { removedDevice } = this.removeDeviceAndPairing(hostDeviceId);
+
+    // No socket outlives its row: the host's, and an orphaned mobile's
+    this.closeDeviceSockets(hostDeviceId, 'Device removed');
+    if (mobileId && this.getDevice(mobileId) === null) {
+      this.closeDeviceSockets(mobileId, 'Device removed');
+    }
 
     return jsonResponse({ removed: removedDevice });
   }

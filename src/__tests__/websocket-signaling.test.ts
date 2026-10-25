@@ -161,6 +161,61 @@ describe('WebSocket signaling [T1.8]', () => {
 
       expect(ws.lastMessage()).toEqual({ type: 'error', error: 'Invalid JSON' });
     });
+
+    it('rejects a second auth on an authenticated socket without relabeling it', async () => {
+      const { ws } = await connectAndAuth('agent-1', 'host');
+      const otherToken = await setupDevice('mobile-2', 'mobile');
+      ws.sent.length = 0;
+
+      await doInstance.webSocketMessage(
+        ws as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: otherToken })
+      );
+
+      expect(ws.sent).toEqual([{ type: 'error', error: 'Already authenticated' }]);
+      expect(ws.closed).toBe(false);
+      expect(ws.deserializeAttachment()).toMatchObject({ deviceId: 'agent-1', deviceType: 'host', authenticated: true });
+      expect(doInstance.getWsConnectionCount('agent-1')).toBe(1);
+      expect(doInstance.getWsConnectionCount('mobile-2')).toBe(0);
+      expect(doInstance.getConnection('mobile-2')).toBeUndefined();
+    });
+
+    it('counts a socket once when two auth frames race on it', async () => {
+      const token = await setupDevice('agent-1', 'host');
+      const ws = new MockWebSocket();
+      mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
+      const frame = JSON.stringify({ type: 'auth', token });
+
+      await Promise.all([
+        doInstance.webSocketMessage(ws as unknown as WebSocket, frame),
+        doInstance.webSocketMessage(ws as unknown as WebSocket, frame),
+      ]);
+
+      expect(ws.messagesOfType('auth')).toEqual([{ type: 'auth', status: 'ok' }]);
+      expect(ws.messagesOfType('error')).toEqual([{ type: 'error', error: 'Already authenticated' }]);
+      expect(doInstance.getWsConnectionCount('agent-1')).toBe(1);
+    });
+
+    it('takes the attachment deviceType from the devices row, not the JWT', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      doInstance.registerDevice('mobile-1', 'pubkey-mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+      hostWs.sent.length = 0;
+
+      // A JWT claiming host for a device stored as a mobile
+      const token = await createJWT('mobile-1', 'host', JWT_SECRET);
+      const ws = new MockWebSocket();
+      mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
+      await doInstance.webSocketMessage(ws as unknown as WebSocket, JSON.stringify({ type: 'auth', token }));
+
+      expect(ws.deserializeAttachment()).toMatchObject({ deviceId: 'mobile-1', deviceType: 'mobile', authenticated: true });
+      // The mobile branch ran: presence snapshot for the paired host
+      expect(ws.messagesOfType('host_online')).toEqual([
+        expect.objectContaining({ type: 'host_online', deviceId: 'agent-1' }),
+      ]);
+      expect(ws.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+      expect(hostWs.messagesOfType('host_online')).toHaveLength(0);
+    });
   });
 
   describe('presence', () => {
@@ -1665,7 +1720,7 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(mobileWs.messagesOfType('host_online')).toHaveLength(0);
     });
 
-    it('announces host_online once when a stale host socket re-authenticates [SB-1004]', async () => {
+    it('announces host_online once when a stale host socket sends a rejected re-auth [SB-1004]', async () => {
       const { ws: hostWs, token } = await connectAndAuth('agent-1', 'host');
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
       doInstance.createPairing('agent-1', 'mobile-1');
@@ -1677,10 +1732,12 @@ describe('WebSocket signaling [T1.8]', () => {
         lastMessageTime: Date.now() - 10 * 60 * 1000,
       });
       mobileWs.sent.length = 0;
+      hostWs.sent.length = 0;
 
       await doInstance.webSocketMessage(hostWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token }));
 
       expect(mobileWs.messagesOfType('host_online')).toHaveLength(1);
+      expect(hostWs.sent).toEqual([{ type: 'error', error: 'Already authenticated' }]);
     });
   });
 
