@@ -39,14 +39,24 @@ function bytesToHex(bytes: Uint8Array): string {
     .join('');
 }
 
-async function importHmacKey(secret: string): Promise<CryptoKey> {
-  return crypto.subtle.importKey(
-    'raw',
-    textEncode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign', 'verify']
-  );
+const hmacKeys = new Map<string, Promise<CryptoKey>>();
+
+function importHmacKey(secret: string): Promise<CryptoKey> {
+  let key = hmacKeys.get(secret);
+  if (!key) {
+    key = crypto.subtle.importKey(
+      'raw',
+      textEncode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign', 'verify']
+    );
+    hmacKeys.set(secret, key);
+    key.catch(() => {
+      if (hmacKeys.get(secret) === key) hmacKeys.delete(secret);
+    });
+  }
+  return key;
 }
 
 /**
