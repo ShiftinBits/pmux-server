@@ -6,6 +6,7 @@ import {
   bytesToBase64,
   signEd25519,
   signedPairInitiateBodyWithChallenge,
+  HOST_X25519_KEY,
   fetchChallenge,
 } from './helpers/crypto';
 import type { SignalingDO } from '../signaling';
@@ -44,7 +45,7 @@ async function registerAgentDevice(
   ed25519PublicKeyBase64: string,
   keyPair: CryptoKeyPair
 ) {
-  const body = await signedPairInitiateBodyWithChallenge(doInstance, deviceId, keyPair, ed25519PublicKeyBase64, 'x25519-placeholder');
+  const body = await signedPairInitiateBodyWithChallenge(doInstance, deviceId, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
   await postJSON('/pair/initiate', body);
 }
 
@@ -98,6 +99,17 @@ describe('POST /token', () => {
 
     expect(status).toBe(401);
     expect(data['error']).toContain('Signature verification failed');
+  });
+
+  it('rejects a non-base64 signature with 401', async () => {
+    const { publicKeyRaw, keyPair } = await generateEd25519Keypair();
+    await registerAgentDevice(AGENT_1, bytesToBase64(publicKeyRaw), keyPair);
+    const nonce = await fetchChallenge(doInstance, AGENT_1);
+
+    const { status, data } = await postJSON('/token', { deviceId: AGENT_1, nonce, signature: '!!!' });
+
+    expect(status).toBe(401);
+    expect(data['error']).toBe('Invalid signature format');
   });
 
   it('rejects an unknown device', async () => {

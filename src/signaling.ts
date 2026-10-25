@@ -133,6 +133,14 @@ export interface WsAttachment {
 /** Interval (ms) between alarm-based cleanup sweeps. */
 const ALARM_INTERVAL_MS = 30_000; // 30 seconds
 
+/** Age (seconds) after which a host with no pairing is purged. */
+const UNPAIRED_HOST_TTL_S = 86_400; // 1 day
+/** Host rows the unpaired-host purge may delete (age aside). */
+const PURGEABLE_HOST_WHERE = `device_type = 'host'
+  AND id NOT IN (SELECT host_device_id FROM pairings)
+  AND id NOT IN (SELECT host_device_id FROM pairing_sessions)
+  AND id NOT IN (SELECT host_device_id FROM pending_pair_complete)`;
+
 /**
  * Maximum idle time (ms) before a WebSocket is closed.
  *
@@ -179,12 +187,18 @@ export class SignalingDO implements DurableObject {
   // In-memory WebSocket cache indexed by deviceId (rebuilt after hibernation wake)
   private connections = new Map<string, WebSocket>();
 
-  // In-memory WebSocket connection count per device ID (for abuse prevention)
-  private wsConnectionCounts = new Map<string, number>();
+  // Every authenticated socket per device ID, rebuilt from getWebSockets() once
+  // per wake and kept current on auth/close/error/idle-close/device removal.
+  // The per-device connection cap and host_offline decisions count from it.
+  private deviceSockets = new Map<string, Set<WebSocket>>();
+
+  // Set only here: a hibernation wake re-runs the constructor, so the first
+  // lookup after a wake rebuilds the caches above exactly once
+  private cacheRebuilt = false;
 
   // TURN credential cache, mirrored to DO KV storage (TURN_CACHE_KEY) so it survives
-  // hibernation. Shared by all devices: any authenticated device can already obtain
-  // valid credentials, and they are time-limited and relay-only.
+  // hibernation. Shared by all paired devices: they are time-limited
+  // and relay-only.
   private turnCache: TurnCacheEntry | null = null;
   private turnFetch: Promise<TurnCredentials> | null = null;
 
@@ -628,25 +642,49 @@ export class SignalingDO implements DurableObject {
   // --- WebSocket connection management ---
 
   /**
-   * Find a WebSocket by deviceId. Checks in-memory cache first,
-   * then scans hibernated WebSockets and rebuilds cache.
+   * Find a WebSocket by deviceId. Checks the 1:1 cache first, then falls back
+   * to the freshest live socket in the device's set (no rescan), caching it.
+   * webSocketClose leaves the cache empty when a sibling outlives the cached
+   * socket, so the fallback is what keeps that sibling routable.
    */
   private findWebSocket(deviceId: string): WebSocket | undefined {
+    this.ensureConnectionCache();
     const cached = this.connections.get(deviceId);
     if (cached) return cached;
 
-    // After hibernation wake, the in-memory cache is empty — rebuild it.
-    this.rebuildConnectionCache();
-    return this.connections.get(deviceId);
+    let best: WebSocket | undefined;
+    let bestTime = -1;
+    for (const ws of this.deviceSockets.get(deviceId) ?? []) {
+      const att = ws.deserializeAttachment() as WsAttachment | null;
+      if (!att?.authenticated || att.deviceId !== deviceId || !isLive(ws, att)) continue;
+      const last = att.lastMessageTime ?? 0;
+      if (last > bestTime) {
+        best = ws;
+        bestTime = last;
+      }
+    }
+    if (best) this.connections.set(deviceId, best);
+    return best;
   }
 
   /**
-   * Rebuild the in-memory connections cache from hibernated WebSockets.
-   * Called when the cache might be stale (e.g., after hibernation wake).
+   * Rebuild the in-memory socket caches from getWebSockets() once per wake.
+   * Every later lookup reads the per-device sets, which auth/close/error and
+   * the idle sweep keep current.
+   */
+  private ensureConnectionCache(): void {
+    if (this.cacheRebuilt) return;
+    this.cacheRebuilt = true;
+    this.rebuildConnectionCache();
+  }
+
+  /**
+   * Scan hibernated WebSockets into the connections cache and the per-device
+   * socket sets. Only ensureConnectionCache() calls it.
    */
   private rebuildConnectionCache(): void {
     if (!this.state.getWebSockets) return;
-    this.wsConnectionCounts.clear();
+    this.deviceSockets.clear();
     // When a device has several sockets, keep the freshest one [SB-1360]
     const freshest = new Map<string, number>();
     for (const ws of this.state.getWebSockets()) {
@@ -657,10 +695,34 @@ export class SignalingDO implements DurableObject {
           this.connections.set(att.deviceId, ws);
           freshest.set(att.deviceId, last);
         }
-        const count = this.wsConnectionCounts.get(att.deviceId) ?? 0;
-        this.wsConnectionCounts.set(att.deviceId, count + 1);
+        let sockets = this.deviceSockets.get(att.deviceId);
+        if (!sockets) {
+          sockets = new Set();
+          this.deviceSockets.set(att.deviceId, sockets);
+        }
+        sockets.add(ws);
       }
     }
+  }
+
+  /** Track an authenticated socket in its device's set. */
+  private addDeviceSocket(deviceId: string, ws: WebSocket): void {
+    this.ensureConnectionCache();
+    let sockets = this.deviceSockets.get(deviceId);
+    if (!sockets) {
+      sockets = new Set();
+      this.deviceSockets.set(deviceId, sockets);
+    }
+    sockets.add(ws);
+  }
+
+  /** Drop a socket from its device's set, removing the entry once it empties. */
+  private removeDeviceSocket(deviceId: string, ws: WebSocket): void {
+    this.ensureConnectionCache();
+    const sockets = this.deviceSockets.get(deviceId);
+    if (!sockets) return;
+    sockets.delete(ws);
+    if (sockets.size === 0) this.deviceSockets.delete(deviceId);
   }
 
   /**
@@ -675,18 +737,18 @@ export class SignalingDO implements DurableObject {
   }
 
   /**
-   * Send a message to ALL WebSocket connections for a specific device.
-   * Iterates hibernated WebSockets directly (not the 1:1 connections map)
-   * so that every connection receives the message — critical when a device
-   * has multiple concurrent connections (e.g., background agent + pair CLI).
+   * Send a message to ALL live WebSocket connections for a specific device.
+   * Iterates the device's socket set (not the 1:1 connections map) so that
+   * every connection receives the message — critical when a device has
+   * multiple concurrent connections (e.g., background agent + pair CLI).
    * Returns the number of connections the message was sent to.
    */
   private notifyDevice(deviceId: string, message: unknown): number {
+    this.ensureConnectionCache();
     let delivered = 0;
-    if (!this.state.getWebSockets) return delivered;
-    for (const ws of this.state.getWebSockets()) {
+    for (const ws of this.deviceSockets.get(deviceId) ?? []) {
       const att = ws.deserializeAttachment() as WsAttachment | null;
-      if (att?.authenticated && att.deviceId === deviceId) {
+      if (att?.authenticated && att.deviceId === deviceId && isLive(ws, att)) {
         try {
           wsSend(ws, message);
           delivered++;
@@ -711,14 +773,18 @@ export class SignalingDO implements DurableObject {
     this.connections.delete(deviceId);
   }
 
-  /** Get current WebSocket connection count for a device (for testing). */
+  /** Get the live authenticated WebSocket count for a device (for testing). */
   getWsConnectionCount(deviceId: string): number {
-    return this.wsConnectionCounts.get(deviceId) ?? 0;
+    return this.countOtherActiveWsForDevice(deviceId);
   }
 
-  /** Simulate DO hibernation by clearing in-memory connection counts (for testing). */
+  /**
+   * Simulate DO hibernation by clearing the in-memory socket sets, so the
+   * next lookup rebuilds them (for testing).
+   */
   clearWsConnectionCounts(): void {
-    this.wsConnectionCounts.clear();
+    this.deviceSockets.clear();
+    this.cacheRebuilt = false;
   }
 
   /** Simulate DO hibernation by clearing the in-memory TURN credential cache (for testing). */
@@ -740,6 +806,15 @@ export class SignalingDO implements DurableObject {
   };
 
   async fetch(request: Request): Promise<Response> {
+    try {
+      return await this.route(request);
+    } catch (err) {
+      console.error('[do] unhandled error path=%s', new URL(request.url).pathname, err);
+      return jsonResponse({ error: 'Internal error' }, 500);
+    }
+  }
+
+  private async route(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const clientIp = request.headers.get('X-Client-IP') ?? '127.0.0.1';
     const deviceId = request.headers.get('X-Device-Id') ?? '';
@@ -783,7 +858,7 @@ export class SignalingDO implements DurableObject {
         case '/turn/credentials': {
           const limited = await this.checkLimit(this.env.TURN_LIMITER, `turn:${deviceId || clientIp}`, 60);
           if (limited) return limited;
-          return this.handleTurnCredentials();
+          return this.handleTurnCredentials(deviceId, request.headers.get('X-Device-Type'));
         }
         case '/pairing': {
           const limited = await this.checkLimit(this.env.PAIR_LIMITER, `pairing:${deviceId || clientIp}`, 60);
@@ -856,6 +931,20 @@ export class SignalingDO implements DurableObject {
       return;
     }
 
+    // Malformed frames do not count as activity: parse and shape-check first
+    let data: SignalingClientMessage;
+    try {
+      data = JSON.parse(message) as SignalingClientMessage;
+    } catch {
+      wsSend(ws, { type: 'error', error: 'Invalid JSON' });
+      return;
+    }
+    const parsed: unknown = data;
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      wsSend(ws, { type: 'error', error: 'Invalid message' });
+      return;
+    }
+
     // A host whose sockets were all stale was hidden from mobile presence by
     // isWebSocketFresh(); note it so it can be re-announced once live [SB-1004]
     const priorAtt = ws.deserializeAttachment() as WsAttachment | null;
@@ -867,16 +956,9 @@ export class SignalingDO implements DurableObject {
     // Update lastMessageTime on every received message (for idle timeout tracking)
     this.touchWebSocket(ws);
 
-    let data: SignalingClientMessage;
-    try {
-      data = JSON.parse(message) as SignalingClientMessage;
-    } catch {
-      wsSend(ws, { type: 'error', error: 'Invalid JSON' });
-      return;
-    }
-
-    // Re-auth announces host_online itself in handleWsAuth
-    if (hostWasHidden && priorAtt && data.type !== 'auth') {
+    // Any frame from an authenticated host counts as activity, including an
+    // auth frame (rejected below as a re-auth, so handleWsAuth never runs)
+    if (hostWasHidden && priorAtt) {
       const msg: HostOnlineMessage = { type: 'host_online', deviceId: priorAtt.deviceId, ts: Date.now() };
       const name = this.getDevice(priorAtt.deviceId)?.name;
       if (name) msg.name = name;
@@ -890,6 +972,12 @@ export class SignalingDO implements DurableObject {
 
     // Auth must be handled before any other message type
     if (data.type === 'auth') {
+      // One auth per socket: a second one must not relabel the socket's
+      // device or count it twice
+      if (priorAtt?.authenticated) {
+        wsSend(ws, { type: 'error', error: 'Already authenticated' });
+        return;
+      }
       if (typeof data.token !== 'string') {
         wsSend(ws, { type: 'error', error: 'Missing or invalid auth token' });
         ws.close(4001, 'Missing or invalid auth token');
@@ -945,6 +1033,10 @@ export class SignalingDO implements DurableObject {
     // A socket the DO closed was already cleaned up where it was closed [SB-1393]
     if (!attachment?.authenticated || attachment.closed) return;
 
+    // First, so a rebuild this triggers (close as the first event after a
+    // wake) can't re-add the socket after it is removed
+    this.removeDeviceSocket(attachment.deviceId, ws);
+
     // Only remove from cache if this WS is the one currently stored.
     // A device may have multiple concurrent WebSockets (e.g., mobile uses one
     // for presence on the host list and another for WebRTC signaling). If a
@@ -954,14 +1046,9 @@ export class SignalingDO implements DurableObject {
       this.connections.delete(attachment.deviceId);
     }
 
-    // Decrement WebSocket connection count (used by alarm-path guard)
-    this.decrementWsCount(attachment.deviceId);
-
     // If this was the last connection for a host, notify the paired mobile.
-    // Use getWebSockets() (runtime source of truth) rather than the in-memory
-    // wsConnectionCounts, which can be stale after DO hibernation. Exclude the
-    // closing WS from the count regardless of whether Cloudflare has already
-    // removed it from getWebSockets() by the time this handler fires.
+    // Count live sockets in the device's set (rebuilt from getWebSockets()
+    // once per wake), excluding the closing WS.
     if (attachment.deviceType === 'host') {
       const otherCount = this.countOtherActiveWsForDevice(attachment.deviceId, ws);
       if (otherCount === 0) {
@@ -980,14 +1067,13 @@ export class SignalingDO implements DurableObject {
     console.error('[ws-error] deviceId=%s error=%o', attachment?.deviceId, error);
     // Skip cleanup already done when the DO closed this socket [SB-1393]
     if (attachment?.authenticated && !attachment.closed) {
+      this.removeDeviceSocket(attachment.deviceId, ws);
       this.markClosed(ws);
       if (this.connections.get(attachment.deviceId) === ws) {
         this.connections.delete(attachment.deviceId);
       }
-      this.decrementWsCount(attachment.deviceId);
-      // If this was the last connection for a host, notify the paired mobile.
-      // Use getWebSockets() via countOtherActiveWsForDevice for the same
-      // reason as webSocketClose: in-memory counts are unreliable post-hibernation.
+      // If this was the last connection for a host, notify the paired mobile,
+      // counting the device's other live sockets as webSocketClose does.
       if (
         attachment.deviceType === 'host' &&
         this.countOtherActiveWsForDevice(attachment.deviceId, ws) === 0
@@ -1028,6 +1114,34 @@ export class SignalingDO implements DurableObject {
   }
 
   /**
+   * Close every live socket of a device whose devices row was just deleted,
+   * with 4004, so no socket outlives its row. Does the close-site cleanup
+   * itself (cache, socket set, a host's signaling session) because
+   * markClosed makes webSocketClose skip these sockets. Sends no
+   * host_offline: every caller has already removed the pairing.
+   */
+  private closeDeviceSockets(deviceId: string, reason: string): void {
+    this.ensureConnectionCache();
+    let closedHost = false;
+    for (const ws of [...(this.deviceSockets.get(deviceId) ?? [])]) {
+      const att = ws.deserializeAttachment() as WsAttachment | null;
+      if (!att || !isLive(ws, att)) continue;
+      this.removeDeviceSocket(deviceId, ws);
+      this.markClosed(ws);
+      try {
+        ws.close(4004, reason);
+      } catch {
+        // May already be closed
+      }
+      if (this.connections.get(deviceId) === ws) {
+        this.connections.delete(deviceId);
+      }
+      if (att.deviceType === 'host') closedHost = true;
+    }
+    if (closedHost) this.clearSignalingSession(deviceId);
+  }
+
+  /**
    * A WebSocket is "fresh" if its last received message is within the idle
    * timeout. A sleeping/frozen host stops sending heartbeats, but its socket
    * lingers until the idle sweep reaps it (up to WS_IDLE_TIMEOUT_MS + one alarm
@@ -1044,13 +1158,12 @@ export class SignalingDO implements DurableObject {
 
   /**
    * Find a fresh socket for a device. Prefers the cached socket, then falls back
-   * to any other authenticated socket of the same device [SB-1004].
+   * to any other fresh socket in the device's socket set [SB-1004].
    */
   private findFreshWebSocket(deviceId: string): WebSocket | undefined {
     const cached = this.findWebSocket(deviceId);
     if (cached && this.isWebSocketFresh(cached)) return cached;
-    if (!this.state.getWebSockets) return undefined;
-    for (const ws of this.state.getWebSockets()) {
+    for (const ws of this.deviceSockets.get(deviceId) ?? []) {
       if (ws === cached) continue;
       const att = ws.deserializeAttachment() as WsAttachment | null;
       if (att?.authenticated && att.deviceId === deviceId && this.isWebSocketFresh(ws)) {
@@ -1063,6 +1176,13 @@ export class SignalingDO implements DurableObject {
 
   // --- DO alarm handler (idle WS cleanup + expired pairing purge) ---
 
+  private isPairedDevice(deviceId: string, deviceType: string | null): boolean {
+    if (!deviceId) return false;
+    if (deviceType === 'host') return this.getPairedMobile(deviceId) !== null;
+    if (deviceType === 'mobile') return this.getHostsForMobile(deviceId).length > 0;
+    return false;
+  }
+
   /**
    * Called by the runtime on the scheduled alarm.
    * Closes idle WebSockets and purges expired pairing codes.
@@ -1070,6 +1190,7 @@ export class SignalingDO implements DurableObject {
   async alarm(): Promise<void> {
     const now = Date.now();
     let activeCount = 0;
+    const liveDeviceIds = new Set<string>();
 
     if (this.state.getWebSockets) {
       for (const ws of this.state.getWebSockets()) {
@@ -1079,6 +1200,8 @@ export class SignalingDO implements DurableObject {
 
         const lastMsg = att.lastMessageTime ?? 0;
         if (lastMsg > 0 && now - lastMsg > WS_IDLE_TIMEOUT_MS) {
+          const authed = att.authenticated && !!att.deviceId;
+          if (authed) this.removeDeviceSocket(att.deviceId, ws);
           // Mark first, as webSocketError does, then close the idle WebSocket
           this.markClosed(ws);
           try {
@@ -1086,15 +1209,14 @@ export class SignalingDO implements DurableObject {
           } catch {
             // May already be closed
           }
-          if (att.authenticated && att.deviceId) {
+          if (authed) {
             if (this.connections.get(att.deviceId) === ws) {
               this.connections.delete(att.deviceId);
             }
-            this.decrementWsCount(att.deviceId);
             // Notify the paired mobile that the host is offline only when this
-            // is the last connection for the device. Use countOtherActiveWsForDevice
-            // (reads from getWebSockets(), not stale in-memory counts) so that
-            // multi-WS devices are handled correctly even after DO hibernation.
+            // is the last connection for the device, counting its other live
+            // sockets in the per-device set, so multi-WS devices are handled
+            // correctly even after DO hibernation.
             if (
               att.deviceType === 'host' &&
               this.countOtherActiveWsForDevice(att.deviceId, ws) === 0
@@ -1106,12 +1228,15 @@ export class SignalingDO implements DurableObject {
           }
         } else {
           activeCount++;
+          if (att.authenticated && att.deviceId && isLive(ws, att)) liveDeviceIds.add(att.deviceId);
         }
       }
     }
 
     // Purge expired pairing codes
     this.cleanExpiredPairings();
+
+    this.purgeUnpairedHosts(now, liveDeviceIds);
 
     // Time out connect_requests the host never answered [SB-1001]
     this.expireSignalingSessions(now);
@@ -1123,20 +1248,50 @@ export class SignalingDO implements DurableObject {
       .exec('SELECT MIN(expires_at) AS next FROM signaling_sessions')
       .toArray()[0]?.['next'];
     if (typeof pending === 'number') next = Math.min(next, pending);
+    // Keep the unpaired-host purge scheduled; clamp so a host that was skipped
+    // (live socket, pending pairing) can't re-fire the alarm in a hot loop.
+    // Rows with a pairing session or pending_pair_complete are left out: the
+    // session schedules its own expiry alarm, and pending_pair_complete has no
+    // TTL, so counting it would wake an idle DO every interval forever.
+    const oldest = this.sql
+      .exec(`SELECT MIN(created_at) AS oldest FROM devices WHERE ${PURGEABLE_HOST_WHERE}`)
+      .toArray()[0]?.['oldest'];
+    if (typeof oldest === 'number') {
+      const due = oldest * 1000 + UNPAIRED_HOST_TTL_S * 1000 + ALARM_INTERVAL_MS;
+      next = Math.min(next, Math.max(due, Date.now() + ALARM_INTERVAL_MS));
+    }
     if (next !== Infinity) {
       await this.state.storage.setAlarm(next);
     }
   }
 
   /**
-   * Schedule the cleanup alarm if not already scheduled.
-   * Called on first WebSocket connection.
+   * Delete host rows with no pairing that are older than UNPAIRED_HOST_TTL_S,
+   * skipping a host with a pairing session, a held confirming /pair/complete
+   * or a live authenticated socket. `pmux pair` re-registers a purged host.
+   */
+  private purgeUnpairedHosts(now: number, liveDeviceIds: Set<string>): void {
+    const cutoff = Math.floor(now / 1000) - UNPAIRED_HOST_TTL_S;
+    const rows = this.sql
+      .exec(
+        `SELECT id FROM devices WHERE ${PURGEABLE_HOST_WHERE} AND created_at < ?`,
+        cutoff
+      )
+      .toArray();
+    for (const row of rows) {
+      const id = row['id'] as string;
+      if (this.pendingPairs.has(id) || liveDeviceIds.has(id)) continue;
+      this.sql.exec('DELETE FROM devices WHERE id = ?', id);
+    }
+  }
+
+  /**
+   * Ensure the idle sweep runs within ALARM_INTERVAL_MS. Called on each
+   * WebSocket connection; pulls forward a later alarm (e.g. the day-out
+   * unpaired-host purge) so idle sockets are still reaped.
    */
   private async scheduleAlarmIfNeeded(): Promise<void> {
-    const currentAlarm = await this.state.storage.getAlarm();
-    if (!currentAlarm) {
-      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
-    }
+    await this.scheduleAlarmBy(Date.now() + ALARM_INTERVAL_MS);
   }
 
   /**
@@ -1203,38 +1358,21 @@ export class SignalingDO implements DurableObject {
     }
   }
 
-  // --- WebSocket connection count helpers ---
-
-  private incrementWsCount(deviceId: string): void {
-    const current = this.wsConnectionCounts.get(deviceId) ?? 0;
-    this.wsConnectionCounts.set(deviceId, current + 1);
-  }
-
-  private decrementWsCount(deviceId: string): void {
-    const current = this.wsConnectionCounts.get(deviceId) ?? 0;
-    if (current <= 1) {
-      this.wsConnectionCounts.delete(deviceId);
-    } else {
-      this.wsConnectionCounts.set(deviceId, current - 1);
-    }
-  }
-
   /**
-   * Count authenticated WebSocket connections for a device, excluding a
-   * specific WebSocket (typically the one that is closing or erroring).
-   * Reads directly from the runtime's getWebSockets() — the source of truth
-   * for open connections — so it is not affected by stale in-memory counts
-   * that can occur after DO hibernation.
+   * Count live authenticated WebSocket connections for a device, optionally
+   * excluding a specific WebSocket (typically the one that is closing or erroring).
+   * Reads the device's socket set, rebuilt from the runtime's getWebSockets()
+   * once per wake and kept current on auth/close/error/idle-close/device
+   * removal, so it is correct straight after DO hibernation.
    *
    * Safe to use for the auth-time cap check (excludeWs = the socket being
-   * authenticated): the filter requires authenticated === true, so the
-   * not-yet-authenticated current socket is never counted, regardless of
-   * whether it already appears in getWebSockets().
+   * authenticated): a socket joins the set only once it authenticates, so the
+   * current socket is never counted.
    */
-  private countOtherActiveWsForDevice(deviceId: string, excludeWs: WebSocket): number {
-    if (!this.state.getWebSockets) return 0;
+  private countOtherActiveWsForDevice(deviceId: string, excludeWs?: WebSocket): number {
+    this.ensureConnectionCache();
     let count = 0;
-    for (const ws of this.state.getWebSockets()) {
+    for (const ws of this.deviceSockets.get(deviceId) ?? []) {
       if (ws === excludeWs) continue;
       const att = ws.deserializeAttachment() as WsAttachment | null;
       if (att?.authenticated && att.deviceId === deviceId && isLive(ws, att)) count++;
@@ -1254,12 +1392,18 @@ export class SignalingDO implements DurableObject {
 
       // The socket may have been closed during the await; don't overwrite its
       // closed attachment with a fresh authenticated one [SB-1393]
-      if (!isLive(ws, ws.deserializeAttachment() as WsAttachment | null)) return;
+      const current = ws.deserializeAttachment() as WsAttachment | null;
+      if (!isLive(ws, current)) return;
+      // A concurrent auth frame on this socket finished first
+      if (current?.authenticated) {
+        wsSend(ws, { type: 'error', error: 'Already authenticated' });
+        return;
+      }
 
-      // Check WebSocket connection limit per device. Count from getWebSockets()
-      // (the runtime source of truth) rather than the in-memory wsConnectionCounts
-      // map, which is empty after DO hibernation and would let a device bypass the
-      // cap by timing connections to hit a hibernated DO [SB-993].
+      // Check WebSocket connection limit per device. Count from the per-device
+      // socket set, rebuilt from getWebSockets() on the first lookup after a
+      // wake, so a device can't bypass the cap by timing connections to hit a
+      // hibernated DO [SB-993].
       const currentCount = this.countOtherActiveWsForDevice(payload.deviceId, ws);
       if (currentCount >= MAX_WS_CONNECTIONS_PER_DEVICE) {
         console.warn(
@@ -1278,22 +1422,23 @@ export class SignalingDO implements DurableObject {
         return;
       }
 
+      // The type comes from the stored row, not the token
       const attachment: WsAttachment = {
         deviceId: payload.deviceId,
-        deviceType: payload.deviceType,
+        deviceType: device.deviceType,
         authenticated: true,
         lastMessageTime: Date.now(),
       };
       ws.serializeAttachment(attachment);
 
-      // Update in-memory cache and connection count
+      // Update in-memory cache and socket set
       this.connections.set(payload.deviceId, ws);
-      this.incrementWsCount(payload.deviceId);
+      this.addDeviceSocket(payload.deviceId, ws);
 
       // Update device name if provided in auth message
       const validName = validateDeviceName(name);
 
-      if (validName && payload.deviceType === 'mobile') {
+      if (validName && device.deviceType === 'mobile') {
         const nameChanged = device.name !== validName;
         this.updateDeviceName(payload.deviceId, validName);
         if (nameChanged) {
@@ -1306,12 +1451,12 @@ export class SignalingDO implements DurableObject {
             });
           }
         }
-      } else if (validName && payload.deviceType === 'host') {
+      } else if (validName && device.deviceType === 'host') {
         this.updateDeviceName(payload.deviceId, validName);
       }
 
       // If host, notify the paired mobile of host_online (with name from DB)
-      if (payload.deviceType === 'host') {
+      if (device.deviceType === 'host') {
         const hostOnlineMsg: HostOnlineMessage = {
           type: 'host_online',
           deviceId: payload.deviceId,
@@ -1342,7 +1487,7 @@ export class SignalingDO implements DurableObject {
         if (pending) {
           if (pairedMobileId === pending['mobile_device_id']) {
             // Broadcast to ALL host connections (this newly authed socket is
-            // already in getWebSockets() with an authenticated attachment),
+            // already in the device's socket set),
             // matching the live-delivery invariant for agent + pair CLI.
             this.notifyDevice(payload.deviceId, {
               type: 'pair_complete',
@@ -1363,24 +1508,24 @@ export class SignalingDO implements DurableObject {
       }
 
       // If mobile, send current presence snapshot for all paired hosts that are connected.
-      if (payload.deviceType === 'mobile') {
+      if (device.deviceType === 'mobile') {
         const pairedHosts = this.getHostsForMobile(payload.deviceId);
         for (const hostDeviceId of pairedHosts) {
           if (this.findFreshWebSocket(hostDeviceId)) {
-            const device = this.getDevice(hostDeviceId);
+            const hostDevice = this.getDevice(hostDeviceId);
             const msg: HostOnlineMessage = { type: 'host_online', deviceId: hostDeviceId, ts: Date.now() };
-            if (device?.name) {
-              msg.name = device.name;
+            if (hostDevice?.name) {
+              msg.name = hostDevice.name;
             }
             wsSend(ws, msg);
           }
         }
-        // Re-assert this WS as the cached connection. The findWebSocket() calls
-        // above may trigger rebuildConnectionCache() after DO hibernation, which
-        // can overwrite this device's cache entry with a stale closing WebSocket
-        // (e.g., a presence WS from HostListScreen that is still in
-        // getWebSockets() but mid-close). Re-setting here guarantees the freshly
-        // authenticated WS is always the routable entry.
+        // Re-assert this WS as the cached connection. The socket caches are
+        // rebuilt at most once per wake, by the cap check above (before this
+        // socket authenticated), and the host lookups above re-cache only host
+        // entries. Re-setting here keeps the freshly authenticated WS the
+        // routable entry over an older sibling (e.g., a presence WS from
+        // HostListScreen that is mid-close).
         this.connections.set(payload.deviceId, ws);
 
         wsSend(ws, { type: 'auth', status: 'ok' });
@@ -1550,10 +1695,8 @@ export class SignalingDO implements DurableObject {
    * Returns: { nonce } (base64, 32 random bytes, 60s TTL)
    */
   private async handleChallenge(request: Request): Promise<Response> {
-    let body: { deviceId?: unknown };
-    try {
-      body = await request.json() as typeof body;
-    } catch {
+    const body = await readJsonObject<{ deviceId?: unknown }>(request);
+    if (!body) {
       return jsonResponse({ error: 'Invalid JSON' }, 400);
     }
 
@@ -1576,7 +1719,7 @@ export class SignalingDO implements DurableObject {
    * requested, telling the host this server holds /pair/complete for its decision.
    */
   private async handlePairInitiate(request: Request): Promise<Response> {
-    let body: {
+    const body = await readJsonObject<{
       deviceId?: string;
       ed25519PublicKey?: string;
       x25519PublicKey?: string;
@@ -1584,10 +1727,8 @@ export class SignalingDO implements DurableObject {
       signature?: string;
       name?: string;
       pairConfirm?: boolean;
-    };
-    try {
-      body = await request.json() as typeof body;
-    } catch {
+    }>(request);
+    if (!body) {
       return jsonResponse({ error: 'Invalid JSON' }, 400);
     }
 
@@ -1597,10 +1738,22 @@ export class SignalingDO implements DurableObject {
         400
       );
     }
+    // Bound to SQL and decoded below, so a non-string must not get that far
+    if (
+      typeof body.deviceId !== 'string' || typeof body.ed25519PublicKey !== 'string' ||
+      typeof body.nonce !== 'string' || typeof body.signature !== 'string'
+    ) {
+      return jsonResponse({ error: 'deviceId, ed25519PublicKey, nonce and signature must be strings' }, 400);
+    }
 
     // Validate name if provided
     if (body.name !== undefined && validateDeviceName(body.name) === undefined) {
       return jsonResponse({ error: 'Name must be a string of 1-64 characters with no control characters' }, 400);
+    }
+
+    // Checked before consumeChallenge so a 400 does not burn the nonce
+    if (!isBase64OfLength(body.x25519PublicKey, 32)) {
+      return jsonResponse({ error: 'Invalid x25519PublicKey' }, 400);
     }
 
     // Consume the nonce challenge (single-use, validates expiry and device binding)
@@ -1612,11 +1765,11 @@ export class SignalingDO implements DurableObject {
     const existing = this.getDevice(body.deviceId);
     const verifyKey = existing ? existing.ed25519PublicKey : body.ed25519PublicKey;
     const message = new TextEncoder().encode(body.deviceId + '|' + body.nonce);
-    const publicKeyBytes = base64ToBytes(verifyKey);
-    const signatureBytes = base64ToBytes(body.signature);
 
     let valid: boolean;
     try {
+      const publicKeyBytes = base64ToBytes(verifyKey);
+      const signatureBytes = base64ToBytes(body.signature);
       valid = await verifyEd25519Signature(publicKeyBytes, message, signatureBytes);
     } catch {
       return jsonResponse({ error: 'Invalid signature format' }, 401);
@@ -1625,9 +1778,20 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Signature verification failed' }, 401);
     }
 
+    // Checked after the signature so an unauthenticated caller learns nothing
+    // about a registered device. Only a host may initiate, and the body key is
+    // what the mobile receives, so it must be the registered one.
+    if (existing && existing.deviceType !== 'host') {
+      return mobileConflictResponse();
+    }
+    if (existing && body.ed25519PublicKey !== existing.ed25519PublicKey) {
+      return jsonResponse({ error: 'ed25519PublicKey does not match the registered key' }, 401);
+    }
+
     // Register the host device if not already registered, or update name
     if (!existing) {
       this.registerDevice(body.deviceId, body.ed25519PublicKey, 'host', body.name);
+      await this.scheduleAlarmBy(Date.now() + UNPAIRED_HOST_TTL_S * 1000 + ALARM_INTERVAL_MS);
     } else if (body.name !== undefined) {
       // Signature already verified against stored key, safe to update name
       this.updateDeviceName(body.deviceId, body.name);
@@ -1661,17 +1825,15 @@ export class SignalingDO implements DurableObject {
    * changes.
    */
   private async handlePairComplete(request: Request): Promise<Response> {
-    let body: {
+    const body = await readJsonObject<{
       pairingCode?: string;
       deviceId?: string;
       ed25519PublicKey?: string;
       x25519PublicKey?: string;
       name?: string;
       pairMac?: string | null;
-    };
-    try {
-      body = await request.json() as typeof body;
-    } catch {
+    }>(request);
+    if (!body) {
       return jsonResponse({ error: 'Invalid JSON' }, 400);
     }
 
@@ -1844,6 +2006,10 @@ export class SignalingDO implements DurableObject {
         hostDeviceId,
         hostName: hostName ?? undefined,
       });
+      // Told first; then its sockets go if its row was removed as an orphan
+      if (this.getDevice(existingMobileId) === null) {
+        this.closeDeviceSockets(existingMobileId, 'Device removed');
+      }
     }
     return true;
   }
@@ -1926,10 +2092,8 @@ export class SignalingDO implements DurableObject {
    * Returns: { token }
    */
   private async handleTokenExchange(request: Request): Promise<Response> {
-    let body: { deviceId?: string; nonce?: string; signature?: string };
-    try {
-      body = await request.json() as typeof body;
-    } catch {
+    const body = await readJsonObject<{ deviceId?: string; nonce?: string; signature?: string }>(request);
+    if (!body) {
       return jsonResponse({ error: 'Invalid JSON' }, 400);
     }
 
@@ -1938,6 +2102,10 @@ export class SignalingDO implements DurableObject {
         { error: 'Missing required fields: deviceId, nonce, signature' },
         400
       );
+    }
+    // Bound to SQL and decoded below, so a non-string must not get that far
+    if (typeof body.deviceId !== 'string' || typeof body.nonce !== 'string' || typeof body.signature !== 'string') {
+      return jsonResponse({ error: 'deviceId, nonce and signature must be strings' }, 400);
     }
 
     // Consume the nonce challenge first (single-use, validates expiry and device binding)
@@ -1953,11 +2121,11 @@ export class SignalingDO implements DurableObject {
 
     // Verify the signature: sign(privateKey, deviceId + "|" + nonce)
     const message = new TextEncoder().encode(body.deviceId + '|' + body.nonce);
-    const publicKeyBytes = base64ToBytes(device.ed25519PublicKey);
-    const signatureBytes = base64ToBytes(body.signature);
 
     let valid: boolean;
     try {
+      const publicKeyBytes = base64ToBytes(device.ed25519PublicKey);
+      const signatureBytes = base64ToBytes(body.signature);
       valid = await verifyEd25519Signature(publicKeyBytes, message, signatureBytes);
     } catch {
       return jsonResponse({ error: 'Invalid signature format' }, 401);
@@ -1989,6 +2157,11 @@ export class SignalingDO implements DurableObject {
     if (!hostDeviceId) {
       return jsonResponse({ error: 'Missing device ID' }, 400);
     }
+    // Both the JWT and the stored row must say host: a JWT issued before the
+    // ID was re-registered as a mobile must not act on that row.
+    if (request.headers.get('X-Device-Type') !== 'host' || this.getDevice(hostDeviceId)?.deviceType === 'mobile') {
+      return jsonResponse({ error: 'Only a host can remove a pairing' }, 403);
+    }
 
     // A held confirming-path request must not commit after the unpair
     this.settlePendingPair(hostDeviceId, pairCancelledResponse());
@@ -2008,6 +2181,11 @@ export class SignalingDO implements DurableObject {
     // Remove pairing (also cleans up orphaned mobile device)
     const removedMobileId = this.removePairing(hostDeviceId);
 
+    // The host row survives; an orphaned mobile's sockets must not
+    if (removedMobileId && this.getDevice(removedMobileId) === null) {
+      this.closeDeviceSockets(removedMobileId, 'Device removed');
+    }
+
     return jsonResponse({ removed: removedMobileId !== null });
   }
 
@@ -2021,6 +2199,11 @@ export class SignalingDO implements DurableObject {
     if (!hostDeviceId) {
       return jsonResponse({ error: 'Missing device ID' }, 400);
     }
+    // Both the JWT and the stored row must say host: a JWT issued before the
+    // ID was re-registered as a mobile must not act on that row.
+    if (request.headers.get('X-Device-Type') !== 'host' || this.getDevice(hostDeviceId)?.deviceType === 'mobile') {
+      return jsonResponse({ error: 'Only a host can remove a device' }, 403);
+    }
 
     // A held confirming-path request must not commit after the uninstall
     this.settlePendingPair(hostDeviceId, pairCancelledResponse());
@@ -2028,6 +2211,7 @@ export class SignalingDO implements DurableObject {
     // Get host device name before removal (for the notification)
     const hostDevice = this.getDevice(hostDeviceId);
     const hostName = hostDevice?.name ?? undefined;
+    const mobileId = this.getPairedMobile(hostDeviceId);
 
     // Notify the paired mobile before removing records
     this.notifyPairedMobile(hostDeviceId, {
@@ -2040,6 +2224,12 @@ export class SignalingDO implements DurableObject {
     // Remove pairing + host device
     const { removedDevice } = this.removeDeviceAndPairing(hostDeviceId);
 
+    // No socket outlives its row: the host's, and an orphaned mobile's
+    this.closeDeviceSockets(hostDeviceId, 'Device removed');
+    if (mobileId && this.getDevice(mobileId) === null) {
+      this.closeDeviceSockets(mobileId, 'Device removed');
+    }
+
     return jsonResponse({ removed: removedDevice });
   }
 
@@ -2051,7 +2241,10 @@ export class SignalingDO implements DurableObject {
    * share one request, and a failed refetch falls back to cached credentials up to
    * TURN_MAX_SERVE_AGE_MS old.
    */
-  private async handleTurnCredentials(): Promise<Response> {
+  private async handleTurnCredentials(deviceId: string, deviceType: string | null): Promise<Response> {
+    if (!this.isPairedDevice(deviceId, deviceType)) {
+      return jsonResponse({ error: 'Device not paired' }, 403);
+    }
     if (!this.turnCache) {
       const stored = await this.state.storage.get<TurnCacheEntry>(TURN_CACHE_KEY);
       this.turnCache ??= stored ?? null;
@@ -2078,7 +2271,11 @@ export class SignalingDO implements DurableObject {
     try {
       const creds = await generateTurnCredentials(this.env);
       this.turnCache = { creds, fetchedAt: Date.now() };
-      await this.state.storage.put(TURN_CACHE_KEY, this.turnCache);
+      try {
+        await this.state.storage.put(TURN_CACHE_KEY, this.turnCache);
+      } catch (err) {
+        console.warn('[turn] Failed to persist TURN cache:', err);
+      }
       return creds;
     } finally {
       this.turnFetch = null;
@@ -2138,6 +2335,32 @@ function base64ToBytes(str: string): Uint8Array {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
+}
+
+function isBase64OfLength(value: unknown, length: number): boolean {
+  if (typeof value !== 'string') return false;
+  try {
+    const binary = atob(value);
+    return binary.length === length && btoa(binary) === value;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Parse a JSON request body that must be an object. Returns null for invalid
+ * JSON and for null, primitive or array bodies, so handlers can read fields
+ * without a TypeError.
+ */
+async function readJsonObject<T extends object>(request: Request): Promise<T | null> {
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return null;
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) return null;
+  return body as T;
 }
 
 function jsonResponse(data: unknown, status = 200): Response {

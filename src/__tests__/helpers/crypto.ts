@@ -21,6 +21,22 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+/** A well-formed 32-byte base64 X25519 public key for /pair/initiate bodies. */
+export const HOST_X25519_KEY = bytesToBase64(new Uint8Array(32).fill(7));
+
+/**
+ * A well-formed 32-byte base64 key derived from a label, for placeholder
+ * /pair/complete keys. The same label always gives the same key; distinct
+ * labels give distinct keys.
+ */
+export function testKey(label: string): string {
+  const bytes = new Uint8Array(32);
+  new TextEncoder().encode(label).forEach((c, i) => {
+    bytes[i % 32] = (bytes[i % 32]! * 31 + c) & 0xff;
+  });
+  return bytesToBase64(bytes);
+}
+
 export async function signEd25519(privateKey: CryptoKey, message: Uint8Array): Promise<Uint8Array> {
   const sig = await crypto.subtle.sign('Ed25519', privateKey, message);
   return new Uint8Array(sig);

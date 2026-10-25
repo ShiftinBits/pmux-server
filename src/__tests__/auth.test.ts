@@ -326,3 +326,45 @@ describe('verifyJWT', () => {
     await expect(verifyJWT(tampered, TEST_SECRET)).rejects.toThrow('missing or mismatched subject');
   });
 });
+
+// --- HMAC key caching ---
+
+describe('JWT HMAC key caching', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('imports the key once per secret across create and verify', async () => {
+    const spy = vi.spyOn(crypto.subtle, 'importKey');
+    const secret = 'cache-test-secret-same';
+
+    const jwt = await createJWT('dev-1', 'host', secret);
+    await createJWT('dev-1', 'host', secret);
+    await verifyJWT(jwt, secret);
+    await verifyJWT(jwt, secret);
+
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('imports again for a different secret', async () => {
+    const spy = vi.spyOn(crypto.subtle, 'importKey');
+
+    await createJWT('dev-1', 'host', 'cache-test-secret-a');
+    await createJWT('dev-1', 'host', 'cache-test-secret-b');
+
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it('evicts a failed import so the next call retries', async () => {
+    const secret = 'cache-test-secret-fail';
+    const spy = vi
+      .spyOn(crypto.subtle, 'importKey')
+      .mockRejectedValueOnce(new Error('import failed'));
+
+    await expect(createJWT('dev-1', 'host', secret)).rejects.toThrow('import failed');
+    const jwt = await createJWT('dev-1', 'host', secret);
+
+    expect(jwt.split('.')).toHaveLength(3);
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+});

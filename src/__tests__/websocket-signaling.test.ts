@@ -161,6 +161,61 @@ describe('WebSocket signaling [T1.8]', () => {
 
       expect(ws.lastMessage()).toEqual({ type: 'error', error: 'Invalid JSON' });
     });
+
+    it('rejects a second auth on an authenticated socket without relabeling it', async () => {
+      const { ws } = await connectAndAuth('agent-1', 'host');
+      const otherToken = await setupDevice('mobile-2', 'mobile');
+      ws.sent.length = 0;
+
+      await doInstance.webSocketMessage(
+        ws as unknown as WebSocket,
+        JSON.stringify({ type: 'auth', token: otherToken })
+      );
+
+      expect(ws.sent).toEqual([{ type: 'error', error: 'Already authenticated' }]);
+      expect(ws.closed).toBe(false);
+      expect(ws.deserializeAttachment()).toMatchObject({ deviceId: 'agent-1', deviceType: 'host', authenticated: true });
+      expect(doInstance.getWsConnectionCount('agent-1')).toBe(1);
+      expect(doInstance.getWsConnectionCount('mobile-2')).toBe(0);
+      expect(doInstance.getConnection('mobile-2')).toBeUndefined();
+    });
+
+    it('counts a socket once when two auth frames race on it', async () => {
+      const token = await setupDevice('agent-1', 'host');
+      const ws = new MockWebSocket();
+      mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
+      const frame = JSON.stringify({ type: 'auth', token });
+
+      await Promise.all([
+        doInstance.webSocketMessage(ws as unknown as WebSocket, frame),
+        doInstance.webSocketMessage(ws as unknown as WebSocket, frame),
+      ]);
+
+      expect(ws.messagesOfType('auth')).toEqual([{ type: 'auth', status: 'ok' }]);
+      expect(ws.messagesOfType('error')).toEqual([{ type: 'error', error: 'Already authenticated' }]);
+      expect(doInstance.getWsConnectionCount('agent-1')).toBe(1);
+    });
+
+    it('takes the attachment deviceType from the devices row, not the JWT', async () => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      doInstance.registerDevice('mobile-1', 'pubkey-mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+      hostWs.sent.length = 0;
+
+      // A JWT claiming host for a device stored as a mobile
+      const token = await createJWT('mobile-1', 'host', JWT_SECRET);
+      const ws = new MockWebSocket();
+      mockState.acceptedWebSockets.push(ws as unknown as WebSocket);
+      await doInstance.webSocketMessage(ws as unknown as WebSocket, JSON.stringify({ type: 'auth', token }));
+
+      expect(ws.deserializeAttachment()).toMatchObject({ deviceId: 'mobile-1', deviceType: 'mobile', authenticated: true });
+      // The mobile branch ran: presence snapshot for the paired host
+      expect(ws.messagesOfType('host_online')).toEqual([
+        expect.objectContaining({ type: 'host_online', deviceId: 'agent-1' }),
+      ]);
+      expect(ws.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+      expect(hostWs.messagesOfType('host_online')).toHaveLength(0);
+    });
   });
 
   describe('presence', () => {
@@ -656,9 +711,9 @@ describe('WebSocket signaling [T1.8]', () => {
     });
 
     it('emits host_offline when the last host WS closes (post-hibernation stale count)', async () => {
-      // After DO hibernation, wsConnectionCounts is reset to empty. This test
-      // verifies that host_offline is still sent correctly even when the in-memory
-      // count is stale (0), because we rely on getWebSockets() as the source of truth.
+      // After DO hibernation the in-memory socket sets are empty. This test
+      // verifies that host_offline is still sent correctly, because the first
+      // lookup after a wake rebuilds them from getWebSockets().
       doInstance.registerDevice('agent-stale', 'pubkey-agent-stale', 'host');
       doInstance.registerDevice('mobile-stale', 'pubkey-mobile-stale', 'mobile');
       doInstance.createPairing('agent-stale', 'mobile-stale');
@@ -680,13 +735,13 @@ describe('WebSocket signaling [T1.8]', () => {
 
       mobileWs.sent.length = 0;
 
-      // Simulate DO hibernation: clear in-memory wsConnectionCounts (counts reset to 0)
+      // Simulate DO hibernation: clear the in-memory socket sets
       doInstance.clearWsConnectionCounts();
 
       // Host WS closes (e.g., fires after DO wakes from hibernation)
       await doInstance.webSocketClose(hostWs as unknown as WebSocket, 1000, 'connection lost', true);
 
-      // Mobile SHOULD see host_offline even with stale (zeroed) in-memory count
+      // Mobile SHOULD see host_offline even though the sets were emptied
       expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
     });
 
@@ -1253,11 +1308,11 @@ describe('WebSocket signaling [T1.8]', () => {
         expect(ws.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
       }
 
-      // Simulate DO hibernation: the in-memory count map is wiped, but the 5
-      // sockets remain live in getWebSockets(). The stale map would read 0.
+      // Simulate DO hibernation: the in-memory socket sets are wiped, but the 5
+      // sockets remain live in getWebSockets()
       doInstance.clearWsConnectionCounts();
 
-      // 6th connection must STILL be rejected (count read from source of truth)
+      // 6th connection must STILL be rejected (sets rebuilt from getWebSockets())
       const ws6 = new MockWebSocket();
       await doInstance.webSocketMessage(
         ws6 as unknown as WebSocket,
@@ -1595,6 +1650,33 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(mobileWs.messagesOfType('host_online')).toHaveLength(1);
     });
 
+    it.each([
+      ['null', 'null'],
+      ['a number', '42'],
+      ['a string literal', '"hello"'],
+      ['an array', '[]'],
+    ])('rejects %s frames without touching or re-announcing', async (_label, frame) => {
+      const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
+      const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
+      doInstance.createPairing('agent-1', 'mobile-1');
+
+      const staleTime = Date.now() - 10 * 60 * 1000;
+      hostWs.serializeAttachment({
+        deviceId: 'agent-1',
+        deviceType: 'host',
+        authenticated: true,
+        lastMessageTime: staleTime,
+      });
+      mobileWs.sent.length = 0;
+      hostWs.sent.length = 0;
+
+      await expect(doInstance.webSocketMessage(hostWs as unknown as WebSocket, frame)).resolves.toBeUndefined();
+
+      expect(hostWs.messagesOfType('error')).toHaveLength(1);
+      expect((hostWs.deserializeAttachment() as { lastMessageTime?: number }).lastMessageTime).toBe(staleTime);
+      expect(mobileWs.messagesOfType('host_online')).toHaveLength(0);
+    });
+
     it('stamps ts on the re-announced host_online [SB-1375]', async () => {
       at(FIXED_NOW);
       const { ws: hostWs } = await connectAndAuth('agent-1', 'host');
@@ -1621,14 +1703,9 @@ describe('WebSocket signaling [T1.8]', () => {
       const { ws: staleHostWs } = await connectAndAuth('agent-1', 'host');
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
       doInstance.createPairing('agent-1', 'mobile-1');
-      const freshHostWs = new MockWebSocket();
-      freshHostWs.serializeAttachment({
-        deviceId: 'agent-1',
-        deviceType: 'host',
-        authenticated: true,
-        lastMessageTime: Date.now(),
-      });
-      mockState.acceptedWebSockets.push(freshHostWs as unknown as WebSocket);
+      await connectAndAuth('agent-1', 'host');
+      // The cache holds the stale socket; the fresh sibling is only in the device's set
+      doInstance.setConnection('agent-1', staleHostWs as unknown as WebSocket);
 
       staleHostWs.serializeAttachment({
         deviceId: 'agent-1',
@@ -1643,7 +1720,7 @@ describe('WebSocket signaling [T1.8]', () => {
       expect(mobileWs.messagesOfType('host_online')).toHaveLength(0);
     });
 
-    it('announces host_online once when a stale host socket re-authenticates [SB-1004]', async () => {
+    it('announces host_online once when a stale host socket sends a rejected re-auth [SB-1004]', async () => {
       const { ws: hostWs, token } = await connectAndAuth('agent-1', 'host');
       const { ws: mobileWs } = await connectAndAuth('mobile-1', 'mobile');
       doInstance.createPairing('agent-1', 'mobile-1');
@@ -1655,10 +1732,12 @@ describe('WebSocket signaling [T1.8]', () => {
         lastMessageTime: Date.now() - 10 * 60 * 1000,
       });
       mobileWs.sent.length = 0;
+      hostWs.sent.length = 0;
 
       await doInstance.webSocketMessage(hostWs as unknown as WebSocket, JSON.stringify({ type: 'auth', token }));
 
       expect(mobileWs.messagesOfType('host_online')).toHaveLength(1);
+      expect(hostWs.sent).toEqual([{ type: 'error', error: 'Already authenticated' }]);
     });
   });
 
@@ -2201,5 +2280,126 @@ describe('connect attempt ID [SB-1375]', () => {
 
     const cols = sql.exec('PRAGMA table_info(signaling_sessions)').toArray().map((c) => c['name']);
     expect(cols).toContain('attempt_id');
+  });
+});
+
+describe('unpaired host purge', () => {
+  const T0 = 1_800_000_000_000;
+  const DAY_S = 86_400;
+  const old = Math.floor(T0 / 1000) - DAY_S - 10;
+
+  const backdate = (id: string, createdAt = old): void => {
+    doInstance['sql'].exec('UPDATE devices SET created_at = ? WHERE id = ?', createdAt, id);
+  };
+  const exists = (id: string): boolean => doInstance.getDevice(id) !== null;
+
+  beforeEach(() => {
+    at(T0);
+  });
+
+  it('purges an old never-paired host and keeps everything else', async () => {
+    doInstance.registerDevice('stale-host', 'pk1', 'host');
+    doInstance.registerDevice('paired-host', 'pk2', 'host');
+    doInstance.registerDevice('paired-mobile', 'pk3', 'mobile');
+    doInstance.createPairing('paired-host', 'paired-mobile');
+    doInstance.registerDevice('recent-host', 'pk4', 'host');
+    doInstance.registerDevice('session-host', 'pk5', 'host');
+    doInstance['sql'].exec(
+      'INSERT INTO pairing_sessions (code, host_device_id, host_x25519_public_key, host_ed_public_key, expires_at, pair_confirm) VALUES (?, ?, ?, ?, ?, 0)',
+      'ABCDEF', 'session-host', 'x', 'e', T0 + 60_000
+    );
+    doInstance.registerDevice('held-host', 'pk6', 'host');
+    doInstance['pendingPairs'].set('held-host', {} as never);
+    doInstance.registerDevice('old-mobile', 'pk8', 'mobile');
+    for (const id of ['stale-host', 'paired-host', 'paired-mobile', 'session-host', 'held-host', 'old-mobile']) {
+      backdate(id);
+    }
+    const { ws } = await connectAndAuth('live-host', 'host');
+    backdate('live-host');
+    ws.serializeAttachment({ ...(ws.deserializeAttachment() as object), lastMessageTime: T0 });
+
+    await doInstance.alarm();
+
+    expect(exists('stale-host')).toBe(false);
+    for (const id of ['paired-host', 'paired-mobile', 'recent-host', 'session-host', 'held-host', 'live-host', 'old-mobile']) {
+      expect(exists(id)).toBe(true);
+    }
+  });
+
+  it('reschedules with no sockets while an unpaired host remains, never earlier than one interval', async () => {
+    doInstance.registerDevice('host-a', 'pk1', 'host');
+    const created = Math.floor(T0 / 1000);
+    await doInstance.alarm();
+
+    expect(mockState.scheduledAlarm).toBe(created * 1000 + DAY_S * 1000 + 30_000);
+  });
+
+  it('clamps the reschedule for a skipped host to now + one interval', async () => {
+    doInstance.registerDevice('held-host', 'pk1', 'host');
+    doInstance['pendingPairs'].set('held-host', {} as never);
+    backdate('held-host');
+
+    await doInstance.alarm();
+
+    expect(exists('held-host')).toBe(true);
+    expect(mockState.scheduledAlarm).toBe(T0 + 30_000);
+  });
+
+  it('purges a backdated never-paired host when the scheduled alarm fires', async () => {
+    doInstance.registerDevice('host-a', 'pk1', 'host');
+    await doInstance.alarm();
+    const fireAt = mockState.scheduledAlarm!;
+
+    at(fireAt);
+    await doInstance.alarm();
+
+    expect(exists('host-a')).toBe(false);
+  });
+
+  it('does not reschedule with no unpaired hosts and no sockets', async () => {
+    doInstance.registerDevice('paired-host', 'pk2', 'host');
+    doInstance.registerDevice('paired-mobile', 'pk3', 'mobile');
+    doInstance.createPairing('paired-host', 'paired-mobile');
+
+    await doInstance.alarm();
+
+    expect(mockState.scheduledAlarm).toBeNull();
+  });
+
+  it('does not reschedule for a host held only by a pending_pair_complete row', async () => {
+    doInstance.registerDevice('held-host', 'pk1', 'host');
+    doInstance['sql'].exec(
+      'INSERT INTO pending_pair_complete (host_device_id, mobile_device_id, mobile_x25519_public_key, mobile_name, created_at) VALUES (?, ?, ?, ?, ?)',
+      'held-host', 'mobile-x', 'x', null, T0
+    );
+    backdate('held-host');
+
+    await doInstance.alarm();
+
+    expect(exists('held-host')).toBe(true);
+    expect(mockState.scheduledAlarm).toBeNull();
+  });
+
+  it('a new socket pulls a day-out purge alarm forward to one interval', async () => {
+    doInstance.registerDevice('host-a', 'pk1', 'host');
+    await doInstance.alarm();
+    expect(mockState.scheduledAlarm).toBeGreaterThan(T0 + 30_000);
+
+    await doInstance['scheduleAlarmIfNeeded']();
+
+    expect(mockState.scheduledAlarm).toBe(T0 + 30_000);
+  });
+
+  it('purges an old host that paired and then unpaired', async () => {
+    doInstance.registerDevice('unpaired-host', 'pk1', 'host');
+    doInstance.registerDevice('gone-mobile', 'pk2', 'mobile');
+    doInstance.createPairing('unpaired-host', 'gone-mobile');
+    doInstance.removePairing('unpaired-host');
+    backdate('unpaired-host');
+
+    await doInstance.alarm();
+
+    expect(exists('unpaired-host')).toBe(false);
+    expect(mockState.scheduledAlarm).toBeNull();
   });
 });

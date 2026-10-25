@@ -10,7 +10,7 @@ import {
 } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
-import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge } from './helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from './helpers/crypto';
 
 /** Pad an arbitrary string to a 32-hex device ID (test-only helper). */
 function toHex32(s: string): string {
@@ -70,7 +70,7 @@ describe('DO rate limiting integration', () => {
       for (let i = 0; i < 10; i++) {
         const keys = await generateEd25519Keypair();
         const body = await signedPairInitiateBodyWithChallenge(
-          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
+          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
         );
         const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
@@ -82,7 +82,7 @@ describe('DO rate limiting integration', () => {
       for (let i = 0; i < 10; i++) {
         const keys = await generateEd25519Keypair();
         const body = await signedPairInitiateBodyWithChallenge(
-          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
+          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
         );
         const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
@@ -91,8 +91,8 @@ describe('DO rate limiting integration', () => {
       // 11th should be rate limited (body doesn't matter — 429 fires before handler)
       const { status, data, response } = await postJSON('/pair/initiate', {
         deviceId: 'agent-overflow',
-        ed25519PublicKey: 'pub-key-overflow',
-        x25519PublicKey: 'x25519-key-overflow',
+        ed25519PublicKey: testKey('pub-key-overflow'),
+        x25519PublicKey: HOST_X25519_KEY,
       });
       expect(status).toBe(429);
       expect(data['error']).toBe('Too many requests');
@@ -104,7 +104,7 @@ describe('DO rate limiting integration', () => {
       for (let i = 0; i < 10; i++) {
         const keys = await generateEd25519Keypair();
         const body = await signedPairInitiateBodyWithChallenge(
-          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
+          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
         );
         await postJSON('/pair/initiate', body);
       }
@@ -113,8 +113,8 @@ describe('DO rate limiting integration', () => {
       const { status } = await postJSON('/pair/complete', {
         pairingCode: 'ABCDEF',
         deviceId: 'mobile-1',
-        ed25519PublicKey: 'pub-key-mobile',
-        x25519PublicKey: 'x25519-key-mobile',
+        ed25519PublicKey: testKey('pub-key-mobile'),
+        x25519PublicKey: testKey('x25519-key-mobile'),
       });
       // 404 because the pairing code is invalid, but NOT 429
       expect(status).toBe(404);
@@ -125,7 +125,7 @@ describe('DO rate limiting integration', () => {
       for (let i = 0; i < 10; i++) {
         const keys = await generateEd25519Keypair();
         const body = await signedPairInitiateBodyWithChallenge(
-          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), `x25519-key-${i}`
+          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
         );
         await postJSON('/pair/initiate', body, { 'X-Client-IP': '10.0.0.1' });
       }
@@ -133,15 +133,15 @@ describe('DO rate limiting integration', () => {
       // IP 1 is blocked
       const blocked = await postJSON('/pair/initiate', {
         deviceId: 'agent-blocked',
-        ed25519PublicKey: 'pub-key-blocked',
-        x25519PublicKey: 'x25519-key-blocked',
+        ed25519PublicKey: testKey('pub-key-blocked'),
+        x25519PublicKey: HOST_X25519_KEY,
       }, { 'X-Client-IP': '10.0.0.1' });
       expect(blocked.status).toBe(429);
 
       // IP 2 is still allowed
       const keys = await generateEd25519Keypair();
       const body = await signedPairInitiateBodyWithChallenge(
-        doInstance, toHex32('agent-allowed'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-allowed'
+        doInstance, toHex32('agent-allowed'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
       );
       const allowed = await postJSON('/pair/initiate', body, { 'X-Client-IP': '10.0.0.2' });
       expect(allowed.status).toBe(200);
@@ -275,11 +275,6 @@ describe('WebSocket connection limits', () => {
     const sockets: MockWebSocket[] = [];
     for (let i = 0; i < MAX_WS_CONNECTIONS_PER_DEVICE; i++) {
       const ws = new MockWebSocket();
-      ws.serializeAttachment({
-        deviceId: 'agent-1',
-        deviceType: 'host',
-        authenticated: true,
-      });
       await doInstance.webSocketMessage(
         ws as unknown as WebSocket,
         JSON.stringify({ type: 'auth', token })
@@ -392,7 +387,7 @@ describe('pairing code expiry enforcement', () => {
     // Create pairing session
     const keys = await generateEd25519Keypair();
     const body = await signedPairInitiateBodyWithChallenge(
-      doInstance, toHex32('agent-1'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-agent'
+      doInstance, toHex32('agent-1'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
     );
     const initResult = await postJSON('/pair/initiate', body);
     const code = initResult.data['pairingCode'] as string;
@@ -403,8 +398,8 @@ describe('pairing code expiry enforcement', () => {
     const { status, data } = await postJSON('/pair/complete', {
       pairingCode: code,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'pub-key-mobile',
-      x25519PublicKey: 'x25519-key-mobile',
+      ed25519PublicKey: testKey('pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-key-mobile'),
     });
 
     expect(status).toBe(404);
@@ -414,7 +409,7 @@ describe('pairing code expiry enforcement', () => {
   it('accepts pairing code within 5-minute window', async () => {
     const keys = await generateEd25519Keypair();
     const body = await signedPairInitiateBodyWithChallenge(
-      doInstance, toHex32('agent-1'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-agent'
+      doInstance, toHex32('agent-1'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
     );
     const initResult = await postJSON('/pair/initiate', body);
     const code = initResult.data['pairingCode'] as string;
@@ -425,8 +420,8 @@ describe('pairing code expiry enforcement', () => {
     const { status } = await postJSON('/pair/complete', {
       pairingCode: code,
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'pub-key-mobile',
-      x25519PublicKey: 'x25519-key-mobile',
+      ed25519PublicKey: testKey('pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-key-mobile'),
     });
 
     expect(status).toBe(200);
@@ -466,7 +461,7 @@ describe('legitimate usage patterns', () => {
     // A normal user: 1 pair/initiate + 1 pair/complete
     const keys = await generateEd25519Keypair();
     const body = await signedPairInitiateBodyWithChallenge(
-      doInstance, toHex32('agent-1'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), 'x25519-key-agent'
+      doInstance, toHex32('agent-1'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
     );
     const initResult = await postJSON('/pair/initiate', body);
     expect(initResult.status).toBe(200);
@@ -474,8 +469,8 @@ describe('legitimate usage patterns', () => {
     const { status } = await postJSON('/pair/complete', {
       pairingCode: initResult.data['pairingCode'],
       deviceId: 'mobile-1',
-      ed25519PublicKey: 'pub-key-mobile',
-      x25519PublicKey: 'x25519-key-mobile',
+      ed25519PublicKey: testKey('pub-key-mobile'),
+      x25519PublicKey: testKey('x25519-key-mobile'),
     });
     expect(status).toBe(200);
   });

@@ -664,6 +664,192 @@ describe('Signaling server efficiency [T3.10]', () => {
   });
 });
 
+// The socket caches are rebuilt from getWebSockets() once per wake; every later
+// lookup reads the per-device socket sets instead of rescanning.
+describe('socket cache rebuilt once per wake', () => {
+  const asWs = (ws: MockWebSocket): WebSocket => ws as unknown as WebSocket;
+  const connectRequest = (target: string): string =>
+    JSON.stringify({ type: 'connect_request', targetDeviceId: target });
+
+  /** Spy on the DO's getWebSockets(), then force (and prove) the one rebuild. */
+  function spyAfterRebuild(): ReturnType<typeof vi.spyOn> {
+    const scans = vi.spyOn(mockDOState, 'getWebSockets');
+    doInstance.getConnection('nobody');
+    expect(scans).toHaveBeenCalledTimes(1);
+    scans.mockClear();
+    return scans;
+  }
+
+  it('does not rescan for a connect_request to an offline host', async () => {
+    doInstance.registerDevice('off-host', 'pubkey-off-host', 'host');
+    const scans = spyAfterRebuild();
+    const { ws: mobileWs } = await connectAndAuth('eff-mobile', 'mobile');
+    doInstance.createPairing('off-host', 'eff-mobile');
+
+    await doInstance.webSocketMessage(asWs(mobileWs), connectRequest('off-host'));
+
+    expect(mobileWs.messagesOfType('host_offline')).toHaveLength(1);
+    expect(scans).not.toHaveBeenCalled();
+  });
+
+  it('does not rescan when a mobile with offline paired hosts authenticates', async () => {
+    const token = await setupDevice('eff-mobile', 'mobile');
+    for (let i = 0; i < 10; i++) {
+      doInstance.registerDevice(`off-host-${i}`, `pubkey-off-host-${i}`, 'host');
+      doInstance.createPairing(`off-host-${i}`, 'eff-mobile');
+    }
+    const scans = spyAfterRebuild();
+    const mobileWs = new MockWebSocket();
+    mockDOState.acceptedWebSockets.push(asWs(mobileWs));
+
+    await doInstance.webSocketMessage(asWs(mobileWs), JSON.stringify({ type: 'auth', token }));
+
+    expect(mobileWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+    expect(mobileWs.messagesOfType('host_online')).toHaveLength(0);
+    expect(scans).not.toHaveBeenCalled();
+  });
+
+  it('does not rescan for an ice_candidate relayed to a departed peer', async () => {
+    const scans = spyAfterRebuild();
+    const { ws: hostWs } = await connectAndAuth('eff-host', 'host');
+    const { ws: mobileWs } = await connectAndAuth('eff-mobile', 'mobile');
+    doInstance.createPairing('eff-host', 'eff-mobile');
+    mockDOState.acceptedWebSockets.splice(mockDOState.acceptedWebSockets.indexOf(asWs(mobileWs)), 1);
+    await doInstance.webSocketClose(asWs(mobileWs), 1000, 'bye', true);
+
+    await doInstance.webSocketMessage(
+      asWs(hostWs),
+      JSON.stringify({ type: 'ice_candidate', candidate: 'candidate:1', targetDeviceId: 'eff-mobile' })
+    );
+
+    expect(hostWs.messagesOfType('peer_unavailable')).toHaveLength(1);
+    expect(scans).not.toHaveBeenCalled();
+  });
+
+  it('scans once in total when 500 sockets authenticate after a wake', async () => {
+    const tokens: string[] = [];
+    for (let d = 0; d < 100; d++) tokens.push(await setupDevice(`load-host-${d}`, 'host'));
+    doInstance.clearWsConnectionCounts();
+    const scans = vi.spyOn(mockDOState, 'getWebSockets');
+
+    const sockets: MockWebSocket[] = [];
+    for (let i = 0; i < 500; i++) {
+      const ws = new MockWebSocket();
+      sockets.push(ws);
+      mockDOState.acceptedWebSockets.push(asWs(ws));
+      await doInstance.webSocketMessage(asWs(ws), JSON.stringify({ type: 'auth', token: tokens[i % 100]! }));
+    }
+
+    expect(scans).toHaveBeenCalledTimes(1);
+    expect(sockets.every((ws) => ws.messagesOfType('auth').length === 1 && !ws.closed)).toBe(true);
+    expect(doInstance.getWsConnectionCount('load-host-0')).toBe(5);
+  });
+
+  it('enforces the per-device cap after a wake', async () => {
+    for (let i = 0; i < 5; i++) await connectAndAuth('cap-host', 'host');
+    doInstance.clearWsConnectionCounts();
+    const scans = vi.spyOn(mockDOState, 'getWebSockets');
+
+    const { ws: sixth } = await connectAndAuth('cap-host', 'host');
+
+    expect(sixth.closeCode).toBe(1008);
+    expect(doInstance.getWsConnectionCount('cap-host')).toBe(5);
+    expect(scans).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a sibling socket routable after the cached socket closes', async () => {
+    const scans = spyAfterRebuild();
+    const { ws: olderWs } = await connectAndAuth('eff-host', 'host');
+    const { ws: cachedWs } = await connectAndAuth('eff-host', 'host');
+    const { ws: mobileWs } = await connectAndAuth('eff-mobile', 'mobile');
+    doInstance.createPairing('eff-host', 'eff-mobile');
+    mockDOState.acceptedWebSockets.splice(mockDOState.acceptedWebSockets.indexOf(asWs(cachedWs)), 1);
+    await doInstance.webSocketClose(asWs(cachedWs), 1000, 'bye', true);
+    mobileWs.sent = [];
+
+    await doInstance.webSocketMessage(asWs(mobileWs), connectRequest('eff-host'));
+
+    expect(olderWs.messagesOfType('connect_request')).toHaveLength(1);
+    expect(mobileWs.messagesOfType('host_offline')).toHaveLength(0);
+    expect(doInstance.getConnection('eff-host')).toBe(olderWs);
+    expect(scans).not.toHaveBeenCalled();
+  });
+
+  it('notifies every socket of a multi-socket device after a wake', async () => {
+    const { ws: agentWs } = await connectAndAuth('eff-host', 'host');
+    const { ws: cliWs } = await connectAndAuth('eff-host', 'host');
+    const token = await setupDevice('eff-mobile', 'mobile');
+    doInstance.createPairing('eff-host', 'eff-mobile');
+    doInstance.clearWsConnectionCounts();
+    const mobileWs = new MockWebSocket();
+    mockDOState.acceptedWebSockets.push(asWs(mobileWs));
+
+    await doInstance.webSocketMessage(asWs(mobileWs), JSON.stringify({ type: 'auth', token, name: 'Renamed Phone' }));
+
+    for (const ws of [agentWs, cliWs]) {
+      expect(ws.messagesOfType('mobile_name_updated')).toEqual([
+        { type: 'mobile_name_updated', deviceId: 'eff-mobile', name: 'Renamed Phone' },
+      ]);
+    }
+  });
+
+  it.each(['close', 'error'] as const)(
+    'does not route to a socket whose %s is the first event after a wake',
+    async (event) => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { ws: olderWs } = await connectAndAuth('eff-host', 'host');
+      const { ws: gone } = await connectAndAuth('eff-host', 'host');
+      const { ws: mobileWs } = await connectAndAuth('eff-mobile', 'mobile');
+      doInstance.createPairing('eff-host', 'eff-mobile');
+      // A real wake also empties the 1:1 cache
+      doInstance.removeConnection('eff-host');
+      doInstance.removeConnection('eff-mobile');
+      doInstance.clearWsConnectionCounts();
+      const scans = vi.spyOn(mockDOState, 'getWebSockets');
+
+      if (event === 'close') {
+        await doInstance.webSocketClose(asWs(gone), 1000, 'bye', true);
+      } else {
+        await doInstance.webSocketError(asWs(gone), new Error('reset'));
+      }
+      mobileWs.sent = [];
+      await doInstance.webSocketMessage(asWs(mobileWs), connectRequest('eff-host'));
+
+      expect(gone.messagesOfType('connect_request')).toHaveLength(0);
+      expect(olderWs.messagesOfType('connect_request')).toHaveLength(1);
+      expect(doInstance.getConnection('eff-host')).toBe(olderWs);
+      expect(doInstance.getWsConnectionCount('eff-host')).toBe(1);
+      expect(scans).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  // The runtime reports the socket as CLOSED by the time webSocketClose runs
+  // (auto-reply to close), so the wake rebuild already leaves it out
+  it.each(['close', 'error'] as const)(
+    'keeps the sibling counted when an already-closed socket\'s %s is the first event after a wake',
+    async (event) => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { ws: olderWs } = await connectAndAuth('eff-host', 'host');
+      const { ws: gone } = await connectAndAuth('eff-host', 'host');
+      const { ws: mobileWs } = await connectAndAuth('eff-mobile', 'mobile');
+      doInstance.createPairing('eff-host', 'eff-mobile');
+      doInstance.removeConnection('eff-host');
+      doInstance.clearWsConnectionCounts();
+      gone.readyState = 3;
+
+      if (event === 'close') {
+        await doInstance.webSocketClose(asWs(gone), 1000, 'bye', true);
+      } else {
+        await doInstance.webSocketError(asWs(gone), new Error('reset'));
+      }
+
+      expect(doInstance.getWsConnectionCount('eff-host')).toBe(1);
+      expect(doInstance.getConnection('eff-host')).toBe(olderWs);
+      expect(mobileWs.messagesOfType('host_offline')).toHaveLength(0);
+    }
+  );
+});
+
 describe('Worker root redirect', () => {
   it('returns 308 redirect to https://pmux.io for GET /', async () => {
     const worker = (await import('../worker')).default;

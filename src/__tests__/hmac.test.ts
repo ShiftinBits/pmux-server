@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   validateClientSignature,
   validateClientSignatureV1,
@@ -399,5 +399,29 @@ describe('worker HMAC integration', () => {
     expect(response.headers.get('X-Response-Time')).toBeTruthy();
     const body = await response.json() as { error: string; requestId?: string };
     expect(body.requestId).toBe(response.headers.get('X-Request-Id'));
+  });
+});
+
+describe('HMAC key caching', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('imports once per secret across repeated validations', async () => {
+    const spy = vi.spyOn(crypto.subtle, 'importKey');
+    const secret = 'hmac-cache-secret-one';
+    const path = '/auth/challenge';
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const signature = await computeSignature(secret, timestamp, path);
+
+    for (let i = 0; i < 3; i++) {
+      const result = await validateClientSignature(makeRequest(path, { signature, timestamp }), secret);
+      expect(result.valid).toBe(true);
+    }
+
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    await computeSignature('hmac-cache-secret-two', timestamp, path);
+    expect(spy).toHaveBeenCalledTimes(2);
   });
 });

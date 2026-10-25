@@ -16,13 +16,23 @@ function credsResponse(username: string): Response {
   );
 }
 
-async function getCreds(): Promise<{ status: number; data: Record<string, unknown> }> {
-  const response = await doInstance.fetch(new Request('http://localhost/turn/credentials'));
+async function getCreds(
+  deviceId = 'host-1',
+  deviceType = 'host'
+): Promise<{ status: number; data: Record<string, unknown> }> {
+  const response = await doInstance.fetch(
+    new Request('http://localhost/turn/credentials', {
+      headers: { 'X-Device-Id': deviceId, 'X-Device-Type': deviceType },
+    })
+  );
   return { status: response.status, data: await response.json() as Record<string, unknown> };
 }
 
 beforeEach(async () => {
   doInstance = await createTestDO();
+  doInstance.registerDevice('host-1', 'pub-host-1', 'host');
+  doInstance.registerDevice('mobile-1', 'pub-mobile-1', 'mobile');
+  doInstance.createPairing('host-1', 'mobile-1');
   globalThis.fetch = vi.fn();
   // Fake only Date — sql.js WASM and promise scheduling stay real
   vi.useFakeTimers({ toFake: ['Date'] });
@@ -32,6 +42,33 @@ beforeEach(async () => {
 afterEach(() => {
   vi.useRealTimers();
   globalThis.fetch = originalFetch;
+});
+
+describe('TURN credentials require a pairing', () => {
+  it('serves a paired host and a paired mobile', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(credsResponse('paired'));
+
+    expect((await getCreds('host-1', 'host')).status).toBe(200);
+    expect((await getCreds('mobile-1', 'mobile')).status).toBe(200);
+  });
+
+  it('rejects an unpaired host and an unpaired mobile without touching the API', async () => {
+    doInstance.registerDevice('host-2', 'pub-host-2', 'host');
+    doInstance.registerDevice('mobile-2', 'pub-mobile-2', 'mobile');
+
+    const host = await getCreds('host-2', 'host');
+    const mobile = await getCreds('mobile-2', 'mobile');
+
+    expect(host.status).toBe(403);
+    expect(host.data['error']).toBe('Device not paired');
+    expect(mobile.status).toBe(403);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects missing identity and unknown device types', async () => {
+    expect((await getCreds('', 'host')).status).toBe(403);
+    expect((await getCreds('host-1', 'other')).status).toBe(403);
+  });
 });
 
 describe('TURN credential cache', () => {
@@ -142,5 +179,23 @@ describe('TURN credential cache', () => {
     expect(b.status).toBe(200);
     expect(b.data['username']).toBe('first');
     expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('still returns fresh credentials when persisting the cache fails', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(credsResponse('first'));
+    const { storage } = (doInstance as unknown as { state: DurableObjectState }).state;
+    vi.spyOn(storage, 'put').mockRejectedValueOnce(new Error('storage down'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const a = await getCreds();
+    const b = await getCreds();
+
+    expect(a.status).toBe(200);
+    expect(a.data['username']).toBe('first');
+    expect(warn).toHaveBeenCalledWith('[turn] Failed to persist TURN cache:', expect.any(Error));
+    expect(b.status).toBe(200);
+    expect(b.data['username']).toBe('first');
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
   });
 });

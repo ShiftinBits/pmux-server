@@ -14,7 +14,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDO } from '../helpers/mock-do';
 import { MockWebSocket } from '../helpers/mock-websocket';
 import { verifyJWT, createJWT } from '../../auth';
-import { generateEd25519Keypair, bytesToBase64, signEd25519, fetchChallenge, signedPairInitiateBodyWithChallenge } from '../helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, signEd25519, fetchChallenge, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from '../helpers/crypto';
 import type { SignalingDO } from '../../signaling';
 import type { MockDOState } from '../helpers/mock-do';
 
@@ -95,7 +95,7 @@ describe('Full auth flow integration [T3.11]', () => {
     const mobilePubBase64 = bytesToBase64(mobileKeys.publicKeyRaw);
 
     // 2. Agent initiates pairing
-    const initBody = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_INTEG, agentKeys.keyPair, agentPubBase64, 'agent-x25519-pub');
+    const initBody = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_INTEG, agentKeys.keyPair, agentPubBase64, HOST_X25519_KEY);
     const initResult = await postJSON('/pair/initiate', initBody);
     expect(initResult.status).toBe(200);
     const pairingCode = initResult.data['pairingCode'] as string;
@@ -106,11 +106,11 @@ describe('Full auth flow integration [T3.11]', () => {
       pairingCode,
       deviceId: MOBILE_INTEG,
       ed25519PublicKey: mobilePubBase64,
-      x25519PublicKey: 'mobile-x25519-pub',
+      x25519PublicKey: testKey('mobile-x25519-pub'),
     });
     expect(completeResult.status).toBe(200);
     expect(completeResult.data['hostDeviceId']).toBe(AGENT_INTEG);
-    expect(completeResult.data['hostX25519PublicKey']).toBe('agent-x25519-pub');
+    expect(completeResult.data['hostX25519PublicKey']).toBe(HOST_X25519_KEY);
     // No userId in response
     expect(completeResult.data['userId']).toBeUndefined();
 
@@ -164,7 +164,13 @@ describe('Full auth flow integration [T3.11]', () => {
       hostWs as unknown as WebSocket,
       JSON.stringify({ type: 'auth', token: agentJWT })
     );
-    expect(hostWs.lastMessage()).toEqual({ type: 'auth', status: 'ok' });
+    // The pair_complete persisted while the host was offline follows the auth reply
+    expect(hostWs.sent[0]).toEqual({ type: 'auth', status: 'ok' });
+    expect(hostWs.lastMessage()).toEqual({
+      type: 'pair_complete',
+      mobileDeviceId: MOBILE_INTEG,
+      mobileX25519PublicKey: testKey('mobile-x25519-pub'),
+    });
 
     const mobileWs = new MockWebSocket();
     doInstance.setConnection(MOBILE_INTEG, mobileWs as unknown as WebSocket);
@@ -248,7 +254,7 @@ describe('Full auth flow integration [T3.11]', () => {
 
     // Register with the real public key via signed pair/initiate
     const initBody = await signedPairInitiateBodyWithChallenge(
-      doInstance, AGENT_WRONG_KEY, realKeys.keyPair, bytesToBase64(realKeys.publicKeyRaw), 'x25519-key'
+      doInstance, AGENT_WRONG_KEY, realKeys.keyPair, bytesToBase64(realKeys.publicKeyRaw), HOST_X25519_KEY
     );
     await postJSON('/pair/initiate', initBody);
 

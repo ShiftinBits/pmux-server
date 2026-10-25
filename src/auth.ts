@@ -84,26 +84,34 @@ export async function verifyEd25519Signature(
 
 // --- HMAC-SHA256 helpers for JWT ---
 
+const hmacKeys = new Map<string, Promise<CryptoKey>>();
+
+export function getHmacKey(secret: string): Promise<CryptoKey> {
+  let key = hmacKeys.get(secret);
+  if (!key) {
+    key = crypto.subtle.importKey(
+      'raw',
+      textEncode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign', 'verify']
+    );
+    hmacKeys.set(secret, key);
+    key.catch(() => {
+      if (hmacKeys.get(secret) === key) hmacKeys.delete(secret);
+    });
+  }
+  return key;
+}
+
 async function hmacSign(secret: string, data: string): Promise<Uint8Array> {
-  const key = await crypto.subtle.importKey(
-    'raw',
-    textEncode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
+  const key = await getHmacKey(secret);
   const sig = await crypto.subtle.sign('HMAC', key, textEncode(data));
   return new Uint8Array(sig);
 }
 
 async function hmacVerify(secret: string, data: string, signature: Uint8Array): Promise<boolean> {
-  const key = await crypto.subtle.importKey(
-    'raw',
-    textEncode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['verify']
-  );
+  const key = await getHmacKey(secret);
   return crypto.subtle.verify('HMAC', key, signature, textEncode(data));
 }
 
