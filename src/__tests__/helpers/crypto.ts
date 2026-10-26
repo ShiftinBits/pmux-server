@@ -74,7 +74,7 @@ export const TEST_ORIGIN = 'http://localhost';
  */
 export async function signAuthChallenge(
   privateKey: CryptoKey,
-  origin: string = TEST_ORIGIN,
+  origin: string,
   deviceId: string,
   nonce: string
 ): Promise<string> {
@@ -134,7 +134,7 @@ export async function signedPairInitiateBody(
   }
   const signature = options.legacy
     ? await signLegacyAuthChallenge(keyPair.privateKey, deviceId, nonce)
-    : await signAuthChallenge(keyPair.privateKey, options.origin, deviceId, nonce);
+    : await signAuthChallenge(keyPair.privateKey, options.origin ?? TEST_ORIGIN, deviceId, nonce);
   return {
     deviceId,
     ed25519PublicKey: ed25519PublicKeyBase64,

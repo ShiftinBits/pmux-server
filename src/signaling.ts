@@ -2412,7 +2412,7 @@ async function checkChallengeSignature(
   signatureBase64: string
 ): Promise<Response | null> {
   const origins = authOrigins(env, request);
-  const acceptLegacy = env.PMUX_REJECT_LEGACY_AUTH !== 'true';
+  const acceptLegacy = env.PMUX_REJECT_LEGACY_AUTH?.trim().toLowerCase() !== 'true';
   let form: 'v1' | 'legacy' | null;
   try {
     form = await verifyChallengeSignature(
