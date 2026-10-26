@@ -11,7 +11,7 @@
 
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import { createTestDO } from '../helpers/mock-do';
-import { generateEd25519Keypair, bytesToBase64, deriveDeviceId, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from '../helpers/crypto';
+import { newTestDevice, bytesToBase64, deriveDeviceId, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from '../helpers/crypto';
 import type { SignalingDO } from '../../signaling';
 
 // Limits mirror the native Workers Rate Limiting bindings (wrangler.toml).
@@ -53,16 +53,10 @@ async function postJSON(
   return { status: response.status, data, response };
 }
 
-/** Pad an arbitrary string to a 32-hex device ID for testing (ponytail: test-only, not real derivation). */
-function toTestDeviceId(s: string): string {
-  const hex = Array.from(s).map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
-  return hex.slice(0, 32).padEnd(32, '0');
-}
-
-async function signedInitiateBody(deviceId: string, x25519Key: string) {
-  const keys = await generateEd25519Keypair();
-  const hexId = toTestDeviceId(deviceId);
-  return signedPairInitiateBodyWithChallenge(doInstance, hexId, keys.keyPair, bytesToBase64(keys.publicKeyRaw), x25519Key);
+/** A /pair/initiate body for a fresh host whose ID is derived from its own key. */
+async function signedInitiateBody(x25519Key: string) {
+  const dev = await newTestDevice();
+  return signedPairInitiateBodyWithChallenge(doInstance, dev.deviceId, dev.keyPair, dev.publicKeyB64, x25519Key);
 }
 
 describe('Rate limiting integration [T3.11]', () => {
@@ -73,7 +67,7 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Send requests up to the limit
       for (let i = 0; i < limit; i++) {
-        const body = await signedInitiateBody(`agent-${i}`, HOST_X25519_KEY);
+        const body = await signedInitiateBody(HOST_X25519_KEY);
         const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
       }
@@ -99,14 +93,14 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Send 5 requests
       for (let i = 0; i < 5; i++) {
-        const body = await signedInitiateBody(`agent-persist-${i}`, HOST_X25519_KEY);
+        const body = await signedInitiateBody(HOST_X25519_KEY);
         const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
       }
 
       // Send remaining requests to hit the limit
       for (let i = 5; i < limit; i++) {
-        const body = await signedInitiateBody(`agent-persist-${i}`, HOST_X25519_KEY);
+        const body = await signedInitiateBody(HOST_X25519_KEY);
         const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
       }
@@ -127,7 +121,7 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Exhaust limit for IP A
       for (let i = 0; i < limit; i++) {
-        const body = await signedInitiateBody(`agent-a-${i}`, HOST_X25519_KEY);
+        const body = await signedInitiateBody(HOST_X25519_KEY);
         const { status } = await postJSON('/pair/initiate', body, { 'X-Client-IP': '10.0.0.1' });
         expect(status).toBe(200);
       }
@@ -145,12 +139,12 @@ describe('Rate limiting integration [T3.11]', () => {
       expect(blockedA.status).toBe(429);
 
       // IP B is still allowed
-      const bodyB = await signedInitiateBody('agent-b-1', HOST_X25519_KEY);
+      const bodyB = await signedInitiateBody(HOST_X25519_KEY);
       const allowedB = await postJSON('/pair/initiate', bodyB, { 'X-Client-IP': '10.0.0.2' });
       expect(allowedB.status).toBe(200);
 
       // IP C is also allowed
-      const bodyC = await signedInitiateBody('agent-c-1', HOST_X25519_KEY);
+      const bodyC = await signedInitiateBody(HOST_X25519_KEY);
       const allowedC = await postJSON('/pair/initiate', bodyC, { 'X-Client-IP': '10.0.0.3' });
       expect(allowedC.status).toBe(200);
     });
@@ -162,7 +156,7 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Exhaust /pair/initiate limit
       for (let i = 0; i < limit; i++) {
-        const body = await signedInitiateBody(`agent-sep-${i}`, HOST_X25519_KEY);
+        const body = await signedInitiateBody(HOST_X25519_KEY);
         await postJSON('/pair/initiate', body);
       }
 
@@ -187,7 +181,7 @@ describe('Rate limiting integration [T3.11]', () => {
     it('/pairing has its own counter, independent of /pair/initiate', async () => {
       // Exhaust /pair/initiate for this IP
       for (let i = 0; i < PAIR_LIMIT; i++) {
-        const body = await signedInitiateBody(`agent-pg-${i}`, HOST_X25519_KEY);
+        const body = await signedInitiateBody(HOST_X25519_KEY);
         await postJSON('/pair/initiate', body);
       }
       const blockedInitiate = await postJSON('/pair/initiate', {
@@ -243,7 +237,7 @@ describe('Rate limiting integration [T3.11]', () => {
 
       // Fill the limit
       for (let i = 0; i < limit; i++) {
-        const body = await signedInitiateBody(`agent-format-${i}`, HOST_X25519_KEY);
+        const body = await signedInitiateBody(HOST_X25519_KEY);
         await postJSON('/pair/initiate', body);
       }
 

@@ -20,11 +20,11 @@ import type { MockDOState } from '../helpers/mock-do';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
-// Valid 32-hex device IDs (format: hex(SHA-256(publicKey)[0:16]))
-const AGENT_INTEG = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
+// Derived from each test's host key, as /pair/initiate requires of a new device
+let AGENT_INTEG: string;
 // Derived from the mobile's key in the lifecycle test, as /pair/complete requires
 let MOBILE_INTEG: string;
-const AGENT_WRONG_KEY = 'cccccccccccccccccccccccccccccccc';
+let AGENT_WRONG_KEY: string;
 
 let doInstance: SignalingDO;
 let mockState: MockDOState;
@@ -95,6 +95,7 @@ describe('Full auth flow integration [T3.11]', () => {
     const agentPubBase64 = bytesToBase64(agentKeys.publicKeyRaw);
     const mobilePubBase64 = bytesToBase64(mobileKeys.publicKeyRaw);
     MOBILE_INTEG = await deriveDeviceId(mobileKeys.publicKeyRaw);
+    AGENT_INTEG = await deriveDeviceId(agentKeys.publicKeyRaw);
 
     // 2. Agent initiates pairing
     const initBody = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_INTEG, agentKeys.keyPair, agentPubBase64, HOST_X25519_KEY);
@@ -253,6 +254,7 @@ describe('Full auth flow integration [T3.11]', () => {
     // Generate two different key pairs
     const realKeys = await generateEd25519Keypair();
     const wrongKeys = await generateEd25519Keypair();
+    AGENT_WRONG_KEY = await deriveDeviceId(realKeys.publicKeyRaw);
 
     // Register with the real public key via signed pair/initiate
     const initBody = await signedPairInitiateBodyWithChallenge(

@@ -5,8 +5,6 @@ import { createJWT } from '../auth';
 import { generateEd25519Keypair, bytesToBase64, deriveDeviceId, signEd25519, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey, fetchChallenge } from './helpers/crypto';
 import type { SignalingDO } from '../signaling';
 
-// Valid 32-hex device ID for agent (format: hex(SHA-256(publicKey)[0:16]))
-const AGENT_1 = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
 
 function base64Bytes(b64: string): Uint8Array {
   return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
@@ -15,6 +13,8 @@ function base64Bytes(b64: string): Uint8Array {
 let doInstance: SignalingDO;
 let keyPair: CryptoKeyPair;
 let ed25519PublicKeyBase64: string;
+// The host ID is derived from the host key, as /pair/initiate requires of a new device.
+let AGENT_1: string;
 
 // Mobile IDs are derived from the key each test sends, as /pair/complete requires.
 let MOBILE_1: string;
@@ -29,6 +29,7 @@ beforeEach(async () => {
   const keys = await generateEd25519Keypair();
   keyPair = keys.keyPair;
   ed25519PublicKeyBase64 = bytesToBase64(keys.publicKeyRaw);
+  AGENT_1 = await deriveDeviceId(keys.publicKeyRaw);
 });
 
 async function postJSON(
@@ -300,10 +301,38 @@ describe('POST /pair/initiate input validation', () => {
     expect(data['error']).toBe('Invalid signature format');
   });
 
-  it('returns 401 for a non-base64 ed25519PublicKey on a new host', async () => {
-    const { status, data } = await initiateWith({ ed25519PublicKey: '!!!' });
+  it.each([
+    ['non-base64', '!!!'],
+    ['wrong length', bytesToBase64(new Uint8Array(16))],
+    ['unpadded', bytesToBase64(new Uint8Array(32)).replace(/=+$/, '')],
+    ['whitespace-padded', `${bytesToBase64(new Uint8Array(32))}  `],
+    ['non-string', 42],
+  ])('returns 400 for a %s ed25519PublicKey without burning the nonce', async (_label, value) => {
+    for (const existingHost of [false, true]) {
+      if (existingHost) {
+        const first = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
+        expect((await postJSON('/pair/initiate', first)).status).toBe(200);
+      }
+      const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
+      const bad = await postJSON('/pair/initiate', { ...body, ed25519PublicKey: value });
+      expect(bad.status).toBe(400);
+      // A non-string is already rejected by the string-field check
+      expect(bad.data['error']).toBe(
+        typeof value === 'string' ? 'Invalid ed25519PublicKey' : 'deviceId, ed25519PublicKey, nonce and signature must be strings'
+      );
+      expect((await postJSON('/pair/initiate', body)).status).toBe(200);
+    }
+  });
+
+  it('returns 401 for a new device whose deviceId is not derived from its ed25519PublicKey', async () => {
+    const strangerId = await deriveDeviceId(base64Bytes(testKey('someone-else')));
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, strangerId, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
+    const { status, data } = await postJSON('/pair/initiate', body);
     expect(status).toBe(401);
-    expect(data['error']).toBe('Invalid signature format');
+    expect(data['error']).toBe('deviceId does not match ed25519PublicKey');
+    expect(doInstance.getDevice(strangerId)).toBeNull();
+    const sql = (doInstance as unknown as { sql: { exec: (q: string, ...b: unknown[]) => { toArray(): unknown[] } } }).sql;
+    expect(sql.exec('SELECT code FROM pairing_sessions WHERE host_device_id = ?', strangerId).toArray()).toEqual([]);
   });
 
   it.each([
@@ -320,11 +349,8 @@ describe('POST /pair/initiate input validation', () => {
     expect((await postJSON('/pair/initiate', body)).status).toBe(200);
   });
 
-  it.each([
-    ['malformed', 'not-a-key'],
-    ['different well-formed', testKey('another-host-key')],
-  ])('returns 401 for a %s ed25519PublicKey on an existing host and issues no code', async (_label, value) => {
-    const { status, data } = await initiateWith({ ed25519PublicKey: value }, true);
+  it('returns 401 for a different well-formed ed25519PublicKey on an existing host and issues no code', async () => {
+    const { status, data } = await initiateWith({ ed25519PublicKey: testKey('another-host-key') }, true);
     expect(status).toBe(401);
     expect(data['error']).toBe('ed25519PublicKey does not match the registered key');
     const sql = (doInstance as unknown as { sql: { exec: (q: string, ...b: unknown[]) => { toArray(): unknown[] } } }).sql;
@@ -593,7 +619,7 @@ describe('POST /pair/complete', () => {
     const { doInstance: do2, mockState } = await createTestDOFull();
 
     // Generate keypair for this DO instance
-    const keys = await generateEd25519Keypair();
+    const keys = { keyPair, publicKeyRaw: base64Bytes(ed25519PublicKeyBase64) };
     const kp = keys.keyPair;
     const pubBase64 = bytesToBase64(keys.publicKeyRaw);
 
@@ -660,7 +686,7 @@ describe('POST /pair/complete', () => {
     // a live host WebSocket connected during /pair/complete.
     async function setupPairing(withLiveHostWs: boolean, mobileName?: string, pairMac?: string | null) {
       const { doInstance: do2, mockState } = await createTestDOFull();
-      const keys = await generateEd25519Keypair();
+      const keys = { keyPair, publicKeyRaw: base64Bytes(ed25519PublicKeyBase64) };
       const pubBase64 = bytesToBase64(keys.publicKeyRaw);
       const keyPairForHost = keys.keyPair;
 
@@ -917,7 +943,7 @@ describe('POST /pair/complete', () => {
     const { doInstance: do2, mockState } = await createTestDOFull();
 
     // Generate keypair for this DO instance
-    const keys = await generateEd25519Keypair();
+    const keys = { keyPair, publicKeyRaw: base64Bytes(ed25519PublicKeyBase64) };
     const kp = keys.keyPair;
     const pubBase64 = bytesToBase64(keys.publicKeyRaw);
 
@@ -1011,7 +1037,7 @@ describe('POST /pair/complete', () => {
     const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
     const { doInstance: do2, mockState } = await createTestDOFull();
 
-    const keys = await generateEd25519Keypair();
+    const keys = { keyPair, publicKeyRaw: base64Bytes(ed25519PublicKeyBase64) };
     const kp = keys.keyPair;
     const pubBase64 = bytesToBase64(keys.publicKeyRaw);
 
@@ -1057,7 +1083,7 @@ describe('POST /pair/complete', () => {
     const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
     const { doInstance: do2, mockState } = await createTestDOFull();
 
-    const keys = await generateEd25519Keypair();
+    const keys = { keyPair, publicKeyRaw: base64Bytes(ed25519PublicKeyBase64) };
     const kp = keys.keyPair;
     const pubBase64 = bytesToBase64(keys.publicKeyRaw);
 
@@ -1139,7 +1165,7 @@ describe('POST /pair/complete', () => {
     const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
     // Generate keypair for this DO instance
-    const keys = await generateEd25519Keypair();
+    const keys = { keyPair, publicKeyRaw: base64Bytes(ed25519PublicKeyBase64) };
     const kp = keys.keyPair;
     const pubBase64 = bytesToBase64(keys.publicKeyRaw);
 
@@ -1340,7 +1366,7 @@ describe('DELETE /pairing', () => {
   it('removes existing pairing and returns removed: true', async () => {
     const { doInstance: do2 } = await createTestDOFull();
 
-    const keys = await generateEd25519Keypair();
+    const keys = { keyPair, publicKeyRaw: base64Bytes(ed25519PublicKeyBase64) };
     const kp = keys.keyPair;
     const pubBase64 = bytesToBase64(keys.publicKeyRaw);
 
@@ -1382,7 +1408,7 @@ describe('DELETE /pairing', () => {
     const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
     const { doInstance: do2, mockState } = await createTestDOFull();
 
-    const keys = await generateEd25519Keypair();
+    const keys = { keyPair, publicKeyRaw: base64Bytes(ed25519PublicKeyBase64) };
     const kp = keys.keyPair;
     const pubBase64 = bytesToBase64(keys.publicKeyRaw);
 
@@ -1435,7 +1461,7 @@ describe('DELETE /pairing', () => {
     const { doInstance: do2 } = await createTestDOFull();
 
     // Register a host device but don't pair it
-    const keys = await generateEd25519Keypair();
+    const keys = { keyPair, publicKeyRaw: base64Bytes(ed25519PublicKeyBase64) };
     const kp = keys.keyPair;
     const pubBase64 = bytesToBase64(keys.publicKeyRaw);
     const initBody = await signedPairInitiateBodyWithChallenge(do2, AGENT_1, kp, pubBase64, HOST_X25519_KEY);

@@ -47,6 +47,17 @@ export async function deriveDeviceId(publicKeyRaw: Uint8Array): Promise<string> 
   return Array.from(digest.slice(0, 16), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** A fresh Ed25519 identity whose device ID is derived from its key. */
+export async function newTestDevice() {
+  const { keyPair, publicKeyRaw } = await generateEd25519Keypair();
+  return {
+    deviceId: await deriveDeviceId(publicKeyRaw),
+    keyPair,
+    publicKeyRaw,
+    publicKeyB64: bytesToBase64(publicKeyRaw),
+  };
+}
+
 export async function signEd25519(privateKey: CryptoKey, message: Uint8Array): Promise<Uint8Array> {
   const sig = await crypto.subtle.sign('Ed25519', privateKey, message);
   return new Uint8Array(sig);

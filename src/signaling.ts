@@ -1750,6 +1750,9 @@ export class SignalingDO implements DurableObject {
     if (!isBase64OfLength(body.x25519PublicKey, 32)) {
       return jsonResponse({ error: 'Invalid x25519PublicKey' }, 400);
     }
+    if (!isBase64OfLength(body.ed25519PublicKey, 32)) {
+      return jsonResponse({ error: 'Invalid ed25519PublicKey' }, 400);
+    }
 
     // Consume the nonce challenge (single-use, validates expiry and device binding)
     if (!this.consumeChallenge(body.nonce, body.deviceId)) {
@@ -1771,6 +1774,13 @@ export class SignalingDO implements DurableObject {
     }
     if (!valid) {
       return jsonResponse({ error: 'Signature verification failed' }, 401);
+    }
+
+    // A new device's ID must be derived from its key, so an ID cannot be
+    // claimed with a key it does not belong to. Checked after the signature so
+    // an unauthenticated caller learns nothing.
+    if (!existing && body.deviceId !== await deriveDeviceId(base64ToBytes(body.ed25519PublicKey))) {
+      return jsonResponse({ error: 'deviceId does not match ed25519PublicKey' }, 401);
     }
 
     // Checked after the signature so an unauthenticated caller learns nothing

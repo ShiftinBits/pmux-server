@@ -2,19 +2,22 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { createTestDO as createTestDOFull } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
-import { generateEd25519Keypair, bytesToBase64, deriveDeviceId, signedPairInitiateBodyWithChallenge, fetchChallenge, signEd25519, HOST_X25519_KEY, testKey } from './helpers/crypto';
+import { generateEd25519Keypair, newTestDevice, bytesToBase64, deriveDeviceId, signedPairInitiateBodyWithChallenge, fetchChallenge, signEd25519, HOST_X25519_KEY, testKey } from './helpers/crypto';
 import type { SignalingDO } from '../signaling';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
-// Valid 32-hex device IDs (format: hex(SHA-256(publicKey)[0:16]))
-const HOST_1 = 'c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1';
+// Host ID derived from the host key, as /pair/initiate requires of a new device
+let HOST_1: string;
+let hostKeys: Awaited<ReturnType<typeof newTestDevice>>;
 
 // Mobile ID derived from the key it sends to /pair/complete
 const MOBILE_KEY = testKey('ed25519-pub-key-mobile');
 let MOBILE_1: string;
 
 beforeAll(async () => {
+  hostKeys = await newTestDevice();
+  HOST_1 = hostKeys.deviceId;
   MOBILE_1 = await deriveDeviceId(Uint8Array.from(atob(MOBILE_KEY), (c) => c.charCodeAt(0)));
 });
 
@@ -51,7 +54,6 @@ async function deleteDevice(
 
 /** Helper: register a host and a mobile, complete pairing, return both keypairs. */
 async function setupPairedDevices(doInstance: SignalingDO, hostName?: string) {
-  const hostKeys = await generateEd25519Keypair();
   const hostPubBase64 = bytesToBase64(hostKeys.publicKeyRaw);
 
   const initBody = await signedPairInitiateBodyWithChallenge(
@@ -109,8 +111,7 @@ describe('DELETE /device', () => {
     const { doInstance } = await createTestDOFull();
 
     // Register host but don't complete pairing
-    const hostKeys = await generateEd25519Keypair();
-    const hostPubBase64 = bytesToBase64(hostKeys.publicKeyRaw);
+      const hostPubBase64 = bytesToBase64(hostKeys.publicKeyRaw);
     const initBody = await signedPairInitiateBodyWithChallenge(
       doInstance,
       HOST_1,

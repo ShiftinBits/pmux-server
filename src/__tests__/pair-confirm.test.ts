@@ -15,7 +15,6 @@ import {
 
 // Host-confirmed pairing: /pair/complete is held until the host answers [SB-1348]
 
-const AGENT_1 = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
 afterEach(() => {
@@ -26,8 +25,13 @@ afterEach(() => {
 // Mobile IDs are derived from the key each test sends, as /pair/complete requires.
 let M1: string;
 let M2: string;
+// The host ID is derived from the host key, as /pair/initiate requires of a new device.
+let AGENT_1: string;
+let hostKeys: Awaited<ReturnType<typeof generateEd25519Keypair>>;
 
 beforeAll(async () => {
+  hostKeys = await generateEd25519Keypair();
+  AGENT_1 = await deriveDeviceId(hostKeys.publicKeyRaw);
   M1 = await deriveDeviceId(base64Bytes(testKey('ed25519-pub-key-mobile-1')));
   M2 = await deriveDeviceId(base64Bytes(testKey('ed25519-pub-key-mobile-2')));
 });
@@ -45,7 +49,7 @@ interface CompleteOverrides {
 async function setup(opts: { pairConfirm?: boolean; liveHost?: boolean; hostName?: string } = {}) {
   const { pairConfirm = true, liveHost = true, hostName } = opts;
   const { doInstance: do2, mockState } = await createTestDO();
-  const keys = await generateEd25519Keypair();
+  const keys = hostKeys;
   const pubBase64 = bytesToBase64(keys.publicKeyRaw);
 
   function request(path: string, body: unknown): Request {
