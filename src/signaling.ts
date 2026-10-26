@@ -1746,13 +1746,11 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Name must be a string of 1-64 characters with no control characters' }, 400);
     }
 
-    // Format checks run before getDevice and consumeChallenge so a 400 neither
-    // reaches SQL nor burns the nonce
-    if (!DEVICE_ID_PATTERN.test(body.deviceId)) {
-      return jsonResponse({ error: 'Invalid deviceId' }, 400);
-    }
-    if (!isBase64OfLength(body.signature, 64)) {
-      return jsonResponse({ error: 'Invalid signature' }, 400);
+    // Key format checks run before consumeChallenge so a 400 does not burn the
+    // nonce; the existing-device ed25519PublicKey check needs getDevice first
+    const fieldsError = challengeFieldsError(body.deviceId, body.nonce, body.signature);
+    if (fieldsError) {
+      return fieldsError;
     }
     if (!isBase64OfLength(body.x25519PublicKey, 32)) {
       return jsonResponse({ error: 'Invalid x25519PublicKey' }, 400);
@@ -2127,12 +2125,9 @@ export class SignalingDO implements DurableObject {
     if (typeof body.deviceId !== 'string' || typeof body.nonce !== 'string' || typeof body.signature !== 'string') {
       return jsonResponse({ error: 'deviceId, nonce and signature must be strings' }, 400);
     }
-    // Checked before consumeChallenge so a 400 does not burn the nonce
-    if (!DEVICE_ID_PATTERN.test(body.deviceId)) {
-      return jsonResponse({ error: 'Invalid deviceId' }, 400);
-    }
-    if (!isBase64OfLength(body.signature, 64)) {
-      return jsonResponse({ error: 'Invalid signature' }, 400);
+    const fieldsError = challengeFieldsError(body.deviceId, body.nonce, body.signature);
+    if (fieldsError) {
+      return fieldsError;
     }
 
     // Consume the nonce challenge first (single-use, validates expiry and device binding)
@@ -2356,6 +2351,24 @@ function base64ToBytes(str: string): Uint8Array {
 }
 
 const DEVICE_ID_PATTERN = /^[0-9a-f]{32}$/;
+
+/**
+ * Format checks for a challenge-signed request (/token, /pair/initiate). Run
+ * before getDevice and consumeChallenge, so a 400 neither reaches SQL nor
+ * burns the nonce.
+ */
+function challengeFieldsError(deviceId: string, nonce: string, signature: string): Response | null {
+  if (!DEVICE_ID_PATTERN.test(deviceId)) {
+    return jsonResponse({ error: 'Invalid deviceId' }, 400);
+  }
+  if (!isBase64OfLength(nonce, 32)) {
+    return jsonResponse({ error: 'Invalid nonce' }, 400);
+  }
+  if (!isBase64OfLength(signature, 64)) {
+    return jsonResponse({ error: 'Invalid signature' }, 400);
+  }
+  return null;
+}
 
 function isBase64OfLength(value: unknown, length: number): boolean {
   if (typeof value !== 'string') return false;

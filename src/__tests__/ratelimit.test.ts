@@ -159,7 +159,7 @@ describe('DO rate limiting integration', () => {
       for (let i = 0; i < 30; i++) {
         const { status } = await postJSON('/token', {
           deviceId: fakeId,
-          nonce: 'fake-nonce',
+          nonce: 'A'.repeat(43) + '=', // well-formed, never issued
           signature: 'A'.repeat(86) + '==',
         });
         // 401 because nonce is invalid, but NOT 429
@@ -172,7 +172,7 @@ describe('DO rate limiting integration', () => {
       for (let i = 0; i < 30; i++) {
         await postJSON('/token', {
           deviceId: fakeId,
-          nonce: 'fake-nonce',
+          nonce: 'A'.repeat(43) + '=', // well-formed, never issued
           signature: 'A'.repeat(86) + '==',
         });
       }
@@ -180,7 +180,7 @@ describe('DO rate limiting integration', () => {
       // 31st should be rate limited
       const { status, data } = await postJSON('/token', {
         deviceId: fakeId,
-        nonce: 'fake-nonce',
+        nonce: 'A'.repeat(43) + '=', // well-formed, never issued
         signature: 'A'.repeat(86) + '==',
       });
       expect(status).toBe(429);
@@ -485,7 +485,7 @@ describe('legitimate usage patterns', () => {
       for (let i = 0; i < 5; i++) {
         const { status } = await postJSON('/token', {
           deviceId: fakeId,
-          nonce: 'fake-nonce',
+          nonce: 'A'.repeat(43) + '=', // well-formed, never issued
           signature: 'A'.repeat(86) + '==',
         }, { 'X-Client-IP': `10.0.0.${ip}` });
         // Expect 401 (invalid challenge) not 429 (rate limited)
