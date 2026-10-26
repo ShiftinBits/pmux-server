@@ -159,8 +159,8 @@ describe('DO rate limiting integration', () => {
       for (let i = 0; i < 30; i++) {
         const { status } = await postJSON('/token', {
           deviceId: fakeId,
-          nonce: 'fake-nonce',
-          signature: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+          nonce: 'A'.repeat(43) + '=', // well-formed, never issued
+          signature: 'A'.repeat(86) + '==',
         });
         // 401 because nonce is invalid, but NOT 429
         expect(status).toBe(401);
@@ -172,16 +172,16 @@ describe('DO rate limiting integration', () => {
       for (let i = 0; i < 30; i++) {
         await postJSON('/token', {
           deviceId: fakeId,
-          nonce: 'fake-nonce',
-          signature: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+          nonce: 'A'.repeat(43) + '=', // well-formed, never issued
+          signature: 'A'.repeat(86) + '==',
         });
       }
 
       // 31st should be rate limited
       const { status, data } = await postJSON('/token', {
         deviceId: fakeId,
-        nonce: 'fake-nonce',
-        signature: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+        nonce: 'A'.repeat(43) + '=', // well-formed, never issued
+        signature: 'A'.repeat(86) + '==',
       });
       expect(status).toBe(429);
       expect(data['error']).toBe('Too many requests');
@@ -485,8 +485,8 @@ describe('legitimate usage patterns', () => {
       for (let i = 0; i < 5; i++) {
         const { status } = await postJSON('/token', {
           deviceId: fakeId,
-          nonce: 'fake-nonce',
-          signature: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+          nonce: 'A'.repeat(43) + '=', // well-formed, never issued
+          signature: 'A'.repeat(86) + '==',
         }, { 'X-Client-IP': `10.0.0.${ip}` });
         // Expect 401 (invalid challenge) not 429 (rate limited)
         expect(status).toBe(401);

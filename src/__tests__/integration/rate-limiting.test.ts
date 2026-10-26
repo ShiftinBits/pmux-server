@@ -211,7 +211,7 @@ describe('Rate limiting integration [T3.11]', () => {
       for (let i = 0; i < tokenLimit; i++) {
         const { status } = await postJSON('/token', {
           deviceId: fakeDeviceId,
-          nonce: 'fake-nonce',
+          nonce: 'A'.repeat(43) + '=', // well-formed, never issued
           signature: bytesToBase64(new Uint8Array(64)),
         });
         expect(status).toBe(401);
@@ -220,7 +220,7 @@ describe('Rate limiting integration [T3.11]', () => {
       // 31st should be rate limited
       const { status } = await postJSON('/token', {
         deviceId: fakeDeviceId,
-        nonce: 'fake-nonce',
+        nonce: 'A'.repeat(43) + '=', // well-formed, never issued
         signature: bytesToBase64(new Uint8Array(64)),
       });
       expect(status).toBe(429);

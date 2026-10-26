@@ -394,16 +394,48 @@ describe('POST /pair/initiate input validation', () => {
     return postJSON('/pair/initiate', { ...body, ...overrides });
   }
 
-  it('returns 401 for a non-base64 signature on a new host', async () => {
-    const { status, data } = await initiateWith({ signature: '!!!' });
-    expect(status).toBe(401);
-    expect(data['error']).toBe('Invalid signature format');
+  it.each([
+    ['a new', false],
+    ['an existing', true],
+  ])('returns 400 for a non-base64 signature on %s host without burning the nonce', async (_label, existing) => {
+    if (existing) {
+      const first = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
+      expect((await postJSON('/pair/initiate', first)).status).toBe(200);
+    }
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
+    const bad = await postJSON('/pair/initiate', { ...body, signature: '!!!' });
+    expect(bad.status).toBe(400);
+    expect(bad.data['error']).toBe('Invalid signature');
+    expect((await postJSON('/pair/initiate', body)).status).toBe(200);
   });
 
-  it('returns 401 for a non-base64 signature on an existing host', async () => {
-    const { status, data } = await initiateWith({ signature: '!!!' }, true);
-    expect(status).toBe(401);
-    expect(data['error']).toBe('Invalid signature format');
+  it.each([
+    ['non-base64', '!!!'],
+    ['wrong-length', bytesToBase64(new Uint8Array(16))],
+  ])('returns 400 for a %s nonce', async (_label, value) => {
+    const { status, data } = await initiateWith({ nonce: value });
+    expect(status).toBe(400);
+    expect(data['error']).toBe('Invalid nonce');
+  });
+
+  it.each([
+    ['non-hex', 'z'.repeat(32)],
+    ['uppercase', 'A'.repeat(32)],
+    ['65-char', 'a'.repeat(65)],
+  ])('returns 400 for a %s deviceId without burning the nonce', async (_label, value) => {
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
+    const bad = await postJSON('/pair/initiate', { ...body, deviceId: value });
+    expect(bad.status).toBe(400);
+    expect(bad.data['error']).toBe('Invalid deviceId');
+    expect((await postJSON('/pair/initiate', body)).status).toBe(200);
+  });
+
+  it('returns 400 for a wrong-length base64 signature without burning the nonce', async () => {
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
+    const bad = await postJSON('/pair/initiate', { ...body, signature: bytesToBase64(new Uint8Array(32)) });
+    expect(bad.status).toBe(400);
+    expect(bad.data['error']).toBe('Invalid signature');
+    expect((await postJSON('/pair/initiate', body)).status).toBe(200);
   });
 
   it.each([
