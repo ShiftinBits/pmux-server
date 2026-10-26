@@ -11,6 +11,11 @@ export interface Env {
   TURN_API_TOKEN: string;
   JWT_SECRET: string;
   PMUX_HMAC_SECRET?: string;  // Optional — enables client signature validation
+  // Optional — comma-separated origins auth challenge signatures may be bound
+  // to; replaces the request origin (see wrangler.toml).
+  PMUX_AUTH_ORIGINS?: string;
+  // Optional — `true` rejects legacy `deviceId|nonce` challenge signatures.
+  PMUX_REJECT_LEGACY_AUTH?: string;
   // Native Workers Rate Limiting bindings (see wrangler.toml) [SB-995].
   TOKEN_LIMITER: RateLimit;
   PAIR_LIMITER: RateLimit;

@@ -6,10 +6,11 @@ import {
   generateEd25519Keypair,
   bytesToBase64,
   deriveDeviceId,
-  signEd25519,
+  signAuthChallenge,
   fetchChallenge,
   signedPairInitiateBodyWithChallenge,
   HOST_X25519_KEY,
+  TEST_ORIGIN,
   testKey,
 } from './helpers/crypto';
 
@@ -169,11 +170,8 @@ describe('host-confirmed pairing (SB-1348)', () => {
     expect(do2.getDevice(mobileId)!.ed25519PublicKey).toBe(mobilePub);
 
     const nonce = await fetchChallenge(do2, mobileId);
-    const signature = await signEd25519(
-      mobileKeys.keyPair.privateKey,
-      new TextEncoder().encode(mobileId + '|' + nonce)
-    );
-    const tokenRes = await do2.fetch(request('/token', { deviceId: mobileId, nonce, signature: bytesToBase64(signature) }));
+    const signature = await signAuthChallenge(mobileKeys.keyPair.privateKey, TEST_ORIGIN, mobileId, nonce);
+    const tokenRes = await do2.fetch(request('/token', { deviceId: mobileId, nonce, signature }));
     expect(tokenRes.status).toBe(200);
     expect(await tokenRes.json()).toEqual({ token: expect.any(String) });
   });
