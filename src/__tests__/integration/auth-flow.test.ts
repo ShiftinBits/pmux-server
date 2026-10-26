@@ -14,7 +14,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDO } from '../helpers/mock-do';
 import { MockWebSocket } from '../helpers/mock-websocket';
 import { verifyJWT, createJWT } from '../../auth';
-import { generateEd25519Keypair, bytesToBase64, signEd25519, fetchChallenge, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from '../helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, deriveDeviceId, signEd25519, fetchChallenge, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from '../helpers/crypto';
 import type { SignalingDO } from '../../signaling';
 import type { MockDOState } from '../helpers/mock-do';
 
@@ -22,7 +22,8 @@ const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
 // Valid 32-hex device IDs (format: hex(SHA-256(publicKey)[0:16]))
 const AGENT_INTEG = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
-const MOBILE_INTEG = 'b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1';
+// Derived from the mobile's key in the lifecycle test, as /pair/complete requires
+let MOBILE_INTEG: string;
 const AGENT_WRONG_KEY = 'cccccccccccccccccccccccccccccccc';
 
 let doInstance: SignalingDO;
@@ -93,6 +94,7 @@ describe('Full auth flow integration [T3.11]', () => {
     const mobileKeys = await generateEd25519Keypair();
     const agentPubBase64 = bytesToBase64(agentKeys.publicKeyRaw);
     const mobilePubBase64 = bytesToBase64(mobileKeys.publicKeyRaw);
+    MOBILE_INTEG = await deriveDeviceId(mobileKeys.publicKeyRaw);
 
     // 2. Agent initiates pairing
     const initBody = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_INTEG, agentKeys.keyPair, agentPubBase64, HOST_X25519_KEY);

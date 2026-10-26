@@ -1,10 +1,11 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
 import { createTestDO } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
 import {
   generateEd25519Keypair,
   bytesToBase64,
+  deriveDeviceId,
   signEd25519,
   fetchChallenge,
   signedPairInitiateBodyWithChallenge,
@@ -22,7 +23,21 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+// Mobile IDs are derived from the key each test sends, as /pair/complete requires.
+let M1: string;
+let M2: string;
+
+beforeAll(async () => {
+  M1 = await deriveDeviceId(base64Bytes(testKey('ed25519-pub-key-mobile-1')));
+  M2 = await deriveDeviceId(base64Bytes(testKey('ed25519-pub-key-mobile-2')));
+});
+
+function base64Bytes(b64: string): Uint8Array {
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
 interface CompleteOverrides {
+  deviceId?: string;
   ed25519PublicKey?: string;
   x25519PublicKey?: string;
 }
@@ -63,12 +78,16 @@ async function setup(opts: { pairConfirm?: boolean; liveHost?: boolean; hostName
     return ws;
   }
 
-  function complete(code: string, deviceId = 'mobile-1', overrides: CompleteOverrides = {}): Promise<Response> {
+  // label picks the placeholder key pair; the ID is derived from the key sent
+  // unless the test overrides it.
+  async function complete(code: string, label = 'mobile-1', overrides: CompleteOverrides = {}): Promise<Response> {
+    const ed25519PublicKey = overrides.ed25519PublicKey ?? testKey(`ed25519-pub-key-${label}`);
+    const deviceId = overrides.deviceId ?? await deriveDeviceId(base64Bytes(ed25519PublicKey));
     return do2.fetch(request('/pair/complete', {
       pairingCode: code,
       deviceId,
-      ed25519PublicKey: overrides.ed25519PublicKey ?? testKey(`ed25519-pub-key-${deviceId}`),
-      x25519PublicKey: overrides.x25519PublicKey ?? testKey(`x25519-pub-key-${deviceId}`),
+      ed25519PublicKey,
+      x25519PublicKey: overrides.x25519PublicKey ?? testKey(`x25519-pub-key-${label}`),
       pairMac: 'bWFj',
     }));
   }
@@ -116,12 +135,12 @@ describe('host-confirmed pairing (SB-1348)', () => {
     await relayed(hostWs!);
 
     const relay = hostWs!.messagesOfType('pair_complete')[0]!;
-    expect(relay['mobileDeviceId']).toBe('mobile-1');
+    expect(relay['mobileDeviceId']).toBe(M1);
     expect(relay['pairMac']).toBe('bWFj');
-    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(false);
-    expect(do2.getDevice('mobile-1')).toBeNull();
+    expect(do2.isPaired(AGENT_1, M1)).toBe(false);
+    expect(do2.getDevice(M1)).toBeNull();
 
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M1 });
     const res = await pending;
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
@@ -129,17 +148,17 @@ describe('host-confirmed pairing (SB-1348)', () => {
       hostX25519PublicKey: HOST_X25519_KEY,
       hostName: 'build-box',
     });
-    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(true);
-    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: 'mobile-1', ok: true }]);
+    expect(do2.isPaired(AGENT_1, M1)).toBe(true);
+    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: M1, ok: true }]);
   });
 
   it('commits a real Ed25519 key that the mobile can then exchange for a token', async () => {
-    const mobileId = 'b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2';
     const mobileKeys = await generateEd25519Keypair();
     const mobilePub = bytesToBase64(mobileKeys.publicKeyRaw);
+    const mobileId = await deriveDeviceId(mobileKeys.publicKeyRaw);
     const { do2, code, hostWs, complete, send, request } = await setup();
 
-    const pending = complete(code, mobileId, { ed25519PublicKey: mobilePub });
+    const pending = complete(code, 'real', { ed25519PublicKey: mobilePub });
     await relayed(hostWs!);
     await send(hostWs!, { type: 'pair_accept', mobileDeviceId: mobileId });
     expect((await pending).status).toBe(200);
@@ -163,7 +182,7 @@ describe('host-confirmed pairing (SB-1348)', () => {
     await relayed(hostWs!);
     await relayed(pairCliWs);
 
-    await send(pairCliWs, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    await send(pairCliWs, { type: 'pair_accept', mobileDeviceId: M1 });
     expect((await pending).status).toBe(200);
   });
 
@@ -175,12 +194,12 @@ describe('host-confirmed pairing (SB-1348)', () => {
 
     const pending = complete(code);
     await relayed(hostWs!);
-    await send(hostWs!, { type: 'pair_reject', mobileDeviceId: 'mobile-1' });
+    await send(hostWs!, { type: 'pair_reject', mobileDeviceId: M1 });
 
     expect((await pending).status).toBe(403);
     expect(hostWs!.messagesOfType('pair_result')).toHaveLength(0);
     expect(do2.isPaired(AGENT_1, 'mobile-old')).toBe(true);
-    expect(do2.getDevice('mobile-1')).toBeNull();
+    expect(do2.getDevice(M1)).toBeNull();
     expect(oldWs.messagesOfType('device_unpaired')).toHaveLength(0);
   });
 
@@ -189,13 +208,13 @@ describe('host-confirmed pairing (SB-1348)', () => {
     const pending = complete(code);
     await relayed(hostWs!);
 
-    await send(hostWs!, { type: 'pair_reject', mobileDeviceId: 'mobile-1' });
+    await send(hostWs!, { type: 'pair_reject', mobileDeviceId: M1 });
     expect((await pending).status).toBe(403);
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M1 });
 
-    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: 'mobile-1', ok: false }]);
-    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(false);
-    expect(do2.getDevice('mobile-1')).toBeNull();
+    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: M1, ok: false }]);
+    expect(do2.isPaired(AGENT_1, M1)).toBe(false);
+    expect(do2.getDevice(M1)).toBeNull();
   });
 
   it('evicts the old mobile only when the host accepts', async () => {
@@ -208,9 +227,9 @@ describe('host-confirmed pairing (SB-1348)', () => {
     await relayed(hostWs!);
     expect(oldWs.messagesOfType('device_unpaired')).toHaveLength(0);
 
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M1 });
     expect((await pending).status).toBe(200);
-    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(true);
+    expect(do2.isPaired(AGENT_1, M1)).toBe(true);
     expect(do2.isPaired(AGENT_1, 'mobile-old')).toBe(false);
     expect(oldWs.messagesOfType('device_unpaired')[0]).toMatchObject({ reason: 'replaced_by_new_pairing' });
     // The orphaned row is gone, so its socket closes after the notice
@@ -228,7 +247,7 @@ describe('host-confirmed pairing (SB-1348)', () => {
 
     const pending = complete(code);
     await relayed(hostWs!);
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M1 });
     expect((await pending).status).toBe(200);
 
     expect(oldWs.messagesOfType('device_unpaired')).toHaveLength(1);
@@ -253,10 +272,10 @@ describe('host-confirmed pairing (SB-1348)', () => {
     expect((await pending).status).toBe(504);
     expect(heldCount()).toBe(0);
 
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
-    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(false);
-    expect(do2.getDevice('mobile-1')).toBeNull();
-    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: 'mobile-1', ok: false }]);
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M1 });
+    expect(do2.isPaired(AGENT_1, M1)).toBe(false);
+    expect(do2.getDevice(M1)).toBeNull();
+    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: M1, ok: false }]);
   });
 
   it('ignores a decision for the wrong mobile or from a mobile-typed socket', async () => {
@@ -271,15 +290,15 @@ describe('host-confirmed pairing (SB-1348)', () => {
 
     await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-other' });
     await send(hostWs!, { type: 'pair_reject', mobileDeviceId: 'mobile-other' });
-    await send(spoofWs, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
-    await send(spoofWs, { type: 'pair_reject', mobileDeviceId: 'mobile-1' });
+    await send(spoofWs, { type: 'pair_accept', mobileDeviceId: M1 });
+    await send(spoofWs, { type: 'pair_reject', mobileDeviceId: M1 });
     expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: 'mobile-other', ok: false }]);
-    expect(spoofWs.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: 'mobile-1', ok: false }]);
-    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(false);
+    expect(spoofWs.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: M1, ok: false }]);
+    expect(do2.isPaired(AGENT_1, M1)).toBe(false);
     expect(heldCount()).toBe(1);
 
     // Still held: the real host's accept goes through.
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M1 });
     expect((await pending).status).toBe(200);
   });
 
@@ -294,13 +313,13 @@ describe('host-confirmed pairing (SB-1348)', () => {
     const hostWs = await authWs(AGENT_1, 'host', true);
     const types = hostWs.sent.map((m) => (m as { type: string }).type);
     expect(hostWs.messagesOfType('pair_complete')).toHaveLength(1);
-    expect(hostWs.messagesOfType('pair_complete')[0]).toMatchObject({ mobileDeviceId: 'mobile-1', pairMac: 'bWFj' });
+    expect(hostWs.messagesOfType('pair_complete')[0]).toMatchObject({ mobileDeviceId: M1, pairMac: 'bWFj' });
     expect(types.indexOf('auth')).toBeGreaterThanOrEqual(0);
     expect(types.indexOf('auth')).toBeLessThan(types.indexOf('pair_complete'));
 
-    await send(hostWs, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    await send(hostWs, { type: 'pair_accept', mobileDeviceId: M1 });
     expect((await pending).status).toBe(200);
-    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(true);
+    expect(do2.isPaired(AGENT_1, M1)).toBe(true);
   });
 
   it('a new /pair/initiate supersedes the held request with 409', async () => {
@@ -316,23 +335,23 @@ describe('host-confirmed pairing (SB-1348)', () => {
     const freshWs = await authWs(AGENT_1, 'host', true);
     expect(freshWs.messagesOfType('pair_complete')).toHaveLength(0);
 
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
-    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: 'mobile-1', ok: false }]);
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M1 });
+    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: M1, ok: false }]);
 
     const second = complete(code2, 'mobile-2');
     await relayed(hostWs!, 2);
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-2' });
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M2 });
     expect((await second).status).toBe(200);
-    expect(do2.isPaired(AGENT_1, 'mobile-2')).toBe(true);
-    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(false);
-    expect(do2.getDevice('mobile-1')).toBeNull();
+    expect(do2.isPaired(AGENT_1, M2)).toBe(true);
+    expect(do2.isPaired(AGENT_1, M1)).toBe(false);
+    expect(do2.getDevice(M1)).toBeNull();
   });
 
   it.each([
     {
       conflict: 'device-type',
       introduce: (do2: Awaited<ReturnType<typeof setup>>['do2']) => {
-        do2.registerDevice('mobile-1', testKey('ed25519-pub-key-mobile-1'), 'host');
+        do2.registerDevice(M1, testKey('ed25519-pub-key-mobile-1'), 'host');
       },
     },
     {
@@ -351,12 +370,12 @@ describe('host-confirmed pairing (SB-1348)', () => {
     await relayed(hostWs!);
     introduce(do2);
 
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M1 });
     expect((await pending).status).toBe(409);
-    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: 'mobile-1', ok: false }]);
+    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: M1, ok: false }]);
     expect(heldCount()).toBe(0);
     expect(do2.isPaired(AGENT_1, 'mobile-old')).toBe(true);
-    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(false);
+    expect(do2.isPaired(AGENT_1, M1)).toBe(false);
     expect(oldWs.messagesOfType('device_unpaired')).toHaveLength(0);
   });
 
@@ -369,11 +388,11 @@ describe('host-confirmed pairing (SB-1348)', () => {
       throw new Error('storage failure');
     });
 
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M1 });
     const res = await pending;
     expect(res.status).toBe(500);
     expect(await res.json()).toEqual({ error: 'Pairing failed' });
-    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: 'mobile-1', ok: false }]);
+    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: M1, ok: false }]);
     expect(heldCount()).toBe(0);
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('[pair]'), expect.any(Error));
   });
@@ -392,13 +411,13 @@ describe('host-confirmed pairing (SB-1348)', () => {
       throw new Error('storage failure');
     });
 
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M1 });
     expect((await pending).status).toBe(500);
-    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: 'mobile-1', ok: false }]);
+    expect(hostWs!.messagesOfType('pair_result')).toEqual([{ type: 'pair_result', mobileDeviceId: M1, ok: false }]);
     expect(heldCount()).toBe(0);
     expect(do2.isPaired(AGENT_1, 'mobile-old')).toBe(true);
     expect(do2.getDevice('mobile-old')).not.toBeNull();
-    expect(do2.getDevice('mobile-1')).toBeNull();
+    expect(do2.getDevice(M1)).toBeNull();
     expect(oldWs.messagesOfType('device_unpaired')).toHaveLength(0);
   });
 
@@ -419,9 +438,9 @@ describe('host-confirmed pairing (SB-1348)', () => {
     await relayed(hostWs!, 2);
     expect(heldCount()).toBe(1);
 
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-2' });
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M2 });
     expect((await second).status).toBe(200);
-    expect(do2.isPaired(AGENT_1, 'mobile-2')).toBe(true);
+    expect(do2.isPaired(AGENT_1, M2)).toBe(true);
   });
 
   it.each([
@@ -446,23 +465,23 @@ describe('host-confirmed pairing (SB-1348)', () => {
     // Uninstall deletes the host row, so its socket is closed and the late
     // accept is ignored; after an unpair the open socket gets ok:false
     expect(hostWs!.closeCode).toBe(hostClosed ? 4004 : undefined);
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M1 });
     expect(hostWs!.messagesOfType('pair_result')).toEqual(
-      hostClosed ? [] : [{ type: 'pair_result', mobileDeviceId: 'mobile-1', ok: false }]
+      hostClosed ? [] : [{ type: 'pair_result', mobileDeviceId: M1, ok: false }]
     );
-    expect(do2.isPaired(AGENT_1, 'mobile-1')).toBe(false);
-    expect(do2.getDevice('mobile-1')).toBeNull();
+    expect(do2.isPaired(AGENT_1, M1)).toBe(false);
+    expect(do2.getDevice(M1)).toBeNull();
   });
 
   it.each([
     { field: 'deviceId', value: 'd'.repeat(65) },
     { field: 'ed25519PublicKey', value: 'k'.repeat(129) },
     { field: 'x25519PublicKey', value: 'x'.repeat(129) },
-  ])('rejects an oversized $field with 400 without consuming the code', async ({ field, value }) => {
+  ])('rejects an oversized or non-canonical $field with 400 without consuming the code', async ({ field, value }) => {
     const { code, hostWs, complete, send, request, do2 } = await setup();
     const body: Record<string, string> = {
       pairingCode: code,
-      deviceId: 'mobile-1',
+      deviceId: M1,
       ed25519PublicKey: testKey('ed25519-pub-key-mobile-1'),
       x25519PublicKey: testKey('x25519-pub-key-mobile-1'),
       [field]: value,
@@ -471,18 +490,52 @@ describe('host-confirmed pairing (SB-1348)', () => {
 
     const pending = complete(code);
     await relayed(hostWs!);
-    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: 'mobile-1' });
+    await send(hostWs!, { type: 'pair_accept', mobileDeviceId: M1 });
     expect((await pending).status).toBe(200);
   });
 
+  it('rejects a deviceId bound to another key with 400 before any hold or relay', async () => {
+    const { code, hostWs, complete, request, do2, heldCount } = await setup();
+    // Victim M1 is already paired under its own key; the attacker claims M1 with a different key
+    do2.registerDevice(M1, testKey('ed25519-pub-key-mobile-1'), 'mobile');
+
+    const res = await do2.fetch(request('/pair/complete', {
+      pairingCode: code,
+      deviceId: M1,
+      ed25519PublicKey: testKey('ed25519-pub-key-attacker'),
+      x25519PublicKey: testKey('x25519-pub-key-attacker'),
+    }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'deviceId does not match ed25519PublicKey' });
+    expect(heldCount()).toBe(0);
+    expect(hostWs!.messagesOfType('pair_complete')).toHaveLength(0);
+    expect(do2.getDevice(M1)!.ed25519PublicKey).toBe(testKey('ed25519-pub-key-mobile-1'));
+
+    // The code was not consumed
+    const pending = complete(code);
+    await relayed(hostWs!);
+    expect(heldCount()).toBe(1);
+    pending.catch(() => {});
+  });
+
   it.each([
-    { conflict: 'device-type', deviceId: 'mobile-1', key: testKey('ed25519-pub-key-mobile-1'), type: 'host' as const },
-    { conflict: 'Ed25519 key', deviceId: 'mobile-squatter', key: testKey('ed25519-pub-key-mobile-1'), type: 'mobile' as const },
-  ])('rejects a $conflict conflict with 409 before evicting the old mobile', async ({ deviceId, key, type }) => {
+    {
+      conflict: 'device-type',
+      introduce: (do2: Awaited<ReturnType<typeof setup>>['do2']) => {
+        do2.registerDevice(M1, testKey('ed25519-pub-key-mobile-1'), 'host');
+      },
+    },
+    {
+      conflict: 'Ed25519 key',
+      introduce: (do2: Awaited<ReturnType<typeof setup>>['do2']) => {
+        do2.registerDevice('mobile-squatter', testKey('ed25519-pub-key-mobile-1'), 'mobile');
+      },
+    },
+  ])('rejects a $conflict conflict with 409 before evicting the old mobile', async ({ introduce }) => {
     const { do2, code, complete } = await setup({ pairConfirm: false, liveHost: false });
     do2.registerDevice('mobile-old', 'ed25519-pub-key-mobile-old', 'mobile');
     do2.createPairing(AGENT_1, 'mobile-old');
-    do2.registerDevice(deviceId, key, type);
+    introduce(do2);
 
     expect((await complete(code)).status).toBe(409);
     expect(do2.isPaired(AGENT_1, 'mobile-old')).toBe(true);

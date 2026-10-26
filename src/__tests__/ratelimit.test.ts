@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import {
   rateLimitResponse,
   MAX_WS_CONNECTIONS_PER_DEVICE,
@@ -10,7 +10,7 @@ import {
 } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
-import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from './helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, deriveDeviceId, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from './helpers/crypto';
 
 /** Pad an arbitrary string to a 32-hex device ID (test-only helper). */
 function toHex32(s: string): string {
@@ -18,6 +18,14 @@ function toHex32(s: string): string {
   return hex.slice(0, 32).padEnd(32, '0');
 }
 import type { SignalingDO } from '../signaling';
+
+// /pair/complete requires the mobile ID to be derived from the key it sends
+const MOBILE_KEY = testKey('pub-key-mobile');
+let MOBILE_ID: string;
+
+beforeAll(async () => {
+  MOBILE_ID = await deriveDeviceId(Uint8Array.from(atob(MOBILE_KEY), (c) => c.charCodeAt(0)));
+});
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
@@ -112,8 +120,8 @@ describe('DO rate limiting integration', () => {
       // /pair/complete should still work (separate counter)
       const { status } = await postJSON('/pair/complete', {
         pairingCode: 'ABCDEF',
-        deviceId: 'mobile-1',
-        ed25519PublicKey: testKey('pub-key-mobile'),
+        deviceId: MOBILE_ID,
+        ed25519PublicKey: MOBILE_KEY,
         x25519PublicKey: testKey('x25519-key-mobile'),
       });
       // 404 because the pairing code is invalid, but NOT 429
@@ -397,8 +405,8 @@ describe('pairing code expiry enforcement', () => {
 
     const { status, data } = await postJSON('/pair/complete', {
       pairingCode: code,
-      deviceId: 'mobile-1',
-      ed25519PublicKey: testKey('pub-key-mobile'),
+      deviceId: MOBILE_ID,
+      ed25519PublicKey: MOBILE_KEY,
       x25519PublicKey: testKey('x25519-key-mobile'),
     });
 
@@ -419,8 +427,8 @@ describe('pairing code expiry enforcement', () => {
 
     const { status } = await postJSON('/pair/complete', {
       pairingCode: code,
-      deviceId: 'mobile-1',
-      ed25519PublicKey: testKey('pub-key-mobile'),
+      deviceId: MOBILE_ID,
+      ed25519PublicKey: MOBILE_KEY,
       x25519PublicKey: testKey('x25519-key-mobile'),
     });
 
@@ -468,8 +476,8 @@ describe('legitimate usage patterns', () => {
 
     const { status } = await postJSON('/pair/complete', {
       pairingCode: initResult.data['pairingCode'],
-      deviceId: 'mobile-1',
-      ed25519PublicKey: testKey('pub-key-mobile'),
+      deviceId: MOBILE_ID,
+      ed25519PublicKey: MOBILE_KEY,
       x25519PublicKey: testKey('x25519-key-mobile'),
     });
     expect(status).toBe(200);

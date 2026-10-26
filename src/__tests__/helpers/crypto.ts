@@ -37,6 +37,16 @@ export function testKey(label: string): string {
   return bytesToBase64(bytes);
 }
 
+/**
+ * Independent test-side device ID derivation (first 16 bytes of
+ * SHA-256(publicKey), lowercase hex), deliberately not importing the
+ * production implementation so a production bug isn't masked.
+ */
+export async function deriveDeviceId(publicKeyRaw: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', publicKeyRaw));
+  return Array.from(digest.slice(0, 16), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 export async function signEd25519(privateKey: CryptoKey, message: Uint8Array): Promise<Uint8Array> {
   const sig = await crypto.subtle.sign('Ed25519', privateKey, message);
   return new Uint8Array(sig);

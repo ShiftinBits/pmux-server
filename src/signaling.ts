@@ -20,7 +20,7 @@ import type {
   PairRejectMessage,
   PairResultMessage,
 } from '@pocketmux/shared';
-import { verifyEd25519Signature, createJWT, verifyJWT, TokenExpiredError } from './auth';
+import { verifyEd25519Signature, deriveDeviceId, createJWT, verifyJWT, TokenExpiredError } from './auth';
 import { generateTurnCredentials, TURN_REFRESH_AGE_MS, TURN_MAX_SERVE_AGE_MS } from './turn';
 import {
   rateLimitResponse,
@@ -173,9 +173,8 @@ const SIGNALING_SESSION_TIMEOUT_MS = 12_000; // 12 seconds
  */
 const PAIR_CONFIRM_TIMEOUT_MS = 30_000; // 30 seconds
 
-/** Upper bounds on /pair/complete identity fields (a 32-hex ID and base64 32-byte keys fit well inside). */
+/** Upper bound on the /pair/complete deviceId (a 32-hex derived ID fits well inside). Keys are checked as canonical 32-byte base64. */
 const MAX_PAIR_DEVICE_ID_LENGTH = 64;
-const MAX_PAIR_PUBLIC_KEY_LENGTH = 128;
 
 // --- Durable Object ---
 
@@ -1844,14 +1843,20 @@ export class SignalingDO implements DurableObject {
       );
     }
 
-    // Bound what a held confirming-path request can pin in memory. Validate
-    // before consuming the code.
+    // Bound what a held confirming-path request can pin in memory and require
+    // canonical 32-byte keys. Validate before consuming the code.
     if (
       typeof body.deviceId !== 'string' || body.deviceId.length > MAX_PAIR_DEVICE_ID_LENGTH ||
-      typeof body.ed25519PublicKey !== 'string' || body.ed25519PublicKey.length > MAX_PAIR_PUBLIC_KEY_LENGTH ||
-      typeof body.x25519PublicKey !== 'string' || body.x25519PublicKey.length > MAX_PAIR_PUBLIC_KEY_LENGTH
+      !isBase64OfLength(body.ed25519PublicKey, 32) ||
+      !isBase64OfLength(body.x25519PublicKey, 32)
     ) {
       return jsonResponse({ error: 'Invalid deviceId or public key' }, 400);
+    }
+
+    // The ID must be derived from the key, so a caller cannot claim another
+    // device's ID with its own key. Still before consuming the code.
+    if (body.deviceId !== await deriveDeviceId(base64ToBytes(body.ed25519PublicKey))) {
+      return jsonResponse({ error: 'deviceId does not match ed25519PublicKey' }, 400);
     }
 
     // pairMac is an opaque pass-through (the agent verifies it); optional so

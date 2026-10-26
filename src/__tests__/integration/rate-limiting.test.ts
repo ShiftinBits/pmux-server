@@ -9,14 +9,22 @@
  * 5. Different endpoints have independent rate limits
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import { createTestDO } from '../helpers/mock-do';
-import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from '../helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, deriveDeviceId, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from '../helpers/crypto';
 import type { SignalingDO } from '../../signaling';
 
 // Limits mirror the native Workers Rate Limiting bindings (wrangler.toml).
 const PAIR_LIMIT = 10;
 const TOKEN_LIMIT = 30;
+
+// /pair/complete requires the mobile ID to be derived from the key it sends
+const MOBILE_KEY = testKey('pub-key-mobile');
+let MOBILE_ID: string;
+
+beforeAll(async () => {
+  MOBILE_ID = await deriveDeviceId(Uint8Array.from(atob(MOBILE_KEY), (c) => c.charCodeAt(0)));
+});
 
 let doInstance: SignalingDO;
 
@@ -169,8 +177,8 @@ describe('Rate limiting integration [T3.11]', () => {
       // /pair/complete should still work (returns 404 for bad code, not 429)
       const complete = await postJSON('/pair/complete', {
         pairingCode: 'ABCDEF',
-        deviceId: 'mobile-sep-1',
-        ed25519PublicKey: testKey('pub-key-mobile'),
+        deviceId: MOBILE_ID,
+        ed25519PublicKey: MOBILE_KEY,
         x25519PublicKey: testKey('x25519-key-mobile'),
       });
       expect(complete.status).toBe(404); // Bad code, but NOT rate limited
