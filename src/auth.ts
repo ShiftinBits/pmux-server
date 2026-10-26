@@ -82,6 +82,24 @@ export async function verifyEd25519Signature(
   return crypto.subtle.verify('Ed25519', key, signature, message);
 }
 
+/**
+ * Derive a device ID from a raw Ed25519 public key: lowercase hex of the first
+ * 16 bytes of SHA-256(publicKey), 32 hex chars (SPEC §7, docs/SECURITY.md).
+ * Matches the agent's identity.go deriveDeviceID and the mobile app's
+ * identity.ts deriveDeviceId.
+ */
+export async function deriveDeviceId(publicKey: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(publicKey)));
+  return bytesToHex(digest.subarray(0, 16));
+}
+
+/** Lowercase hex encoding of a byte array. */
+export function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 // --- HMAC-SHA256 helpers for JWT ---
 
 const hmacKeys = new Map<string, Promise<CryptoKey>>();

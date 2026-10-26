@@ -20,7 +20,7 @@ import type {
   PairRejectMessage,
   PairResultMessage,
 } from '@pocketmux/shared';
-import { verifyEd25519Signature, createJWT, verifyJWT, TokenExpiredError } from './auth';
+import { verifyEd25519Signature, deriveDeviceId, createJWT, verifyJWT, TokenExpiredError } from './auth';
 import { generateTurnCredentials, TURN_REFRESH_AGE_MS, TURN_MAX_SERVE_AGE_MS } from './turn';
 import {
   rateLimitResponse,
@@ -173,9 +173,8 @@ const SIGNALING_SESSION_TIMEOUT_MS = 12_000; // 12 seconds
  */
 const PAIR_CONFIRM_TIMEOUT_MS = 30_000; // 30 seconds
 
-/** Upper bounds on /pair/complete identity fields (a 32-hex ID and base64 32-byte keys fit well inside). */
+/** Upper bound on the /pair/complete deviceId (a 32-hex derived ID fits well inside). Keys are checked as canonical 32-byte base64. */
 const MAX_PAIR_DEVICE_ID_LENGTH = 64;
-const MAX_PAIR_PUBLIC_KEY_LENGTH = 128;
 
 // --- Durable Object ---
 
@@ -329,8 +328,9 @@ export class SignalingDO implements DurableObject {
   // --- Device CRUD ---
 
   /**
-   * Register a device. New devices are inserted; existing devices are updated
-   * only if the device_type matches. Throws DeviceTypeConflictError on mismatch.
+   * Register a device. New devices are inserted; for an existing device the
+   * device_type must match (DeviceTypeConflictError otherwise) and only the
+   * name is updated. The stored public key of an existing device is never changed.
    */
   registerDevice(
     deviceId: string,
@@ -362,15 +362,10 @@ export class SignalingDO implements DurableObject {
       throw new DeviceTypeConflictError(deviceId, existing.deviceType, deviceType);
     }
 
-    // Update allowed fields for existing devices (key rotation, name change)
-    if (existing.ed25519PublicKey !== ed25519PublicKey || existing.name !== (name ?? null)) {
-      this.sql.exec(
-        'UPDATE devices SET ed25519_public_key = ?, name = ?, created_at = ? WHERE id = ?',
-        ed25519PublicKey,
-        name ?? null,
-        now,
-        deviceId
-      );
+    // Existing devices only get a name change. The stored key is never
+    // replaced: rotation means a new derived ID, i.e. a new device.
+    if (existing.name !== (name ?? null)) {
+      this.sql.exec('UPDATE devices SET name = ? WHERE id = ?', name ?? null, deviceId);
     }
 
     return { deviceId };
@@ -1755,6 +1750,12 @@ export class SignalingDO implements DurableObject {
     if (!isBase64OfLength(body.x25519PublicKey, 32)) {
       return jsonResponse({ error: 'Invalid x25519PublicKey' }, 400);
     }
+    // A registered device is held to its stored key by the equality check
+    // below, so only a new device's body key needs to be canonical here.
+    const existing = this.getDevice(body.deviceId);
+    if (!existing && !isBase64OfLength(body.ed25519PublicKey, 32)) {
+      return jsonResponse({ error: 'Invalid ed25519PublicKey' }, 400);
+    }
 
     // Consume the nonce challenge (single-use, validates expiry and device binding)
     if (!this.consumeChallenge(body.nonce, body.deviceId)) {
@@ -1762,7 +1763,6 @@ export class SignalingDO implements DurableObject {
     }
 
     // Verify signature against stored key (if device exists) or request body key
-    const existing = this.getDevice(body.deviceId);
     const verifyKey = existing ? existing.ed25519PublicKey : body.ed25519PublicKey;
     const message = new TextEncoder().encode(body.deviceId + '|' + body.nonce);
 
@@ -1776,6 +1776,13 @@ export class SignalingDO implements DurableObject {
     }
     if (!valid) {
       return jsonResponse({ error: 'Signature verification failed' }, 401);
+    }
+
+    // A new device's ID must be derived from its key, so an ID cannot be
+    // claimed with a key it does not belong to. Checked after the signature so
+    // an unauthenticated caller learns nothing.
+    if (!existing && body.deviceId !== await deriveDeviceId(base64ToBytes(body.ed25519PublicKey))) {
+      return jsonResponse({ error: 'deviceId does not match ed25519PublicKey' }, 401);
     }
 
     // Checked after the signature so an unauthenticated caller learns nothing
@@ -1844,14 +1851,20 @@ export class SignalingDO implements DurableObject {
       );
     }
 
-    // Bound what a held confirming-path request can pin in memory. Validate
-    // before consuming the code.
+    // Bound what a held confirming-path request can pin in memory and require
+    // canonical 32-byte keys. Validate before consuming the code.
     if (
       typeof body.deviceId !== 'string' || body.deviceId.length > MAX_PAIR_DEVICE_ID_LENGTH ||
-      typeof body.ed25519PublicKey !== 'string' || body.ed25519PublicKey.length > MAX_PAIR_PUBLIC_KEY_LENGTH ||
-      typeof body.x25519PublicKey !== 'string' || body.x25519PublicKey.length > MAX_PAIR_PUBLIC_KEY_LENGTH
+      !isBase64OfLength(body.ed25519PublicKey, 32) ||
+      !isBase64OfLength(body.x25519PublicKey, 32)
     ) {
       return jsonResponse({ error: 'Invalid deviceId or public key' }, 400);
+    }
+
+    // The ID must be derived from the key, so a caller cannot claim another
+    // device's ID with its own key. Still before consuming the code.
+    if (body.deviceId !== await deriveDeviceId(base64ToBytes(body.ed25519PublicKey))) {
+      return jsonResponse({ error: 'deviceId does not match ed25519PublicKey' }, 400);
     }
 
     // pairMac is an opaque pass-through (the agent verifies it); optional so
@@ -1961,12 +1974,15 @@ export class SignalingDO implements DurableObject {
 
   /**
    * Whether the mobile can't be registered: its ID belongs to a non-mobile
-   * device, or its Ed25519 key is already registered to a different device
+   * device or is registered under a different key, or its Ed25519 key is already registered to a different device
    * (devices.ed25519_public_key is UNIQUE).
    */
   private hasMobileConflict(mobileDeviceId: string, mobileEd25519PublicKey: string): boolean {
     const existing = this.getDevice(mobileDeviceId);
     if (existing && existing.deviceType !== 'mobile') return true;
+    // registerDevice never replaces an existing key, so a row holding a
+    // different key would leave the mobile paired under a key it can't sign with.
+    if (existing && existing.ed25519PublicKey !== mobileEd25519PublicKey) return true;
     const keyOwners = this.sql
       .exec('SELECT 1 FROM devices WHERE ed25519_public_key = ? AND id != ?', mobileEd25519PublicKey, mobileDeviceId)
       .toArray();
@@ -1993,7 +2009,8 @@ export class SignalingDO implements DurableObject {
     this.state.storage.transactionSync(() => {
       // Remove the old pairing (also cleans up an orphaned old mobile device)
       if (existingMobileId) this.removePairing(hostDeviceId);
-      // Validated above, so this registers (or refreshes) a mobile device
+      // Validated above, so this registers a new mobile device or, for an
+      // existing one, refreshes only its name (the stored key never changes)
       this.registerDevice(mobileDeviceId, mobileEd25519PublicKey, 'mobile', mobileName);
       this.createPairing(hostDeviceId, mobileDeviceId);
     });

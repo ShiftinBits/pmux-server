@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { createTestDOCompat as createTestDO } from './helpers/mock-do';
 import { verifyJWT } from '../auth';
 import {
-  generateEd25519Keypair,
+  newTestDevice,
   bytesToBase64,
   signEd25519,
   signedPairInitiateBodyWithChallenge,
@@ -13,14 +13,18 @@ import type { SignalingDO } from '../signaling';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
-// Valid 32-hex device IDs (format: hex(SHA-256(publicKey)[0:16]))
-const AGENT_1 = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
+// AGENT_1 is derived from the host key, as /pair/initiate requires of a new device.
+// AGENT_2 only ever receives a challenge, so it needs no key.
+let AGENT_1: string;
+let host: Awaited<ReturnType<typeof newTestDevice>>;
 const AGENT_2 = 'a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2';
 
 let doInstance: SignalingDO;
 
 beforeEach(async () => {
   doInstance = await createTestDO();
+  host = await newTestDevice();
+  AGENT_1 = host.deviceId;
 });
 
 async function postJSON(
@@ -51,7 +55,7 @@ async function registerAgentDevice(
 
 describe('POST /token', () => {
   it('issues a JWT for a valid nonce+signature', async () => {
-    const { keyPair, publicKeyRaw } = await generateEd25519Keypair();
+    const { keyPair, publicKeyRaw } = host;
     const ed25519PublicKeyBase64 = bytesToBase64(publicKeyRaw);
 
     // Register device
@@ -82,7 +86,7 @@ describe('POST /token', () => {
   });
 
   it('rejects an invalid signature', async () => {
-    const { publicKeyRaw, keyPair } = await generateEd25519Keypair();
+    const { keyPair, publicKeyRaw } = host;
     const ed25519PublicKeyBase64 = bytesToBase64(publicKeyRaw);
 
     await registerAgentDevice(AGENT_1, ed25519PublicKeyBase64, keyPair);
@@ -102,7 +106,7 @@ describe('POST /token', () => {
   });
 
   it('rejects a non-base64 signature with 401', async () => {
-    const { publicKeyRaw, keyPair } = await generateEd25519Keypair();
+    const { keyPair, publicKeyRaw } = host;
     await registerAgentDevice(AGENT_1, bytesToBase64(publicKeyRaw), keyPair);
     const nonce = await fetchChallenge(doInstance, AGENT_1);
 
@@ -149,7 +153,7 @@ describe('POST /token', () => {
   });
 
   it('rejects a replayed nonce (replay attack)', async () => {
-    const { keyPair, publicKeyRaw } = await generateEd25519Keypair();
+    const { keyPair, publicKeyRaw } = host;
     const ed25519PublicKeyBase64 = bytesToBase64(publicKeyRaw);
 
     await registerAgentDevice(AGENT_1, ed25519PublicKeyBase64, keyPair);
@@ -175,7 +179,7 @@ describe('POST /token', () => {
   });
 
   it('rejects a nonce issued to a different device', async () => {
-    const { keyPair, publicKeyRaw } = await generateEd25519Keypair();
+    const { keyPair, publicKeyRaw } = host;
     const ed25519PublicKeyBase64 = bytesToBase64(publicKeyRaw);
 
     await registerAgentDevice(AGENT_1, ed25519PublicKeyBase64, keyPair);

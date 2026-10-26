@@ -25,19 +25,13 @@
  * Uses Web Crypto API (Cloudflare Workers compatible).
  */
 
-import { getHmacKey, textEncode } from './auth';
+import { bytesToHex, getHmacKey, textEncode } from './auth';
 
 const CLOCK_SKEW_TOLERANCE_S = 60;
 
 /** Expected nonce length: 32 hex chars (16 random bytes). */
 const NONCE_HEX_LENGTH = 32;
 const NONCE_HEX_PATTERN = /^[0-9a-f]{32}$/;
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-}
 
 /**
  * Legacy: compute HMAC-SHA256(secret, "{timestamp}:{pathname}") as hex.

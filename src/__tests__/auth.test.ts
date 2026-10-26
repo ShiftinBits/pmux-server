@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { verifyEd25519Signature, createJWT, verifyJWT, TokenExpiredError } from '../auth';
+import { deriveDeviceId, verifyEd25519Signature, createJWT, verifyJWT, TokenExpiredError } from '../auth';
 
 // --- Ed25519 helpers ---
 
@@ -17,6 +17,15 @@ async function signEd25519(privateKey: CryptoKey, message: Uint8Array): Promise<
 }
 
 // --- Ed25519 signature verification ---
+
+describe('deriveDeviceId', () => {
+  it('matches the SHA-256 vector for bytes 0..31 (first 16 bytes, lowercase hex)', async () => {
+    const publicKey = Uint8Array.from({ length: 32 }, (_, i) => i);
+    const id = await deriveDeviceId(publicKey);
+    expect(id).toBe('630dcd2966c4336691125448bbb25b4f');
+    expect(id).toMatch(/^[0-9a-f]{32}$/);
+  });
+});
 
 describe('verifyEd25519Signature', () => {
   it('verifies a valid signature', async () => {

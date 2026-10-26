@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import {
   rateLimitResponse,
   MAX_WS_CONNECTIONS_PER_DEVICE,
@@ -10,14 +10,17 @@ import {
 } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
-import { generateEd25519Keypair, bytesToBase64, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from './helpers/crypto';
+import { newTestDevice, deriveDeviceId, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from './helpers/crypto';
 
-/** Pad an arbitrary string to a 32-hex device ID (test-only helper). */
-function toHex32(s: string): string {
-  const hex = Array.from(s).map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
-  return hex.slice(0, 32).padEnd(32, '0');
-}
 import type { SignalingDO } from '../signaling';
+
+// /pair/complete requires the mobile ID to be derived from the key it sends
+const MOBILE_KEY = testKey('pub-key-mobile');
+let MOBILE_ID: string;
+
+beforeAll(async () => {
+  MOBILE_ID = await deriveDeviceId(Uint8Array.from(atob(MOBILE_KEY), (c) => c.charCodeAt(0)));
+});
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
@@ -68,9 +71,9 @@ describe('DO rate limiting integration', () => {
   describe('pairing rate limits', () => {
     it('allows pairing requests under the limit', async () => {
       for (let i = 0; i < 10; i++) {
-        const keys = await generateEd25519Keypair();
+        const dev = await newTestDevice();
         const body = await signedPairInitiateBodyWithChallenge(
-          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
+          doInstance, dev.deviceId, dev.keyPair, dev.publicKeyB64, HOST_X25519_KEY
         );
         const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
@@ -80,9 +83,9 @@ describe('DO rate limiting integration', () => {
     it('blocks 11th pairing request with 429', async () => {
       // Send 10 requests (the limit)
       for (let i = 0; i < 10; i++) {
-        const keys = await generateEd25519Keypair();
+        const dev = await newTestDevice();
         const body = await signedPairInitiateBodyWithChallenge(
-          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
+          doInstance, dev.deviceId, dev.keyPair, dev.publicKeyB64, HOST_X25519_KEY
         );
         const { status } = await postJSON('/pair/initiate', body);
         expect(status).toBe(200);
@@ -102,9 +105,9 @@ describe('DO rate limiting integration', () => {
     it('rate limits /pair/complete separately from /pair/initiate', async () => {
       // Exhaust /pair/initiate limit
       for (let i = 0; i < 10; i++) {
-        const keys = await generateEd25519Keypair();
+        const dev = await newTestDevice();
         const body = await signedPairInitiateBodyWithChallenge(
-          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
+          doInstance, dev.deviceId, dev.keyPair, dev.publicKeyB64, HOST_X25519_KEY
         );
         await postJSON('/pair/initiate', body);
       }
@@ -112,8 +115,8 @@ describe('DO rate limiting integration', () => {
       // /pair/complete should still work (separate counter)
       const { status } = await postJSON('/pair/complete', {
         pairingCode: 'ABCDEF',
-        deviceId: 'mobile-1',
-        ed25519PublicKey: testKey('pub-key-mobile'),
+        deviceId: MOBILE_ID,
+        ed25519PublicKey: MOBILE_KEY,
         x25519PublicKey: testKey('x25519-key-mobile'),
       });
       // 404 because the pairing code is invalid, but NOT 429
@@ -123,9 +126,9 @@ describe('DO rate limiting integration', () => {
     it('different IPs have separate rate limits', async () => {
       // Fill limit for IP 1
       for (let i = 0; i < 10; i++) {
-        const keys = await generateEd25519Keypair();
+        const dev = await newTestDevice();
         const body = await signedPairInitiateBodyWithChallenge(
-          doInstance, toHex32(`agent-${i}`), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
+          doInstance, dev.deviceId, dev.keyPair, dev.publicKeyB64, HOST_X25519_KEY
         );
         await postJSON('/pair/initiate', body, { 'X-Client-IP': '10.0.0.1' });
       }
@@ -139,9 +142,9 @@ describe('DO rate limiting integration', () => {
       expect(blocked.status).toBe(429);
 
       // IP 2 is still allowed
-      const keys = await generateEd25519Keypair();
+      const dev = await newTestDevice();
       const body = await signedPairInitiateBodyWithChallenge(
-        doInstance, toHex32('agent-allowed'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
+        doInstance, dev.deviceId, dev.keyPair, dev.publicKeyB64, HOST_X25519_KEY
       );
       const allowed = await postJSON('/pair/initiate', body, { 'X-Client-IP': '10.0.0.2' });
       expect(allowed.status).toBe(200);
@@ -385,9 +388,9 @@ describe('pairing code expiry enforcement', () => {
 
   it('rejects pairing code after 5-minute expiry', async () => {
     // Create pairing session
-    const keys = await generateEd25519Keypair();
+    const dev = await newTestDevice();
     const body = await signedPairInitiateBodyWithChallenge(
-      doInstance, toHex32('agent-1'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
+      doInstance, dev.deviceId, dev.keyPair, dev.publicKeyB64, HOST_X25519_KEY
     );
     const initResult = await postJSON('/pair/initiate', body);
     const code = initResult.data['pairingCode'] as string;
@@ -397,8 +400,8 @@ describe('pairing code expiry enforcement', () => {
 
     const { status, data } = await postJSON('/pair/complete', {
       pairingCode: code,
-      deviceId: 'mobile-1',
-      ed25519PublicKey: testKey('pub-key-mobile'),
+      deviceId: MOBILE_ID,
+      ed25519PublicKey: MOBILE_KEY,
       x25519PublicKey: testKey('x25519-key-mobile'),
     });
 
@@ -407,9 +410,9 @@ describe('pairing code expiry enforcement', () => {
   });
 
   it('accepts pairing code within 5-minute window', async () => {
-    const keys = await generateEd25519Keypair();
+    const dev = await newTestDevice();
     const body = await signedPairInitiateBodyWithChallenge(
-      doInstance, toHex32('agent-1'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
+      doInstance, dev.deviceId, dev.keyPair, dev.publicKeyB64, HOST_X25519_KEY
     );
     const initResult = await postJSON('/pair/initiate', body);
     const code = initResult.data['pairingCode'] as string;
@@ -419,8 +422,8 @@ describe('pairing code expiry enforcement', () => {
 
     const { status } = await postJSON('/pair/complete', {
       pairingCode: code,
-      deviceId: 'mobile-1',
-      ed25519PublicKey: testKey('pub-key-mobile'),
+      deviceId: MOBILE_ID,
+      ed25519PublicKey: MOBILE_KEY,
       x25519PublicKey: testKey('x25519-key-mobile'),
     });
 
@@ -459,17 +462,17 @@ describe('legitimate usage patterns', () => {
 
   it('normal pairing flow stays under limits', async () => {
     // A normal user: 1 pair/initiate + 1 pair/complete
-    const keys = await generateEd25519Keypair();
+    const dev = await newTestDevice();
     const body = await signedPairInitiateBodyWithChallenge(
-      doInstance, toHex32('agent-1'), keys.keyPair, bytesToBase64(keys.publicKeyRaw), HOST_X25519_KEY
+      doInstance, dev.deviceId, dev.keyPair, dev.publicKeyB64, HOST_X25519_KEY
     );
     const initResult = await postJSON('/pair/initiate', body);
     expect(initResult.status).toBe(200);
 
     const { status } = await postJSON('/pair/complete', {
       pairingCode: initResult.data['pairingCode'],
-      deviceId: 'mobile-1',
-      ed25519PublicKey: testKey('pub-key-mobile'),
+      deviceId: MOBILE_ID,
+      ed25519PublicKey: MOBILE_KEY,
       x25519PublicKey: testKey('x25519-key-mobile'),
     });
     expect(status).toBe(200);
