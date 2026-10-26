@@ -200,15 +200,42 @@ describe('POST /token', () => {
     expect(data['error']).toContain('Signature verification failed');
   });
 
-  it('rejects a non-base64 signature with 401', async () => {
+  it('rejects a non-base64 signature with 400', async () => {
     const { keyPair, publicKeyRaw } = host;
     await registerAgentDevice(AGENT_1, bytesToBase64(publicKeyRaw), keyPair);
     const nonce = await fetchChallenge(doInstance, AGENT_1);
 
     const { status, data } = await postJSON('/token', { deviceId: AGENT_1, nonce, signature: '!!!' });
 
-    expect(status).toBe(401);
-    expect(data['error']).toBe('Invalid signature format');
+    expect(status).toBe(400);
+    expect(data['error']).toBe('Invalid signature');
+  });
+
+  it.each([
+    ['non-hex', 'z'.repeat(32)],
+    ['65-char', 'a'.repeat(65)],
+  ])('rejects a %s deviceId with 400 without burning the nonce', async (_label, value) => {
+    const { keyPair, publicKeyRaw } = host;
+    await registerAgentDevice(AGENT_1, bytesToBase64(publicKeyRaw), keyPair);
+    const nonce = await fetchChallenge(doInstance, AGENT_1);
+    const signature = await signAuthChallenge(keyPair.privateKey, TEST_ORIGIN, AGENT_1, nonce);
+
+    const bad = await postJSON('/token', { deviceId: value, nonce, signature });
+    expect(bad.status).toBe(400);
+    expect(bad.data['error']).toBe('Invalid deviceId');
+    expect((await postJSON('/token', { deviceId: AGENT_1, nonce, signature })).status).toBe(200);
+  });
+
+  it('rejects a wrong-length base64 signature with 400 without burning the nonce', async () => {
+    const { keyPair, publicKeyRaw } = host;
+    await registerAgentDevice(AGENT_1, bytesToBase64(publicKeyRaw), keyPair);
+    const nonce = await fetchChallenge(doInstance, AGENT_1);
+    const signature = await signAuthChallenge(keyPair.privateKey, TEST_ORIGIN, AGENT_1, nonce);
+
+    const bad = await postJSON('/token', { deviceId: AGENT_1, nonce, signature: bytesToBase64(new Uint8Array(32)) });
+    expect(bad.status).toBe(400);
+    expect(bad.data['error']).toBe('Invalid signature');
+    expect((await postJSON('/token', { deviceId: AGENT_1, nonce, signature })).status).toBe(200);
   });
 
   it('rejects an unknown device', async () => {
