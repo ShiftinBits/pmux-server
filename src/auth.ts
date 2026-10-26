@@ -92,23 +92,27 @@ export function authChallengeMessage(origin: string, deviceId: string, nonce: st
 }
 
 /**
- * Verify a challenge signature, trying the origin-bound message first and then
- * the legacy `deviceId|nonce` message that older clients sign.
+ * Verify a challenge signature, trying the origin-bound message for each
+ * accepted origin and then, when acceptLegacy is set, the legacy
+ * `deviceId|nonce` message that older clients sign.
  *
- * @returns 'v1' for an origin-bound signature, 'legacy' for a legacy one, null if neither verifies
+ * @returns 'v1' for an origin-bound signature, 'legacy' for an accepted legacy one, null otherwise
  * @throws Error if the key or signature has the wrong length
  */
 export async function verifyChallengeSignature(
   publicKey: Uint8Array,
-  origin: string,
+  origins: readonly string[],
   deviceId: string,
   nonce: string,
-  signature: Uint8Array
+  signature: Uint8Array,
+  acceptLegacy: boolean
 ): Promise<'v1' | 'legacy' | null> {
-  if (await verifyEd25519Signature(publicKey, authChallengeMessage(origin, deviceId, nonce), signature)) {
-    return 'v1';
+  for (const origin of origins) {
+    if (await verifyEd25519Signature(publicKey, authChallengeMessage(origin, deviceId, nonce), signature)) {
+      return 'v1';
+    }
   }
-  if (await verifyEd25519Signature(publicKey, textEncode(`${deviceId}|${nonce}`), signature)) {
+  if (acceptLegacy && await verifyEd25519Signature(publicKey, textEncode(`${deviceId}|${nonce}`), signature)) {
     return 'legacy';
   }
   return null;

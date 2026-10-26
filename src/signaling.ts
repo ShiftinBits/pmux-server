@@ -1765,7 +1765,7 @@ export class SignalingDO implements DurableObject {
     // Verify signature against stored key (if device exists) or request body key
     const verifyKey = existing ? existing.ed25519PublicKey : body.ed25519PublicKey;
     const signatureError = await checkChallengeSignature(
-      request, 'pair/initiate', verifyKey, body.deviceId, body.nonce, body.signature
+      this.env, request, 'pair/initiate', verifyKey, body.deviceId, body.nonce, body.signature
     );
     if (signatureError) {
       return signatureError;
@@ -2099,8 +2099,9 @@ export class SignalingDO implements DurableObject {
    * Device exchanges a signed challenge for a JWT.
    * Body: { deviceId, nonce, signature }
    * signature = Ed25519.sign(privateKey, "pocketmux-auth-v1|" + origin + "|" + deviceId + "|" + nonce),
-   * origin being this server's URL origin. A legacy signature over
-   * deviceId + "|" + nonce is still accepted, with a warning.
+   * origin being a PMUX_AUTH_ORIGINS entry, or this server's URL origin when
+   * that is unset. A legacy signature over deviceId + "|" + nonce is accepted,
+   * with a warning, unless PMUX_REJECT_LEGACY_AUTH is `true`.
    * Returns: { token }
    */
   private async handleTokenExchange(request: Request): Promise<Response> {
@@ -2132,7 +2133,7 @@ export class SignalingDO implements DurableObject {
     }
 
     const signatureError = await checkChallengeSignature(
-      request, 'token', device.ed25519PublicKey, body.deviceId, body.nonce, body.signature
+      this.env, request, 'token', device.ed25519PublicKey, body.deviceId, body.nonce, body.signature
     );
     if (signatureError) {
       return signatureError;
@@ -2374,11 +2375,35 @@ function jsonResponse(data: unknown, status = 200): Response {
 }
 
 /**
- * Verify a challenge signature against the request's origin, accepting the
- * legacy unbound form with a warning. Returns the 401 to send, or null when
- * the signature verifies.
+ * The origins a challenge signature may be bound to: the normalized
+ * PMUX_AUTH_ORIGINS entries when set (it replaces the request origin, which
+ * `wrangler dev` rewrites to the route host), else the request's own origin.
+ * A malformed entry throws, surfacing as the DO's 500.
+ */
+function authOrigins(env: Env, request: Request): string[] {
+  const configured = (env.PMUX_AUTH_ORIGINS ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== '');
+  if (configured.length === 0) {
+    return [new URL(request.url).origin];
+  }
+  return configured.map((entry) => {
+    const origin = new URL(entry).origin;
+    if (origin === 'null') {
+      throw new Error(`PMUX_AUTH_ORIGINS entry has no origin: ${entry}`);
+    }
+    return origin;
+  });
+}
+
+/**
+ * Verify a challenge signature against the accepted origins, accepting the
+ * legacy unbound form with a warning unless PMUX_REJECT_LEGACY_AUTH is
+ * `true`. Returns the 401 to send, or null when the signature verifies.
  */
 async function checkChallengeSignature(
+  env: Env,
   request: Request,
   route: 'token' | 'pair/initiate',
   publicKeyBase64: string,
@@ -2386,11 +2411,12 @@ async function checkChallengeSignature(
   nonce: string,
   signatureBase64: string
 ): Promise<Response | null> {
-  const origin = new URL(request.url).origin;
+  const origins = authOrigins(env, request);
+  const acceptLegacy = env.PMUX_REJECT_LEGACY_AUTH !== 'true';
   let form: 'v1' | 'legacy' | null;
   try {
     form = await verifyChallengeSignature(
-      base64ToBytes(publicKeyBase64), origin, deviceId, nonce, base64ToBytes(signatureBase64)
+      base64ToBytes(publicKeyBase64), origins, deviceId, nonce, base64ToBytes(signatureBase64), acceptLegacy
     );
   } catch {
     return jsonResponse({ error: 'Invalid signature format' }, 401);

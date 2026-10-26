@@ -52,7 +52,10 @@ export interface MockDOState {
   getWebSockets(): WebSocket[];
 }
 
-export async function createTestDO(): Promise<{ doInstance: SignalingDO; mockState: MockDOState }> {
+/** envOverrides are spread over the default test env (e.g. to set optional vars). */
+export async function createTestDO(
+  envOverrides: Partial<Env> = {}
+): Promise<{ doInstance: SignalingDO; mockState: MockDOState }> {
   const mockSql = await createMockSqlStorage();
   const mockKV = createMockKVStorage();
 
@@ -118,6 +121,7 @@ export async function createTestDO(): Promise<{ doInstance: SignalingDO; mockSta
     PAIR_LIMITER: createMockRateLimit(10),
     TURN_LIMITER: createMockRateLimit(20),
     WS_LIMITER: createMockRateLimit(8),
+    ...envOverrides,
   };
 
   const doInstance = new SignalingDO(

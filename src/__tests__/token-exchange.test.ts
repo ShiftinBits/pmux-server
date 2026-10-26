@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { createTestDOCompat as createTestDO } from './helpers/mock-do';
+import { createTestDOCompat as createTestDO, createTestDO as createTestDOFull } from './helpers/mock-do';
 import { verifyJWT } from '../auth';
 import {
   newTestDevice,
@@ -58,6 +58,66 @@ async function registerAgentDevice(
   const body = await signedPairInitiateBodyWithChallenge(doInstance, deviceId, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
   await postJSON('/pair/initiate', body);
 }
+
+describe('POST /token challenge signature config', () => {
+  const LAN_ORIGIN = 'http://192.168.1.5:8787';
+
+  it('binds signatures to PMUX_AUTH_ORIGINS entries instead of the request origin', async () => {
+    doInstance = (await createTestDOFull({ PMUX_AUTH_ORIGINS: ' HTTP://192.168.1.5:8787/ , https://signal.pmux.io:443' })).doInstance;
+    const { keyPair, publicKeyRaw } = host;
+    const body = await signedPairInitiateBodyWithChallenge(
+      doInstance, AGENT_1, keyPair, bytesToBase64(publicKeyRaw), HOST_X25519_KEY, undefined, { origin: LAN_ORIGIN }
+    );
+    expect((await postJSON('/pair/initiate', body)).status).toBe(200);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    for (const origin of [LAN_ORIGIN, 'https://signal.pmux.io']) {
+      const nonce = await fetchChallenge(doInstance, AGENT_1);
+      const signature = await signAuthChallenge(keyPair.privateKey, origin, AGENT_1, nonce);
+      const { status } = await postJSON('/token', { deviceId: AGENT_1, nonce, signature });
+      expect(status).toBe(200);
+    }
+
+    const nonce = await fetchChallenge(doInstance, AGENT_1);
+    const signature = await signAuthChallenge(keyPair.privateKey, TEST_ORIGIN, AGENT_1, nonce);
+    const { status, data } = await postJSON('/token', { deviceId: AGENT_1, nonce, signature });
+    expect(status).toBe(401);
+    expect(data['error']).toBe('Signature verification failed');
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('fails loudly on a PMUX_AUTH_ORIGINS entry that is not a URL', async () => {
+    doInstance = (await createTestDOFull({ PMUX_AUTH_ORIGINS: 'signal.pmux.io' })).doInstance;
+    const { keyPair, publicKeyRaw } = host;
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, bytesToBase64(publicKeyRaw), HOST_X25519_KEY);
+
+    const { status, data } = await postJSON('/pair/initiate', body);
+
+    expect(status).toBe(500);
+    expect(data['error']).toBe('Internal error');
+    expect(errorSpy).toHaveBeenCalled();
+    expect(doInstance.getDevice(AGENT_1)).toBeNull();
+  });
+
+  it('rejects a legacy signature when PMUX_REJECT_LEGACY_AUTH is true', async () => {
+    doInstance = (await createTestDOFull({ PMUX_REJECT_LEGACY_AUTH: 'true' })).doInstance;
+    const { keyPair, publicKeyRaw } = host;
+    await registerAgentDevice(AGENT_1, bytesToBase64(publicKeyRaw), keyPair);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const legacyNonce = await fetchChallenge(doInstance, AGENT_1);
+    const legacySignature = await signLegacyAuthChallenge(keyPair.privateKey, AGENT_1, legacyNonce);
+    const legacy = await postJSON('/token', { deviceId: AGENT_1, nonce: legacyNonce, signature: legacySignature });
+    expect(legacy.status).toBe(401);
+    expect(legacy.data['error']).toBe('Signature verification failed');
+    expect(warnSpy).not.toHaveBeenCalled();
+
+    const nonce = await fetchChallenge(doInstance, AGENT_1);
+    const signature = await signAuthChallenge(keyPair.privateKey, TEST_ORIGIN, AGENT_1, nonce);
+    expect((await postJSON('/token', { deviceId: AGENT_1, nonce, signature })).status).toBe(200);
+  });
+});
 
 describe('POST /token', () => {
   it('issues a JWT for a valid nonce+signature', async () => {

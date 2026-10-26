@@ -328,6 +328,34 @@ describe('POST /pair/initiate challenge signature forms', () => {
     expect(replay.data['error']).toBe('Invalid or expired challenge');
   });
 
+  it('rejects a legacy signature when PMUX_REJECT_LEGACY_AUTH is true', async () => {
+    doInstance = (await createTestDOFull({ PMUX_REJECT_LEGACY_AUTH: 'true' })).doInstance;
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const body = await signedPairInitiateBodyWithChallenge(
+      doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY, undefined, { legacy: true }
+    );
+
+    const { status, data } = await postJSON('/pair/initiate', body);
+
+    expect(status).toBe(401);
+    expect(data['error']).toBe('Signature verification failed');
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(doInstance.getDevice(AGENT_1)).toBeNull();
+    expect(pairingCodesFor(AGENT_1)).toEqual([]);
+  });
+
+  it('accepts a signature bound to a PMUX_AUTH_ORIGINS entry', async () => {
+    doInstance = (await createTestDOFull({ PMUX_AUTH_ORIGINS: 'http://[FD00::1]:8787' })).doInstance;
+    const body = await signedPairInitiateBodyWithChallenge(
+      doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY, undefined, { origin: 'http://[fd00::1]:8787' }
+    );
+
+    const { status, data } = await postJSON('/pair/initiate', body);
+
+    expect(status).toBe(200);
+    expect(data['pairingCode']).toBeTypeOf('string');
+  });
+
   it('rejects a wrong-origin signature from a registered mobile before revealing the conflict', async () => {
     const MOBILE_ID = 'c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3';
     doInstance.registerDevice(MOBILE_ID, ed25519PublicKeyBase64, 'mobile');
