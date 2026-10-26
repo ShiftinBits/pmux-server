@@ -90,11 +90,14 @@ export async function verifyEd25519Signature(
  */
 export async function deriveDeviceId(publicKey: Uint8Array): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(publicKey)));
-  let hex = '';
-  for (const byte of digest.subarray(0, 16)) {
-    hex += byte.toString(16).padStart(2, '0');
-  }
-  return hex;
+  return bytesToHex(digest.subarray(0, 16));
+}
+
+/** Lowercase hex encoding of a byte array. */
+export function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 // --- HMAC-SHA256 helpers for JWT ---

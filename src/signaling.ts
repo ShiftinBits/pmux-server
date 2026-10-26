@@ -1974,12 +1974,15 @@ export class SignalingDO implements DurableObject {
 
   /**
    * Whether the mobile can't be registered: its ID belongs to a non-mobile
-   * device, or its Ed25519 key is already registered to a different device
+   * device or is registered under a different key, or its Ed25519 key is already registered to a different device
    * (devices.ed25519_public_key is UNIQUE).
    */
   private hasMobileConflict(mobileDeviceId: string, mobileEd25519PublicKey: string): boolean {
     const existing = this.getDevice(mobileDeviceId);
     if (existing && existing.deviceType !== 'mobile') return true;
+    // registerDevice never replaces an existing key, so a row holding a
+    // different key would leave the mobile paired under a key it can't sign with.
+    if (existing && existing.ed25519PublicKey !== mobileEd25519PublicKey) return true;
     const keyOwners = this.sql
       .exec('SELECT 1 FROM devices WHERE ed25519_public_key = ? AND id != ?', mobileEd25519PublicKey, mobileDeviceId)
       .toArray();

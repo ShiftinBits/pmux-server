@@ -535,6 +535,13 @@ describe('host-confirmed pairing (SB-1348)', () => {
         do2.registerDevice('mobile-squatter', testKey('ed25519-pub-key-mobile-1'), 'mobile');
       },
     },
+    {
+      conflict: 'stored key',
+      introduce: (do2: Awaited<ReturnType<typeof setup>>['do2']) => {
+        // A pre-existing row squats the mobile's derived ID under another key
+        do2.registerDevice(M1, testKey('ed25519-pub-key-squatter'), 'mobile');
+      },
+    },
   ])('rejects a $conflict conflict with 409 before evicting the old mobile', async ({ introduce }) => {
     const { do2, code, complete } = await setup({ pairConfirm: false, liveHost: false });
     do2.registerDevice('mobile-old', 'ed25519-pub-key-mobile-old', 'mobile');
