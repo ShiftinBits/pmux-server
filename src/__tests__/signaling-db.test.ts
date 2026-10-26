@@ -43,14 +43,22 @@ describe('device registration', () => {
     expect(device!.name).toBe('My Workstation');
   });
 
-  it('re-registering a device with the same type updates allowed fields', () => {
-    doInstance.registerDevice('device-1', 'pub-key-v1', 'host', 'Old Name');
+  it('re-registering a device with a different key keeps the key and updates the name', () => {
+    doInstance.registerDevice('device-1', 'pub-key-1', 'host', 'Old Name');
     doInstance.registerDevice('device-1', 'pub-key-v2', 'host', 'New Name');
 
     const device = doInstance.getDevice('device-1');
     expect(device).not.toBeNull();
-    expect(device!.ed25519PublicKey).toBe('pub-key-v2');
+    expect(device!.ed25519PublicKey).toBe('pub-key-1');
     expect(device!.name).toBe('New Name');
+  });
+
+  it('re-registering with the same key and name changes nothing', () => {
+    doInstance.registerDevice('device-1', 'pub-key-1', 'host', 'Same Name');
+    const before = doInstance.getDevice('device-1');
+    doInstance.registerDevice('device-1', 'pub-key-1', 'host', 'Same Name');
+
+    expect(doInstance.getDevice('device-1')).toEqual(before);
   });
 
   it('throws DeviceTypeConflictError when re-registering with a different device_type', () => {

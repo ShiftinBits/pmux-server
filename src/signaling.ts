@@ -328,8 +328,9 @@ export class SignalingDO implements DurableObject {
   // --- Device CRUD ---
 
   /**
-   * Register a device. New devices are inserted; existing devices are updated
-   * only if the device_type matches. Throws DeviceTypeConflictError on mismatch.
+   * Register a device. New devices are inserted; for an existing device the
+   * device_type must match (DeviceTypeConflictError otherwise) and only the
+   * name is updated. The stored public key of an existing device is never changed.
    */
   registerDevice(
     deviceId: string,
@@ -361,15 +362,10 @@ export class SignalingDO implements DurableObject {
       throw new DeviceTypeConflictError(deviceId, existing.deviceType, deviceType);
     }
 
-    // Update allowed fields for existing devices (key rotation, name change)
-    if (existing.ed25519PublicKey !== ed25519PublicKey || existing.name !== (name ?? null)) {
-      this.sql.exec(
-        'UPDATE devices SET ed25519_public_key = ?, name = ?, created_at = ? WHERE id = ?',
-        ed25519PublicKey,
-        name ?? null,
-        now,
-        deviceId
-      );
+    // Existing devices only get a name change. The stored key is never
+    // replaced: rotation means a new derived ID, i.e. a new device.
+    if (existing.name !== (name ?? null)) {
+      this.sql.exec('UPDATE devices SET name = ? WHERE id = ?', name ?? null, deviceId);
     }
 
     return { deviceId };
