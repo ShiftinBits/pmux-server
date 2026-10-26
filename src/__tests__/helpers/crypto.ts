@@ -63,6 +63,38 @@ export async function signEd25519(privateKey: CryptoKey, message: Uint8Array): P
   return new Uint8Array(sig);
 }
 
+/** The DO's origin in tests: every test request URL is http://localhost/... */
+export const TEST_ORIGIN = 'http://localhost';
+
+/**
+ * Sign an auth challenge in the origin-bound form
+ * (`pocketmux-auth-v1|<origin>|<deviceId>|<nonce>`), built here rather than
+ * with the production helper so a production bug isn't masked.
+ * Returns the base64 signature.
+ */
+export async function signAuthChallenge(
+  privateKey: CryptoKey,
+  origin: string = TEST_ORIGIN,
+  deviceId: string,
+  nonce: string
+): Promise<string> {
+  const message = new TextEncoder().encode(`pocketmux-auth-v1|${origin}|${deviceId}|${nonce}`);
+  return bytesToBase64(await signEd25519(privateKey, message));
+}
+
+/** Sign an auth challenge in the legacy `<deviceId>|<nonce>` form. Returns the base64 signature. */
+export async function signLegacyAuthChallenge(privateKey: CryptoKey, deviceId: string, nonce: string): Promise<string> {
+  return bytesToBase64(await signEd25519(privateKey, new TextEncoder().encode(deviceId + '|' + nonce)));
+}
+
+/** How signedPairInitiateBody signs the challenge. */
+export interface ChallengeSignOptions {
+  /** Origin to bind the signature to; defaults to TEST_ORIGIN. */
+  origin?: string;
+  /** Sign the legacy `<deviceId>|<nonce>` form instead of the origin-bound one. */
+  legacy?: boolean;
+}
+
 /**
  * Obtain a nonce challenge from the DO for the given deviceId.
  * Calls POST /challenge on the DO directly.
@@ -82,8 +114,8 @@ export async function fetchChallenge(doInstance: SignalingDO, deviceId: string):
 }
 
 /**
- * Build a signed request body for POST /pair/initiate.
- * Uses the nonce-based challenge protocol (SB-996).
+ * Build a signed request body for POST /pair/initiate, signing the
+ * challenge in the origin-bound form unless options.legacy is set.
  */
 export async function signedPairInitiateBody(
   deviceId: string,
@@ -91,7 +123,8 @@ export async function signedPairInitiateBody(
   ed25519PublicKeyBase64: string,
   x25519PublicKey: string,
   name?: string,
-  nonce?: string
+  nonce?: string,
+  options: ChallengeSignOptions = {}
 ): Promise<Record<string, string>> {
   // nonce must be provided; callers pre-fetch it via fetchChallenge (or use
   // signedPairInitiateBodyWithChallenge). Fail loudly rather than signing a
@@ -99,14 +132,15 @@ export async function signedPairInitiateBody(
   if (nonce === undefined) {
     throw new Error('signedPairInitiateBody: nonce is required; use signedPairInitiateBodyWithChallenge');
   }
-  const message = new TextEncoder().encode(deviceId + '|' + nonce);
-  const signature = await signEd25519(keyPair.privateKey, message);
+  const signature = options.legacy
+    ? await signLegacyAuthChallenge(keyPair.privateKey, deviceId, nonce)
+    : await signAuthChallenge(keyPair.privateKey, options.origin, deviceId, nonce);
   return {
     deviceId,
     ed25519PublicKey: ed25519PublicKeyBase64,
     x25519PublicKey,
     nonce,
-    signature: bytesToBase64(signature),
+    signature,
     ...(name !== undefined ? { name } : {}),
   };
 }
@@ -121,8 +155,9 @@ export async function signedPairInitiateBodyWithChallenge(
   keyPair: CryptoKeyPair,
   ed25519PublicKeyBase64: string,
   x25519PublicKey: string,
-  name?: string
+  name?: string,
+  options: ChallengeSignOptions = {}
 ): Promise<Record<string, string>> {
   const nonce = await fetchChallenge(doInstance, deviceId);
-  return signedPairInitiateBody(deviceId, keyPair, ed25519PublicKeyBase64, x25519PublicKey, name, nonce);
+  return signedPairInitiateBody(deviceId, keyPair, ed25519PublicKeyBase64, x25519PublicKey, name, nonce, options);
 }

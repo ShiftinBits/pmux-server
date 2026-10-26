@@ -10,11 +10,11 @@
  * 6. SDP/ICE relay works between paired devices
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestDO } from '../helpers/mock-do';
 import { MockWebSocket } from '../helpers/mock-websocket';
 import { verifyJWT, createJWT } from '../../auth';
-import { generateEd25519Keypair, bytesToBase64, deriveDeviceId, signEd25519, fetchChallenge, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey } from '../helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, deriveDeviceId, signAuthChallenge, signLegacyAuthChallenge, fetchChallenge, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, TEST_ORIGIN, testKey } from '../helpers/crypto';
 import type { SignalingDO } from '../../signaling';
 import type { MockDOState } from '../helpers/mock-do';
 
@@ -39,6 +39,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   Date.now = realDateNow;
+  vi.restoreAllMocks();
 });
 
 // --- HTTP helpers ---
@@ -122,9 +123,7 @@ describe('Full auth flow integration [T3.11]', () => {
 
     // 4. Agent exchanges signature for JWT
     const agentNonce = await fetchChallenge(doInstance, AGENT_INTEG);
-    const agentMessage = new TextEncoder().encode(AGENT_INTEG + '|' + agentNonce);
-    const agentSig = await signEd25519(agentKeys.keyPair.privateKey, agentMessage);
-    const agentSigBase64 = bytesToBase64(agentSig);
+    const agentSigBase64 = await signAuthChallenge(agentKeys.keyPair.privateKey, TEST_ORIGIN, AGENT_INTEG, agentNonce);
 
     const agentTokenResult = await postJSON('/token', {
       deviceId: AGENT_INTEG,
@@ -143,9 +142,7 @@ describe('Full auth flow integration [T3.11]', () => {
 
     // 5. Mobile exchanges signature for JWT
     const mobileNonce = await fetchChallenge(doInstance, MOBILE_INTEG);
-    const mobileMessage = new TextEncoder().encode(MOBILE_INTEG + '|' + mobileNonce);
-    const mobileSig = await signEd25519(mobileKeys.keyPair.privateKey, mobileMessage);
-    const mobileSigBase64 = bytesToBase64(mobileSig);
+    const mobileSigBase64 = await signAuthChallenge(mobileKeys.keyPair.privateKey, TEST_ORIGIN, MOBILE_INTEG, mobileNonce);
 
     const mobileTokenResult = await postJSON('/token', {
       deviceId: MOBILE_INTEG,
@@ -264,17 +261,37 @@ describe('Full auth flow integration [T3.11]', () => {
 
     // Fetch a nonce then sign with the wrong private key
     const nonce = await fetchChallenge(doInstance, AGENT_WRONG_KEY);
-    const message = new TextEncoder().encode(AGENT_WRONG_KEY + '|' + nonce);
-    const wrongSig = await signEd25519(wrongKeys.keyPair.privateKey, message);
+    const wrongSig = await signAuthChallenge(wrongKeys.keyPair.privateKey, TEST_ORIGIN, AGENT_WRONG_KEY, nonce);
 
     const result = await postJSON('/token', {
       deviceId: AGENT_WRONG_KEY,
       nonce,
-      signature: bytesToBase64(wrongSig),
+      signature: wrongSig,
     });
 
     expect(result.status).toBe(401);
     expect(result.data['error']).toContain('Signature verification failed');
+  });
+
+  it('pairs and exchanges tokens with legacy signatures, warning each time', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const legacyKeys = await generateEd25519Keypair();
+    const legacyId = await deriveDeviceId(legacyKeys.publicKeyRaw);
+
+    const initBody = await signedPairInitiateBodyWithChallenge(
+      doInstance, legacyId, legacyKeys.keyPair, bytesToBase64(legacyKeys.publicKeyRaw), HOST_X25519_KEY, undefined, { legacy: true }
+    );
+    expect((await postJSON('/pair/initiate', initBody)).status).toBe(200);
+
+    const nonce = await fetchChallenge(doInstance, legacyId);
+    const signature = await signLegacyAuthChallenge(legacyKeys.keyPair.privateKey, legacyId, nonce);
+    const result = await postJSON('/token', { deviceId: legacyId, nonce, signature });
+
+    expect(result.status).toBe(200);
+    const payload = await verifyJWT(result.data['token'] as string, JWT_SECRET);
+    expect(payload.deviceId).toBe(legacyId);
+    expect(warnSpy).toHaveBeenCalledWith('[auth] legacy signature accepted', { route: 'pair/initiate' });
+    expect(warnSpy).toHaveBeenCalledWith('[auth] legacy signature accepted', { route: 'token' });
   });
 
   it('blocks WebSocket auth with expired token', async () => {

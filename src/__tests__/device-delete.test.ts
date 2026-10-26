@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { createTestDO as createTestDOFull } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
-import { generateEd25519Keypair, newTestDevice, bytesToBase64, deriveDeviceId, signedPairInitiateBodyWithChallenge, fetchChallenge, signEd25519, HOST_X25519_KEY, testKey } from './helpers/crypto';
+import { generateEd25519Keypair, newTestDevice, bytesToBase64, deriveDeviceId, signedPairInitiateBodyWithChallenge, fetchChallenge, signAuthChallenge, HOST_X25519_KEY, TEST_ORIGIN, testKey } from './helpers/crypto';
 import type { SignalingDO } from '../signaling';
 
 const JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
@@ -174,9 +174,7 @@ describe('DELETE /device', () => {
     // Try to exchange a token for the deleted host — should fail
     // Nonce fetch succeeds (device need not exist for challenge), but /token rejects unknown device
     const nonce = await fetchChallenge(doInstance, HOST_1);
-    const message = new TextEncoder().encode(HOST_1 + '|' + nonce);
-    const sig = await signEd25519(hostKeys.keyPair.privateKey, message);
-    const sigBase64 = bytesToBase64(sig);
+    const sigBase64 = await signAuthChallenge(hostKeys.keyPair.privateKey, TEST_ORIGIN, HOST_1, nonce);
 
     const { status, data } = await postJSON(doInstance, '/token', {
       deviceId: HOST_1,

@@ -83,6 +83,38 @@ export async function verifyEd25519Signature(
 }
 
 /**
+ * The message a device signs to answer an auth challenge, bound to the
+ * server's origin (`scheme://host[:port]`, as `URL.origin` gives it) so a
+ * signature made for one server cannot be replayed at another.
+ */
+export function authChallengeMessage(origin: string, deviceId: string, nonce: string): Uint8Array {
+  return textEncode(`pocketmux-auth-v1|${origin}|${deviceId}|${nonce}`);
+}
+
+/**
+ * Verify a challenge signature, trying the origin-bound message first and then
+ * the legacy `deviceId|nonce` message that older clients sign.
+ *
+ * @returns 'v1' for an origin-bound signature, 'legacy' for a legacy one, null if neither verifies
+ * @throws Error if the key or signature has the wrong length
+ */
+export async function verifyChallengeSignature(
+  publicKey: Uint8Array,
+  origin: string,
+  deviceId: string,
+  nonce: string,
+  signature: Uint8Array
+): Promise<'v1' | 'legacy' | null> {
+  if (await verifyEd25519Signature(publicKey, authChallengeMessage(origin, deviceId, nonce), signature)) {
+    return 'v1';
+  }
+  if (await verifyEd25519Signature(publicKey, textEncode(`${deviceId}|${nonce}`), signature)) {
+    return 'legacy';
+  }
+  return null;
+}
+
+/**
  * Derive a device ID from a raw Ed25519 public key: lowercase hex of the first
  * 16 bytes of SHA-256(publicKey), 32 hex chars (SPEC §7, docs/SECURITY.md).
  * Matches the agent's identity.go deriveDeviceID and the mobile app's

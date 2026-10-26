@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestDOCompat as createTestDO, createTestDO as createTestDOFull } from './helpers/mock-do';
 import { MockWebSocket } from './helpers/mock-websocket';
 import { createJWT } from '../auth';
-import { generateEd25519Keypair, bytesToBase64, deriveDeviceId, signEd25519, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, testKey, fetchChallenge } from './helpers/crypto';
+import { generateEd25519Keypair, bytesToBase64, deriveDeviceId, signAuthChallenge, signedPairInitiateBodyWithChallenge, HOST_X25519_KEY, TEST_ORIGIN, testKey, fetchChallenge } from './helpers/crypto';
 import type { SignalingDO } from '../signaling';
 
 
@@ -248,15 +248,14 @@ describe('POST /pair/initiate', () => {
     Date.now = () => realDateNow() + 70_000;
 
     try {
-      const message = new TextEncoder().encode(AGENT_1 + '|' + nonce);
-      const sig = await signEd25519(keyPair.privateKey, message);
+      const sig = await signAuthChallenge(keyPair.privateKey, TEST_ORIGIN, AGENT_1, nonce);
 
       const { status, data } = await postJSON('/pair/initiate', {
         deviceId: AGENT_1,
         ed25519PublicKey: ed25519PublicKeyBase64,
         x25519PublicKey: HOST_X25519_KEY,
         nonce,
-        signature: bytesToBase64(sig),
+        signature: sig,
       });
 
       expect(status).toBe(401);
@@ -276,6 +275,84 @@ describe('POST /pair/initiate', () => {
     const { status, data } = await postJSON('/pair/initiate', body);
     expect(status).toBe(401);
     expect(data['error']).toContain('Invalid or expired challenge');
+  });
+});
+
+describe('POST /pair/initiate challenge signature forms', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function pairingCodesFor(deviceId: string): unknown[] {
+    const sql = (doInstance as unknown as { sql: { exec: (q: string, ...b: unknown[]) => { toArray(): unknown[] } } }).sql;
+    return sql.exec('SELECT code FROM pairing_sessions WHERE host_device_id = ?', deviceId).toArray();
+  }
+
+  it('accepts an origin-bound signature without a warning', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
+
+    const { status, data } = await postJSON('/pair/initiate', body);
+
+    expect(status).toBe(200);
+    expect(data['pairingCode']).toBeTypeOf('string');
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects a signature bound to a different origin', async () => {
+    const body = await signedPairInitiateBodyWithChallenge(
+      doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY, undefined, { origin: 'https://signal.pmux.io' }
+    );
+
+    const { status, data } = await postJSON('/pair/initiate', body);
+
+    expect(status).toBe(401);
+    expect(data['error']).toBe('Signature verification failed');
+    expect(doInstance.getDevice(AGENT_1)).toBeNull();
+    expect(pairingCodesFor(AGENT_1)).toEqual([]);
+  });
+
+  it('accepts a legacy signature with a warning, once per nonce', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const body = await signedPairInitiateBodyWithChallenge(
+      doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY, undefined, { legacy: true }
+    );
+
+    const first = await postJSON('/pair/initiate', body);
+    expect(first.status).toBe(200);
+    expect(first.data['pairingCode']).toBeTypeOf('string');
+    expect(warnSpy).toHaveBeenCalledWith('[auth] legacy signature accepted', { route: 'pair/initiate' });
+
+    const replay = await postJSON('/pair/initiate', body);
+    expect(replay.status).toBe(401);
+    expect(replay.data['error']).toBe('Invalid or expired challenge');
+  });
+
+  it('rejects a wrong-origin signature from a registered mobile before revealing the conflict', async () => {
+    const MOBILE_ID = 'c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3';
+    doInstance.registerDevice(MOBILE_ID, ed25519PublicKeyBase64, 'mobile');
+    const body = await signedPairInitiateBodyWithChallenge(
+      doInstance, MOBILE_ID, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY, undefined, { origin: 'https://signal.pmux.io' }
+    );
+
+    const { status, data } = await postJSON('/pair/initiate', body);
+
+    expect(status).toBe(401);
+    expect(data['error']).toBe('Signature verification failed');
+    expect(pairingCodesFor(MOBILE_ID)).toEqual([]);
+  });
+
+  it('rejects a wrong-origin signature from a registered host before checking its body key', async () => {
+    doInstance.registerDevice(AGENT_1, ed25519PublicKeyBase64, 'host');
+    const body = await signedPairInitiateBodyWithChallenge(
+      doInstance, AGENT_1, keyPair, testKey('another-host-key'), HOST_X25519_KEY, undefined, { origin: 'https://signal.pmux.io' }
+    );
+
+    const { status, data } = await postJSON('/pair/initiate', body);
+
+    expect(status).toBe(401);
+    expect(data['error']).toBe('Signature verification failed');
+    expect(pairingCodesFor(AGENT_1)).toEqual([]);
   });
 });
 
@@ -1363,8 +1440,8 @@ describe('POST /pair/complete key and deviceId binding', () => {
 
     // The victim can still get a token with a challenge signed by K
     const nonce = await fetchChallenge(doInstance, victimId);
-    const signature = await signEd25519(victim.keyPair.privateKey, new TextEncoder().encode(victimId + '|' + nonce));
-    const token = await postJSON('/token', { deviceId: victimId, nonce, signature: bytesToBase64(signature) });
+    const signature = await signAuthChallenge(victim.keyPair.privateKey, TEST_ORIGIN, victimId, nonce);
+    const token = await postJSON('/token', { deviceId: victimId, nonce, signature });
     expect(token.status).toBe(200);
   });
 });

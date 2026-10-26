@@ -20,7 +20,7 @@ import type {
   PairRejectMessage,
   PairResultMessage,
 } from '@pocketmux/shared';
-import { verifyEd25519Signature, deriveDeviceId, createJWT, verifyJWT, TokenExpiredError } from './auth';
+import { verifyChallengeSignature, deriveDeviceId, createJWT, verifyJWT, TokenExpiredError } from './auth';
 import { generateTurnCredentials, TURN_REFRESH_AGE_MS, TURN_MAX_SERVE_AGE_MS } from './turn';
 import {
   rateLimitResponse,
@@ -1764,18 +1764,11 @@ export class SignalingDO implements DurableObject {
 
     // Verify signature against stored key (if device exists) or request body key
     const verifyKey = existing ? existing.ed25519PublicKey : body.ed25519PublicKey;
-    const message = new TextEncoder().encode(body.deviceId + '|' + body.nonce);
-
-    let valid: boolean;
-    try {
-      const publicKeyBytes = base64ToBytes(verifyKey);
-      const signatureBytes = base64ToBytes(body.signature);
-      valid = await verifyEd25519Signature(publicKeyBytes, message, signatureBytes);
-    } catch {
-      return jsonResponse({ error: 'Invalid signature format' }, 401);
-    }
-    if (!valid) {
-      return jsonResponse({ error: 'Signature verification failed' }, 401);
+    const signatureError = await checkChallengeSignature(
+      request, 'pair/initiate', verifyKey, body.deviceId, body.nonce, body.signature
+    );
+    if (signatureError) {
+      return signatureError;
     }
 
     // A new device's ID must be derived from its key, so an ID cannot be
@@ -2105,7 +2098,9 @@ export class SignalingDO implements DurableObject {
    * POST /token
    * Device exchanges a signed challenge for a JWT.
    * Body: { deviceId, nonce, signature }
-   * signature = Ed25519.sign(privateKey, deviceId + "|" + nonce)
+   * signature = Ed25519.sign(privateKey, "pocketmux-auth-v1|" + origin + "|" + deviceId + "|" + nonce),
+   * origin being this server's URL origin. A legacy signature over
+   * deviceId + "|" + nonce is still accepted, with a warning.
    * Returns: { token }
    */
   private async handleTokenExchange(request: Request): Promise<Response> {
@@ -2136,20 +2131,11 @@ export class SignalingDO implements DurableObject {
       return jsonResponse({ error: 'Unknown device' }, 401);
     }
 
-    // Verify the signature: sign(privateKey, deviceId + "|" + nonce)
-    const message = new TextEncoder().encode(body.deviceId + '|' + body.nonce);
-
-    let valid: boolean;
-    try {
-      const publicKeyBytes = base64ToBytes(device.ed25519PublicKey);
-      const signatureBytes = base64ToBytes(body.signature);
-      valid = await verifyEd25519Signature(publicKeyBytes, message, signatureBytes);
-    } catch {
-      return jsonResponse({ error: 'Invalid signature format' }, 401);
-    }
-
-    if (!valid) {
-      return jsonResponse({ error: 'Signature verification failed' }, 401);
+    const signatureError = await checkChallengeSignature(
+      request, 'token', device.ed25519PublicKey, body.deviceId, body.nonce, body.signature
+    );
+    if (signatureError) {
+      return signatureError;
     }
 
     // Issue JWT
@@ -2385,6 +2371,37 @@ function jsonResponse(data: unknown, status = 200): Response {
     status,
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+/**
+ * Verify a challenge signature against the request's origin, accepting the
+ * legacy unbound form with a warning. Returns the 401 to send, or null when
+ * the signature verifies.
+ */
+async function checkChallengeSignature(
+  request: Request,
+  route: 'token' | 'pair/initiate',
+  publicKeyBase64: string,
+  deviceId: string,
+  nonce: string,
+  signatureBase64: string
+): Promise<Response | null> {
+  const origin = new URL(request.url).origin;
+  let form: 'v1' | 'legacy' | null;
+  try {
+    form = await verifyChallengeSignature(
+      base64ToBytes(publicKeyBase64), origin, deviceId, nonce, base64ToBytes(signatureBase64)
+    );
+  } catch {
+    return jsonResponse({ error: 'Invalid signature format' }, 401);
+  }
+  if (form === null) {
+    return jsonResponse({ error: 'Signature verification failed' }, 401);
+  }
+  if (form === 'legacy') {
+    console.warn('[auth] legacy signature accepted', { route });
+  }
+  return null;
 }
 
 /** Successful /pair/complete body. */
