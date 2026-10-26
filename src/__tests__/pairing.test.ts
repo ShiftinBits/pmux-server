@@ -308,20 +308,27 @@ describe('POST /pair/initiate input validation', () => {
     ['whitespace-padded', `${bytesToBase64(new Uint8Array(32))}  `],
     ['non-string', 42],
   ])('returns 400 for a %s ed25519PublicKey without burning the nonce', async (_label, value) => {
-    for (const existingHost of [false, true]) {
-      if (existingHost) {
-        const first = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
-        expect((await postJSON('/pair/initiate', first)).status).toBe(200);
-      }
-      const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
-      const bad = await postJSON('/pair/initiate', { ...body, ed25519PublicKey: value });
-      expect(bad.status).toBe(400);
-      // A non-string is already rejected by the string-field check
-      expect(bad.data['error']).toBe(
-        typeof value === 'string' ? 'Invalid ed25519PublicKey' : 'deviceId, ed25519PublicKey, nonce and signature must be strings'
-      );
-      expect((await postJSON('/pair/initiate', body)).status).toBe(200);
-    }
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, ed25519PublicKeyBase64, HOST_X25519_KEY);
+    const bad = await postJSON('/pair/initiate', { ...body, ed25519PublicKey: value });
+    expect(bad.status).toBe(400);
+    // A non-string is already rejected by the string-field check
+    expect(bad.data['error']).toBe(
+      typeof value === 'string' ? 'Invalid ed25519PublicKey' : 'deviceId, ed25519PublicKey, nonce and signature must be strings'
+    );
+    expect((await postJSON('/pair/initiate', body)).status).toBe(200);
+  });
+
+  it('lets an existing host whose stored key is non-canonical keep initiating', async () => {
+    const unpadded = ed25519PublicKeyBase64.replace(/=+$/, '');
+    doInstance.registerDevice(AGENT_1, unpadded, 'host');
+    const body = await signedPairInitiateBodyWithChallenge(doInstance, AGENT_1, keyPair, unpadded, HOST_X25519_KEY);
+    expect((await postJSON('/pair/initiate', body)).status).toBe(200);
+  });
+
+  it('returns 401 for a non-canonical ed25519PublicKey that differs from the registered key', async () => {
+    const { status, data } = await initiateWith({ ed25519PublicKey: ed25519PublicKeyBase64.replace(/=+$/, '') }, true);
+    expect(status).toBe(401);
+    expect(data['error']).toBe('ed25519PublicKey does not match the registered key');
   });
 
   it('returns 401 for a new device whose deviceId is not derived from its ed25519PublicKey', async () => {

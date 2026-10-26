@@ -1750,7 +1750,10 @@ export class SignalingDO implements DurableObject {
     if (!isBase64OfLength(body.x25519PublicKey, 32)) {
       return jsonResponse({ error: 'Invalid x25519PublicKey' }, 400);
     }
-    if (!isBase64OfLength(body.ed25519PublicKey, 32)) {
+    // A registered device is held to its stored key by the equality check
+    // below, so only a new device's body key needs to be canonical here.
+    const existing = this.getDevice(body.deviceId);
+    if (!existing && !isBase64OfLength(body.ed25519PublicKey, 32)) {
       return jsonResponse({ error: 'Invalid ed25519PublicKey' }, 400);
     }
 
@@ -1760,7 +1763,6 @@ export class SignalingDO implements DurableObject {
     }
 
     // Verify signature against stored key (if device exists) or request body key
-    const existing = this.getDevice(body.deviceId);
     const verifyKey = existing ? existing.ed25519PublicKey : body.ed25519PublicKey;
     const message = new TextEncoder().encode(body.deviceId + '|' + body.nonce);
 
@@ -2004,7 +2006,8 @@ export class SignalingDO implements DurableObject {
     this.state.storage.transactionSync(() => {
       // Remove the old pairing (also cleans up an orphaned old mobile device)
       if (existingMobileId) this.removePairing(hostDeviceId);
-      // Validated above, so this registers (or refreshes) a mobile device
+      // Validated above, so this registers a new mobile device or, for an
+      // existing one, refreshes only its name (the stored key never changes)
       this.registerDevice(mobileDeviceId, mobileEd25519PublicKey, 'mobile', mobileName);
       this.createPairing(hostDeviceId, mobileDeviceId);
     });
